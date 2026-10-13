@@ -82,11 +82,15 @@
 
 先把安裝腳本下載成檔案再執行，執行前也可以先打開檢查內容：
 
-```bash
-# 使用 curl
-curl -fsSL https://raw.githubusercontent.com/yogoeasy/clp-helper/main/get.sh -o clp-get.sh && sudo bash clp-get.sh
+使用 curl：
 
-# 或使用 wget
+```bash
+curl -fsSL https://raw.githubusercontent.com/yogoeasy/clp-helper/main/get.sh -o clp-get.sh && sudo bash clp-get.sh
+```
+
+或使用 wget：
+
+```bash
 wget -qO clp-get.sh https://raw.githubusercontent.com/yogoeasy/clp-helper/main/get.sh && sudo bash clp-get.sh
 ```
 
@@ -94,11 +98,15 @@ wget -qO clp-get.sh https://raw.githubusercontent.com/yogoeasy/clp-helper/main/g
 
 **方式二：下載壓縮檔**
 
-```bash
-# 使用 curl
-curl -fsSL https://github.com/yogoeasy/clp-helper/archive/refs/heads/main.tar.gz | tar xz && sudo bash clp-helper-main/install.sh
+使用 curl：
 
-# 或使用 wget
+```bash
+curl -fsSL https://github.com/yogoeasy/clp-helper/archive/refs/heads/main.tar.gz | tar xz && sudo bash clp-helper-main/install.sh
+```
+
+或使用 wget：
+
+```bash
 wget -qO- https://github.com/yogoeasy/clp-helper/archive/refs/heads/main.tar.gz | tar xz && sudo bash clp-helper-main/install.sh
 ```
 
@@ -128,7 +136,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 ```bash
 # 檢視版本資訊 (顯示版本號碼與建置時間戳記)
 clp -v
-# 輸出範例: CLP Helper v1.0.0 (建置時間 2026-10-13 22:44:03)
+# 輸出範例: CLP Helper v1.0.0 (建置時間 2026-10-13 23:11:41)
 
 # 查看全域功能說明選單
 clp --help

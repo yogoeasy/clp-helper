@@ -84,11 +84,15 @@ Run one of the following on your CloudPanel server as root. All three methods gi
 
 The installer script is saved to a file first, so you can inspect it before running it:
 
-```bash
-# Using curl
-curl -fsSL https://raw.githubusercontent.com/yogoeasy/clp-helper/main/get.sh -o clp-get.sh && sudo bash clp-get.sh
+Using curl:
 
-# Or using wget
+```bash
+curl -fsSL https://raw.githubusercontent.com/yogoeasy/clp-helper/main/get.sh -o clp-get.sh && sudo bash clp-get.sh
+```
+
+Or using wget:
+
+```bash
 wget -qO clp-get.sh https://raw.githubusercontent.com/yogoeasy/clp-helper/main/get.sh && sudo bash clp-get.sh
 ```
 
@@ -96,11 +100,15 @@ wget -qO clp-get.sh https://raw.githubusercontent.com/yogoeasy/clp-helper/main/g
 
 **Option 2: Download the archive**
 
-```bash
-# Using curl
-curl -fsSL https://github.com/yogoeasy/clp-helper/archive/refs/heads/main.tar.gz | tar xz && sudo bash clp-helper-main/install.sh
+Using curl:
 
-# Or using wget
+```bash
+curl -fsSL https://github.com/yogoeasy/clp-helper/archive/refs/heads/main.tar.gz | tar xz && sudo bash clp-helper-main/install.sh
+```
+
+Or using wget:
+
+```bash
 wget -qO- https://github.com/yogoeasy/clp-helper/archive/refs/heads/main.tar.gz | tar xz && sudo bash clp-helper-main/install.sh
 ```
 
@@ -130,7 +138,7 @@ In any terminal window:
 ```bash
 # Check version information
 clp -v
-# Output example: CLP Helper v1.0.0 (build 2026-10-13 22:44:03)
+# Output example: CLP Helper v1.0.0 (build 2026-10-13 23:11:41)
 
 # Display global help menu
 clp --help
