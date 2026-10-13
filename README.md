@@ -135,12 +135,17 @@ The installer will automatically:
 
 In any terminal window:
 
-```bash
-# Check version information
-clp -v
-# Output example: CLP Helper v1.0.0 (build 2026-10-13 23:11:41)
+Check version information:
 
-# Display global help menu
+```bash
+clp -v
+```
+
+Output example:`CLP Helper v1.0.0 (build 2026-10-13 23:17:08)`
+
+Display global help menu:
+
+```bash
 clp --help
 ```
 
@@ -204,72 +209,130 @@ The interface language is dynamically resolved in the following priority order:
 #### 1. Runtime Override via Command-Line Flag
 Pass `--lang=zh_TW` or `--lang=en_US` directly to any command:
 
+Display help menu in Traditional Chinese:
+
 ```bash
-# Display help menu in Traditional Chinese
 sudo clp --lang=zh_TW --help
+```
 
-# Display help menu in English
+Display help menu in English:
+
+```bash
 sudo clp --lang=en_US --help
+```
 
-# Check version in Traditional Chinese
+Check version in Traditional Chinese:
+
+```bash
 clp --lang=zh_TW -v
+```
 
-# Check version in English
+Check version in English:
+
+```bash
 clp --lang=en_US -v
+```
 
-# Run module commands with language flag
+Run module commands with language flag:
+
+```bash
 sudo clp --lang=zh_TW site -list
+```
+
+```bash
 sudo clp --lang=en_US site example.com -new
+```
+
+```bash
 sudo clp --lang=zh_TW server
 ```
 
 #### 2. Persistent Override via Environment Variable
 Set `CLP_LANG` in your current terminal session or persist it in `~/.bashrc` / `/etc/environment`:
 
-```bash
-# Switch current terminal session to Traditional Chinese
-export CLP_LANG="zh_TW"
-clp -v
-sudo clp --help
+Switch current terminal session to Traditional Chinese:
 
-# Switch current terminal session to English
-export CLP_LANG="en_US"
+```bash
+export CLP_LANG="zh_TW"
+```
+
+```bash
 clp -v
+```
+
+```bash
+sudo clp --help
+```
+
+Switch current terminal session to English:
+
+```bash
+export CLP_LANG="en_US"
+```
+
+```bash
+clp -v
+```
+
+```bash
 sudo clp --help
 ```
 
 #### 3. Persistent Configuration via `clp config`
 You can permanently configure your preferred system-wide default language using `clp config` without needing to export environment variables on every login:
 
+Set system-wide default language to Traditional Chinese:
+
 ```bash
-# Set system-wide default language to Traditional Chinese
 sudo clp config -set lang=zh_TW
+```
 
-# Set system-wide default language to English
+Set system-wide default language to English:
+
+```bash
 sudo clp config -set lang=en_US
+```
 
-# Query the currently configured default language
+Query the currently configured default language:
+
+```bash
 clp config -get lang
+```
 
-# Remove language configuration (reverts to system locale auto-detection)
+Remove language configuration (reverts to system locale auto-detection):
+
+```bash
 sudo clp config -unset lang
 ```
 
 #### 4. Installer Language Selection (`install.sh`)
 The installer also fully respects the i18n cascade and runtime language flags:
 
+Run installer in Traditional Chinese:
+
 ```bash
-# Run installer in Traditional Chinese
 sudo bash install.sh --lang=zh_TW
+```
 
-# Run installer in English (default on international servers)
+Run installer in English (default on international servers):
+
+```bash
 sudo bash install.sh --lang=en_US
+```
 
-# Display installer help menu
+Display installer help menu:
+
+```bash
 bash install.sh --help
-bash install.sh --lang=zh_TW --help
+```
 
-# Uninstall with specified language
+```bash
+bash install.sh --lang=zh_TW --help
+```
+
+Uninstall with specified language:
+
+```bash
 sudo bash /usr/local/lib/clp-helper/install.sh --uninstall --lang=en_US
 ```
 
@@ -281,35 +344,67 @@ sudo bash /usr/local/lib/clp-helper/install.sh --uninstall --lang=en_US
 
 #### ① Site Listing (`clp site -list`)
 
+List all sites in a table:
+
 ```bash
-# Table view: list all sites
 sudo clp site -list
+```
 
-# Filter by state or SSL
-sudo clp site -list=enabled     # Only enabled sites
-sudo clp site -list=disabled    # Only paused sites
-sudo clp site -list=ssl         # Only sites with active SSL
+**Filter by state or SSL**
 
-# Raw script mode (-raw): output domain names only, one per line
+Only enabled sites:
+
+```bash
+sudo clp site -list=enabled
+```
+
+Only paused sites:
+
+```bash
+sudo clp site -list=disabled
+```
+
+Only sites with active SSL:
+
+```bash
+sudo clp site -list=ssl
+```
+
+Raw mode for scripts (-raw), one domain name per line:
+
+```bash
 sudo clp site -list=enabled -raw
 ```
 
 #### ② Create New WordPress Site (`clp site <domain> -new`)
 
+Interactive creation (prompts for site user, PHP version, SSL mode, admin credentials):
+
 ```bash
-# Interactive creation (prompts for site user, PHP version, SSL mode, admin credentials)
 sudo clp site example.com -new
+```
 
-# One-line creation using CloudPanel native HTTP-01 challenge
+One-line creation using CloudPanel native HTTP-01 challenge:
+
+```bash
 sudo clp site example.com -new -http -php=8.4 -user=myuser
+```
 
-# One-line creation using Cloudflare DNS-01 API challenge
+One-line creation using Cloudflare DNS-01 API challenge:
+
+```bash
 sudo clp site example.com -new -dns -php=8.4
+```
 
-# Create site skipping SSL setup
+Create site skipping SSL setup:
+
+```bash
 sudo clp site example.com -new -ssl=off
+```
 
-# Overwrite existing site of the same name
+Overwrite existing site of the same name:
+
+```bash
 sudo clp site example.com -new -force-replace
 ```
 
@@ -318,31 +413,51 @@ sudo clp site example.com -new -force-replace
 
 #### ③ SSL Certificate Management (`clp site <domain> -ssl`)
 
+Issue Cloudflare DNS-01 SSL (auto cron renewal & verification):
+
 ```bash
-# Issue Cloudflare DNS-01 SSL (auto cron renewal & verification)
 sudo clp site example.com -ssl=on -dns
+```
+
+```bash
 sudo clp site example.com -dns
+```
 
-# Use specific Cloudflare API credentials file
+Use specific Cloudflare API credentials file:
+
+```bash
 sudo clp site example.com -ssl=on -dns -api=my-cloudflare.ini
+```
 
-# Issue CloudPanel native HTTP-01 SSL (domain pointing to server IP)
+Issue CloudPanel native HTTP-01 SSL (domain pointing to server IP):
+
+```bash
 sudo clp site example.com -ssl=on -http
+```
 
-# Remove and disable SSL certificate
+Remove and disable SSL certificate:
+
+```bash
 sudo clp site example.com -ssl=off
 ```
 
 #### ④ Clone / Duplicate Site on Same Host (`clp site -clone-from`)
 
+Basic clone (target site is automatically created if absent):
+
 ```bash
-# Basic clone (target site is automatically created if absent)
 sudo clp site -clone-from=example.com new-example.com
+```
 
-# Overwrite existing target site
+Overwrite existing target site:
+
+```bash
 sudo clp site -clone-from=example.com new-example.com -force-replace
+```
 
-# Customize user and PHP version for target site
+Customize user and PHP version for target site:
+
+```bash
 sudo clp site -clone-from=example.com new-example.com -user=newuser -php=8.4
 ```
 
@@ -354,17 +469,27 @@ sudo clp site -clone-from=example.com new-example.com -user=newuser -php=8.4
 
 #### ⑤ Zero-Write Cross-Server Migration (`clp site -migrate`)
 
+Same domain migration (keeps domain, skips search-replace):
+
 ```bash
-# Same domain migration (keeps domain, skips search-replace)
 sudo clp site -migrate=remote-vps -from=example.com
+```
 
-# Cross-domain migration (automatically executes DB search-replace)
+Cross-domain migration (automatically executes DB search-replace):
+
+```bash
 sudo clp site -migrate=remote-vps -from=example.com new-site.com
+```
 
-# Migrate all sites from remote server to local
+Migrate all sites from remote server to local:
+
+```bash
 sudo clp site -migrate=remote-vps -all
+```
 
-# Batch migrate with domain exclusions
+Batch migrate with domain exclusions:
+
+```bash
 sudo clp site -migrate=remote-vps -all -exclude="test.,dev.,staging." -force-replace
 ```
 
@@ -375,17 +500,27 @@ sudo clp site -migrate=remote-vps -all -exclude="test.,dev.,staging." -force-rep
 
 #### ⑥ Site State Management
 
+Pause site (preserves files and databases):
+
 ```bash
-# Pause site (preserves files and databases)
 sudo clp site example.com -off
+```
 
-# Resume site
+Resume site:
+
+```bash
 sudo clp site example.com -on
+```
 
-# Interactive site and database deletion
+Interactive site and database deletion:
+
+```bash
 sudo clp site delete example.com
+```
 
-# Force delete without interactive prompt
+Force delete without interactive prompt:
+
+```bash
 sudo clp site delete example.com --force
 ```
 
@@ -395,20 +530,33 @@ sudo clp site delete example.com --force
 
 Automatically enforce Full (Strict) SSL, Always Use HTTPS, TLS 1.2+ on Cloudflare Anycast edge, and deploy 4 golden custom WAF rules (Protect WP Admin/Login, Block XML-RPC, Block Sensitive Files/Dumps, Block Bad Scanners):
 
+Optimize edge security and deploy WAF rules for domain:
+
 ```bash
-# Optimize edge security and deploy WAF rules for domain
 sudo clp site example.com -cf-waf
+```
 
-# Dry-run simulation (verifies token, resolves zone, outputs payload without changes)
+Dry-run simulation (verifies token, resolves zone, outputs payload without changes):
+
+```bash
 sudo clp site example.com -cf-waf --dry-run
+```
 
-# Whitelist admin IP addresses for wp-login / wp-admin
+Whitelist admin IP addresses for wp-login / wp-admin:
+
+```bash
 sudo clp site example.com -cf-waf --whitelist="1.2.3.4,5.6.7.8"
+```
 
-# Check edge security and custom WAF rules status
+Check edge security and custom WAF rules status:
+
+```bash
 sudo clp site example.com -cf-waf=status
+```
 
-# Safely remove CLP WAF rules (preserves user custom rules)
+Safely remove CLP WAF rules (preserves user custom rules):
+
+```bash
 sudo clp site example.com -cf-waf=off
 ```
 
@@ -438,17 +586,27 @@ The dashboard covers 3 key areas:
 
 Designed for newly provisioned Ubuntu / Debian VPS instances (Debian untested):
 
+Interactive guided installer (choose database engine and 17 core modules):
+
 ```bash
-# Interactive guided installer (choose database engine and 17 core modules)
 sudo clp server install
+```
 
-# One-click install with recommended configuration (default MySQL 8.4 LTS)
+One-click install with recommended configuration (default MySQL 8.4 LTS):
+
+```bash
 sudo clp server install -y
+```
 
-# Specify MariaDB 11.4 LTS
+Specify MariaDB 11.4 LTS:
+
+```bash
 sudo clp server install -y --db=MARIADB_11.4
+```
 
-# Dry-run test mode (makes zero changes to system)
+Dry-run test mode (makes zero changes to system):
+
+```bash
 sudo clp server install --dry-run
 ```
 
@@ -475,51 +633,150 @@ sudo clp server install --dry-run
 
 Apply security hardening to an existing CloudPanel server step-by-step:
 
-```bash
-# Interactive prompt for each hardening item
-sudo clp server -harden
+Interactive prompt for each hardening item:
 
-# Apply all hardening rules without interactive confirmation
+```bash
+sudo clp server -harden
+```
+
+Apply all hardening rules without interactive confirmation:
+
+```bash
 sudo clp server -harden -y
 ```
 
 #### ④ Tool Installation On-Demand (`sudo clp server -install=...`)
 
+Install Netdata monitoring:
+
 ```bash
-sudo clp server -install=netdata    # Install Netdata monitoring
-sudo clp server -install=rclone     # Install Rclone cloud backup
-sudo clp server -install=certbot    # Install Certbot & Cloudflare DNS plugin
-sudo clp server -install=wordfence  # Install Wordfence CLI scanner
-sudo clp server -install=smtp       # Install Postfix SMTP Relay
-sudo clp server -install=all -y     # Install all tools at once
+sudo clp server -install=netdata
+```
+
+Install Rclone cloud backup:
+
+```bash
+sudo clp server -install=rclone
+```
+
+Install Certbot & Cloudflare DNS plugin:
+
+```bash
+sudo clp server -install=certbot
+```
+
+Install Wordfence CLI scanner:
+
+```bash
+sudo clp server -install=wordfence
+```
+
+Install Postfix SMTP Relay:
+
+```bash
+sudo clp server -install=smtp
+```
+
+Install all tools at once:
+
+```bash
+sudo clp server -install=all -y
 ```
 
 #### ⑤ Standalone Operations Commands
 
+**Firewall management**
+
+View UFW rules:
+
 ```bash
-# Firewall management
-sudo clp server -ufw               # View UFW rules
-sudo clp server -ufw -allow=8080   # Allow port
-sudo clp server -ufw -icmp=drop    # Drop external ICMP ping
+sudo clp server -ufw
+```
 
-# SSH management & emergency recovery
-sudo clp server -ssh               # Check SSH status and authorized keys
-sudo clp server -ssh -harden       # Disable password authentication
-sudo clp server -ssh -unharden     # [Emergency Recovery]: Re-enable password auth
+Allow port:
 
-# Fail2ban intrusion prevention
-sudo clp server -fail2ban          # View banned IPs
-sudo clp server -fail2ban -unban=203.0.113.10  # Unban specific IP
-sudo clp server -fail2ban -unban=all           # Unban all IPs
-sudo clp server -fail2ban -whitelist=1.2.3.4  # Add IP to whitelist
+```bash
+sudo clp server -ufw -allow=8080
+```
 
-# System DNS & Timezone synchronization
-sudo clp server -dns=auto          # Configure Google/Cloudflare DNS
-sudo clp server -timezone=Asia/Taipei # Sync timezone across system & PHP versions
+Drop external ICMP ping:
 
-# SMTP verification & Disk cleanup
-sudo clp server -smtp -test=admin@example.com  # Send test email
-sudo clp server -clean             # Clean journal logs, APT cache, and temp files
+```bash
+sudo clp server -ufw -icmp=drop
+```
+
+**SSH management & emergency recovery**
+
+Check SSH status and authorized keys:
+
+```bash
+sudo clp server -ssh
+```
+
+Disable password authentication:
+
+```bash
+sudo clp server -ssh -harden
+```
+
+Emergency recovery, temporarily re-enable password login:
+
+```bash
+sudo clp server -ssh -unharden
+```
+
+**Fail2ban intrusion prevention**
+
+View banned IPs:
+
+```bash
+sudo clp server -fail2ban
+```
+
+Unban specific IP:
+
+```bash
+sudo clp server -fail2ban -unban=203.0.113.10
+```
+
+Unban all IPs:
+
+```bash
+sudo clp server -fail2ban -unban=all
+```
+
+Add IP to whitelist:
+
+```bash
+sudo clp server -fail2ban -whitelist=1.2.3.4
+```
+
+**System DNS & Timezone synchronization**
+
+Configure Google/Cloudflare DNS:
+
+```bash
+sudo clp server -dns=auto
+```
+
+Sync timezone across system & PHP versions:
+
+```bash
+sudo clp server -timezone=Asia/Taipei
+```
+
+**SMTP verification & Disk cleanup**
+
+Send test email:
+
+```bash
+sudo clp server -smtp -test=admin@example.com
+```
+
+Clean journal logs, APT cache, and temp files:
+
+```bash
+sudo clp server -clean
 ```
 
 ---
@@ -542,20 +799,33 @@ sudo clp backup <domain|all> [options...]
 
 #### ② Usage Examples
 
+Backup single site database locally:
+
 ```bash
-# Backup single site database locally
 sudo clp backup example.com -type=db
+```
 
-# Daily DB backup retaining 7 days of archives
+Daily DB backup retaining 7 days of archives:
+
+```bash
 sudo clp backup example.com -type=db -expire=7d
+```
 
-# Full site backup to local with 30-day retention
+Full site backup to local with 30-day retention:
+
+```bash
 sudo clp backup example.com -type=full -expire=30d
+```
 
-# Compact backup synced to Google Drive via rclone
+Compact backup synced to Google Drive via rclone:
+
+```bash
 sudo clp backup example.com -type=compact -to=google
+```
 
-# Batch backup all sites to Backblaze B2, excluding staging sites, 14-day retention
+Batch backup all sites to Backblaze B2, excluding staging sites, 14-day retention:
+
+```bash
 sudo clp backup all -type=full -to=b2 -expire=14d -exclude="test.,dev.,staging."
 ```
 
@@ -565,11 +835,15 @@ sudo clp backup all -type=full -to=b2 -expire=14d -exclude="test.,dev.,staging."
 
 #### ① Interactive Menu Restore (omitting `-file`)
 
-```bash
-# Restore from local backups list
-sudo clp restore example.com
+Restore from local backups list:
 
-# Restore from Google Drive cloud backups list
+```bash
+sudo clp restore example.com
+```
+
+Restore from Google Drive cloud backups list:
+
+```bash
 sudo clp restore example.com -to=google
 ```
 
@@ -577,11 +851,15 @@ The system will list all available snapshots. Select a number and confirm with `
 
 #### ② Exact Command Line Restore
 
-```bash
-# Specify local backup file
-sudo clp restore example.com -file=example.com-db-20261005_120000.sql.gz
+Specify local backup file:
 
-# Specify remote backup file and force restore without prompt
+```bash
+sudo clp restore example.com -file=example.com-db-20261005_120000.sql.gz
+```
+
+Specify remote backup file and force restore without prompt:
+
+```bash
 sudo clp restore example.com -file=example.com-full-20261005_153000.tar.gz -to=b2 --force
 ```
 
@@ -593,17 +871,27 @@ Password protection and access control for sites. Password files are stored secu
 
 #### ① User Management
 
+Interactive user creation (masked password input):
+
 ```bash
-# Interactive user creation (masked password input)
 sudo clp httpauth example.com -add
+```
 
-# Command-line creation with inline credentials (Note: inline password will appear in shell history; interactive mode is recommended)
+Command-line creation with inline credentials (Note: inline password will appear in shell history; interactive mode is recommended):
+
+```bash
 sudo clp httpauth example.com -add=[admin,StrongPassword123!]
+```
 
-# Delete user
+Delete user:
+
+```bash
 sudo clp httpauth example.com -delete=admin
+```
 
-# List current authenticated users
+List current authenticated users:
+
+```bash
 sudo clp httpauth example.com -list
 ```
 
@@ -611,24 +899,35 @@ sudo clp httpauth example.com -list
 
 Enforce HTTP Auth on `/wp-admin/` and `wp-login.php` to prevent automated brute-force attempts:
 
-```bash
-# Enable admin protection
-sudo clp httpauth example.com -wp-admin
+Enable admin protection:
 
-# Disable admin protection
+```bash
+sudo clp httpauth example.com -wp-admin
+```
+
+Disable admin protection:
+
+```bash
 sudo clp httpauth example.com -wp-admin -off
 ```
 
 #### ③ Full-Site or Path Protection (`-path`)
 
+Full site protection (ideal for staging environments):
+
 ```bash
-# Full site protection (ideal for staging environments)
 sudo clp httpauth example.com -path=/
+```
 
-# Remove full site protection
+Remove full site protection:
+
+```bash
 sudo clp httpauth example.com -path=/ -off
+```
 
-# Protect specific subdirectory
+Protect specific subdirectory:
+
+```bash
 sudo clp httpauth example.com -path=/staging
 ```
 
@@ -636,17 +935,27 @@ sudo clp httpauth example.com -path=/staging
 
 Allow specified IP addresses or office subnets direct access without passwords (Nginx `satisfy any` mechanism):
 
+Add IPs or CIDR blocks to whitelist:
+
 ```bash
-# Add IPs or CIDR blocks to whitelist
 sudo clp httpauth example.com -whitelist=203.0.113.50,192.168.1.0/24
+```
 
-# Remove specific IP from whitelist
+Remove specific IP from whitelist:
+
+```bash
 sudo clp httpauth example.com -whitelist=203.0.113.50 -delete
+```
 
-# Clear all whitelisted IPs (all users must authenticate)
+Clear all whitelisted IPs (all users must authenticate):
+
+```bash
 sudo clp httpauth example.com -whitelist=clear
+```
 
-# View protection summary dashboard
+View protection summary dashboard:
+
+```bash
 sudo clp httpauth example.com -list=protected
 ```
 
@@ -656,11 +965,15 @@ sudo clp httpauth example.com -list=protected
 
 Tuning PHP-FPM pool parameters for high-traffic workloads (`pm.max_children = 35`, `pm.process_idle_timeout = 30s`, `pm.max_requests = 300`):
 
-```bash
-# Optimize single site (auto-detects active PHP version)
-sudo clp php-pm example.com
+Optimize single site (auto-detects active PHP version):
 
-# Optimize all sites on the server in batch
+```bash
+sudo clp php-pm example.com
+```
+
+Optimize all sites on the server in batch:
+
+```bash
 sudo clp php-pm all
 ```
 
@@ -682,29 +995,59 @@ CLP Helper provides a dedicated configuration management module (`clp config`) t
 
 #### Available Commands & Examples
 
+Set system default language to Traditional Chinese:
+
 ```bash
-# Set system default language to Traditional Chinese
 sudo clp config -set lang=zh_TW
+```
 
-# Set system default language to English (WordPress standard)
+Set system default language to English (WordPress standard):
+
+```bash
 sudo clp config -set lang=en_US
+```
 
-# Set Cloudflare API Token (direct token string)
+Set Cloudflare API Token (direct token string):
+
+```bash
 sudo clp config -set cf-token="your_cloudflare_api_token"
+```
 
-# Set Cloudflare API Token (credentials file path - auto-extracts token)
+Set Cloudflare API Token (credentials file path - auto-extracts token):
+
+```bash
 sudo clp config -set cf-token="/root/.secrets/example.ini"
+```
 
-# Query configured value (sensitive tokens are automatically masked: 1234****cdef, shows source)
+Query configured value (sensitive tokens are automatically masked: 1234****cdef, shows source):
+
+```bash
 sudo clp config -get lang
+```
+
+```bash
 sudo clp config -get cf-token
-sudo clp config -get cf-token --raw    # Output unmasked raw token string
+```
 
-# List all current global configuration parameters
+Output unmasked raw token string:
+
+```bash
+sudo clp config -get cf-token --raw
+```
+
+List all current global configuration parameters:
+
+```bash
 sudo clp config -list
+```
 
-# Remove a configured key (reverts to system default)
+Remove a configured key (reverts to system default):
+
+```bash
 sudo clp config -unset lang
+```
+
+```bash
 sudo clp config -unset cf-token
 ```
 

@@ -133,12 +133,17 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 
 在終端機任意目錄輸入：
 
-```bash
-# 檢視版本資訊 (顯示版本號碼與建置時間戳記)
-clp -v
-# 輸出範例: CLP Helper v1.0.0 (建置時間 2026-10-13 23:11:41)
+檢視版本資訊 (顯示版本號碼與建置時間戳記)：
 
-# 查看全域功能說明選單
+```bash
+clp -v
+```
+
+輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-13 23:17:08)`
+
+查看全域功能說明選單：
+
+```bash
 clp --help
 ```
 
@@ -202,72 +207,130 @@ CLP Helper 內建多語系（i18n）功能，語系代碼遵循 **WordPress 與 
 #### 1. 執行期命令列切換 (Runtime Override)
 在任何 `clp` 指令中加入 `--lang=zh_TW` 或 `--lang=en_US`：
 
+以繁體中文顯示說明選單：
+
 ```bash
-# 以繁體中文顯示說明選單
 sudo clp --lang=zh_TW --help
+```
 
-# 以英文顯示說明選單
+以英文顯示說明選單：
+
+```bash
 sudo clp --lang=en_US --help
+```
 
-# 以繁體中文檢視版本資訊
+以繁體中文檢視版本資訊：
+
+```bash
 clp --lang=zh_TW -v
+```
 
-# 以英文檢視版本資訊
+以英文檢視版本資訊：
+
+```bash
 clp --lang=en_US -v
+```
 
-# 搭配各模組指令使用
+搭配各模組指令使用：
+
+```bash
 sudo clp --lang=zh_TW site -list
+```
+
+```bash
 sudo clp --lang=en_US site example.com -new
+```
+
+```bash
 sudo clp --lang=zh_TW server
 ```
 
 #### 2. 環境變數設定 (Persistent Override)
 在終端機中匯出 `CLP_LANG`，或加入 `~/.bashrc` / `/etc/environment`：
 
-```bash
-# 將目前工作階段切換為繁體中文
-export CLP_LANG="zh_TW"
-clp -v
-sudo clp --help
+將目前工作階段切換為繁體中文：
 
-# 將目前工作階段切換為英文
-export CLP_LANG="en_US"
+```bash
+export CLP_LANG="zh_TW"
+```
+
+```bash
 clp -v
+```
+
+```bash
+sudo clp --help
+```
+
+將目前工作階段切換為英文：
+
+```bash
+export CLP_LANG="en_US"
+```
+
+```bash
+clp -v
+```
+
+```bash
 sudo clp --help
 ```
 
 #### 3. 透過 `clp config` 永久設定預設語系 (Persistent Configuration)
 可以用 `clp config` 設定預設語系，之後就不必每次登入都設定環境變數：
 
+將系統全域預設語系永久設定為繁體中文：
+
 ```bash
-# 將系統全域預設語系永久設定為繁體中文
 sudo clp config -set lang=zh_TW
+```
 
-# 將系統全域預設語系永久設定為英文 (WordPress 標準)
+將系統全域預設語系永久設定為英文 (WordPress 標準)：
+
+```bash
 sudo clp config -set lang=en_US
+```
 
-# 查詢目前已設定之預設語系
+查詢目前已設定之預設語系：
+
+```bash
 clp config -get lang
+```
 
-# 清除語系設定（恢復為依系統環境自動判斷）
+清除語系設定（恢復為依系統環境自動判斷）：
+
+```bash
 sudo clp config -unset lang
 ```
 
 #### 4. 安裝程式語系指定 (`install.sh`)
 安裝程式也支援切換語系，並會自動偵測系統語系：
 
+以繁體中文執行安裝程式：
+
 ```bash
-# 以繁體中文執行安裝程式
 sudo bash install.sh --lang=zh_TW
+```
 
-# 以英文執行安裝程式 (國際化伺服器環境預設)
+以英文執行安裝程式 (國際化伺服器環境預設)：
+
+```bash
 sudo bash install.sh --lang=en_US
+```
 
-# 檢視安裝程式說明選單
+檢視安裝程式說明選單：
+
+```bash
 bash install.sh --help
-bash install.sh --lang=zh_TW --help
+```
 
-# 以指定語系執行解除安裝
+```bash
+bash install.sh --lang=zh_TW --help
+```
+
+以指定語系執行解除安裝：
+
+```bash
 sudo bash /usr/local/lib/clp-helper/install.sh --uninstall --lang=zh_TW
 ```
 
@@ -279,35 +342,67 @@ sudo bash /usr/local/lib/clp-helper/install.sh --uninstall --lang=zh_TW
 
 #### ① 網站清單檢視 (`clp site -list`)
 
+以表格列出所有網站：
+
 ```bash
-# 表格模式：列出所有網站
 sudo clp site -list
+```
 
-# 依狀態或 SSL 憑證篩選
-sudo clp site -list=enabled     # 僅列出已啟用網站
-sudo clp site -list=disabled    # 僅列出暫停中網站
-sudo clp site -list=ssl         # 僅列出具備 SSL 憑證網站
+**依狀態或 SSL 憑證篩選**
 
-# 腳本專用純文字模式 (-raw)：每行輸出一個網域名稱，利於迴圈自動化
+僅列出已啟用網站：
+
+```bash
+sudo clp site -list=enabled
+```
+
+僅列出暫停中網站：
+
+```bash
+sudo clp site -list=disabled
+```
+
+僅列出具備 SSL 憑證網站：
+
+```bash
+sudo clp site -list=ssl
+```
+
+腳本專用的純文字模式（-raw），每行輸出一個網域名稱，方便在迴圈中使用：
+
+```bash
 sudo clp site -list=enabled -raw
 ```
 
 #### ② 建立全新 WordPress 網站 (`clp site <domain> -new`)
 
+互動式建立 (依序提示 Site User、PHP 版本、SSL 模式與管理員帳密)：
+
 ```bash
-# 互動式建立 (依序提示 Site User、PHP 版本、SSL 模式與管理員帳密)
 sudo clp site example.com -new
+```
 
-# 一鍵指定參數建立 (採用 CloudPanel 原生 HTTP-01 驗證)
+一鍵指定參數建立 (採用 CloudPanel 原生 HTTP-01 驗證)：
+
+```bash
 sudo clp site example.com -new -http -php=8.4 -user=myuser
+```
 
-# 一鍵指定參數建立 (採用 Cloudflare DNS-01 API 驗證)
+一鍵指定參數建立 (採用 Cloudflare DNS-01 API 驗證)：
+
+```bash
 sudo clp site example.com -new -dns -php=8.4
+```
 
-# 略過 SSL 申請建立
+略過 SSL 申請建立：
+
+```bash
 sudo clp site example.com -new -ssl=off
+```
 
-# 覆寫已存在的同名網站
+覆寫已存在的同名網站：
+
+```bash
 sudo clp site example.com -new -force-replace
 ```
 
@@ -316,31 +411,51 @@ sudo clp site example.com -new -force-replace
 
 #### ③ SSL 憑證管理 (`clp site <domain> -ssl`)
 
+透過 Cloudflare DNS-01 申請 SSL（自動完成驗證並設定續約排程）：
+
 ```bash
-# 透過 Cloudflare DNS-01 申請 SSL（自動完成驗證並設定續約排程）
 sudo clp site example.com -ssl=on -dns
+```
+
+```bash
 sudo clp site example.com -dns
+```
 
-# 指定特定 Cloudflare API 金鑰設定檔
+指定特定 Cloudflare API 金鑰設定檔：
+
+```bash
 sudo clp site example.com -ssl=on -dns -api=my-cloudflare.ini
+```
 
-# 申請 CloudPanel 原生 HTTP-01 SSL (網域已指向本機 IP)
+申請 CloudPanel 原生 HTTP-01 SSL (網域已指向本機 IP)：
+
+```bash
 sudo clp site example.com -ssl=on -http
+```
 
-# 關閉並移除 SSL 憑證
+關閉並移除 SSL 憑證：
+
+```bash
 sudo clp site example.com -ssl=off
 ```
 
 #### ④ 同機網站複製 (`clp site -clone-from`)
 
+基本複製 (目標站不存在將全自動建立)：
+
 ```bash
-# 基本複製 (目標站不存在將全自動建立)
 sudo clp site -clone-from=example.com new-example.com
+```
 
-# 覆寫已存在的目標站
+覆寫已存在的目標站：
+
+```bash
 sudo clp site -clone-from=example.com new-example.com -force-replace
+```
 
-# 自訂目標站使用者或 PHP 版本
+自訂目標站使用者或 PHP 版本：
+
+```bash
 sudo clp site -clone-from=example.com new-example.com -user=newuser -php=8.4
 ```
 
@@ -352,17 +467,27 @@ sudo clp site -clone-from=example.com new-example.com -user=newuser -php=8.4
 
 #### ⑤ 跨主機網站安全搬移 (`clp site -migrate`)
 
+同網域跨主機搬遷 (網域保持不變，略過 search-replace)：
+
 ```bash
-# 同網域跨主機搬遷 (網域保持不變，略過 search-replace)
 sudo clp site -migrate=remote-vps -from=example.com
+```
 
-# 不同網域跨主機搬遷 (自動執行資料庫網址置換)
+不同網域跨主機搬遷 (自動執行資料庫網址置換)：
+
+```bash
 sudo clp site -migrate=remote-vps -from=example.com new-site.com
+```
 
-# 批次搬移遠端主機所有網站至本地 (網域不變)
+批次搬移遠端主機所有網站至本地 (網域不變)：
+
+```bash
 sudo clp site -migrate=remote-vps -all
+```
 
-# 批次搬移並排除特定測試子網域
+批次搬移並排除特定測試子網域：
+
+```bash
 sudo clp site -migrate=remote-vps -all -exclude="test.,dev.,staging." -force-replace
 ```
 
@@ -373,17 +498,27 @@ sudo clp site -migrate=remote-vps -all -exclude="test.,dev.,staging." -force-rep
 
 #### ⑥ 啟用、停用與刪除網站
 
+暫停網站服務 (檔案與資料庫完整保留)：
+
 ```bash
-# 暫停網站服務 (檔案與資料庫完整保留)
 sudo clp site example.com -off
+```
 
-# 重新啟動網站
+重新啟動網站：
+
+```bash
 sudo clp site example.com -on
+```
 
-# 互動確認刪除網站與對應資料庫
+互動確認刪除網站與對應資料庫：
+
+```bash
 sudo clp site delete example.com
+```
 
-# 強制刪除網站 (略過確認提示)
+強制刪除網站 (略過確認提示)：
+
+```bash
 sudo clp site delete example.com --force
 ```
 
@@ -393,20 +528,33 @@ sudo clp site delete example.com --force
 
 一鍵為網域設定 Cloudflare 的 Full (Strict) SSL、Always Use HTTPS、最低 TLS 1.2，並部署 4 條 WAF 規則（保護 WP 後台登入、阻斷 XML-RPC、封鎖敏感原始檔/備份檔、攔截惡意掃描器與空 UA）：
 
+一鍵為指定網域設定邊緣安全性並部署 WAF 規則：
+
 ```bash
-# 一鍵為指定網域設定邊緣安全性並部署 WAF 規則
 sudo clp site example.com -cf-waf
+```
 
-# 模擬執行 (驗證 Token、解析 Zone ID 並輸出即將套用之規則 JSON，不實際變更)
+模擬執行 (驗證 Token、解析 Zone ID 並輸出即將套用之規則 JSON，不實際變更)：
+
+```bash
 sudo clp site example.com -cf-waf --dry-run
+```
 
-# 指定後台登入放行白名單 IP
+指定後台登入放行白名單 IP：
+
+```bash
 sudo clp site example.com -cf-waf --whitelist="1.2.3.4,5.6.7.8"
+```
 
-# 查詢網域目前邊緣安全防禦與 WAF 規則狀態
+查詢網域目前邊緣安全防禦與 WAF 規則狀態：
+
+```bash
 sudo clp site example.com -cf-waf=status
+```
 
-# 安全清理與停用 (僅刪除 [CLP] 規則，完整保留使用者自訂規則)
+安全清理與停用 (僅刪除 [CLP] 規則，完整保留使用者自訂規則)：
+
+```bash
 sudo clp site example.com -cf-waf=off
 ```
 
@@ -436,17 +584,27 @@ sudo clp server
 
 適用於剛開通的 Ubuntu／Debian VPS（Debian 未經測試）：
 
+互動式引導安裝 (自選資料庫引擎與 17 個核心模組)：
+
 ```bash
-# 互動式引導安裝 (自選資料庫引擎與 17 個核心模組)
 sudo clp server install
+```
 
-# 一鍵快速安裝建議設定 (預設 MySQL 8.4 LTS)
+一鍵快速安裝建議設定 (預設 MySQL 8.4 LTS)：
+
+```bash
 sudo clp server install -y
+```
 
-# 指定 MariaDB 11.4 LTS 安裝
+指定 MariaDB 11.4 LTS 安裝：
+
+```bash
 sudo clp server install -y --db=MARIADB_11.4
+```
 
-# 模擬測試模式 (不對系統做任何異動)
+模擬測試模式 (不對系統做任何異動)：
+
+```bash
 sudo clp server install --dry-run
 ```
 
@@ -473,51 +631,150 @@ sudo clp server install --dry-run
 
 針對已經在使用中的 CloudPanel 主機，逐項強化安全設定：
 
-```bash
-# 逐項互動確認加固
-sudo clp server -harden
+逐項互動確認加固：
 
-# 一鍵套用加固
+```bash
+sudo clp server -harden
+```
+
+一鍵套用加固：
+
+```bash
 sudo clp server -harden -y
 ```
 
 #### ④ 輔助工具隨選安裝 (`sudo clp server -install=...`)
 
+安裝 Netdata 效能監控：
+
 ```bash
-sudo clp server -install=netdata    # 安裝 Netdata 效能監控
-sudo clp server -install=rclone     # 安裝 Rclone 雲端備份工具
-sudo clp server -install=certbot    # 安裝 Certbot 與 Cloudflare DNS 外掛
-sudo clp server -install=wordfence  # 安裝 Wordfence CLI 掃描器
-sudo clp server -install=smtp       # 安裝 Postfix Relay 郵件服務
-sudo clp server -install=all -y     # 一鍵全數安裝
+sudo clp server -install=netdata
+```
+
+安裝 Rclone 雲端備份工具：
+
+```bash
+sudo clp server -install=rclone
+```
+
+安裝 Certbot 與 Cloudflare DNS 外掛：
+
+```bash
+sudo clp server -install=certbot
+```
+
+安裝 Wordfence CLI 掃描器：
+
+```bash
+sudo clp server -install=wordfence
+```
+
+安裝 Postfix Relay 郵件服務：
+
+```bash
+sudo clp server -install=smtp
+```
+
+一鍵全數安裝：
+
+```bash
+sudo clp server -install=all -y
 ```
 
 #### ⑤ 獨立日常維運指令
 
+**防火牆維運**
+
+檢視防火牆規則清單：
+
 ```bash
-# 防火牆維運
-sudo clp server -ufw               # 檢視防火牆規則清單
-sudo clp server -ufw -allow=8080   # 放行特定連接埠
-sudo clp server -ufw -icmp=drop    # 阻擋外網 Ping
+sudo clp server -ufw
+```
 
-# SSH 維運與緊急復原
-sudo clp server -ssh               # 查看 SSH 設定與金鑰數量
-sudo clp server -ssh -harden       # 停用密碼登入
-sudo clp server -ssh -unharden     # 【緊急復原】：臨時恢復密碼登入
+放行特定連接埠：
 
-# Fail2ban 入侵防護
-sudo clp server -fail2ban          # 查看被封鎖的 IP 清單
-sudo clp server -fail2ban -unban=203.0.113.10  # 解鎖指定 IP
-sudo clp server -fail2ban -unban=all           # 一鍵解鎖所有 IP
-sudo clp server -fail2ban -whitelist=1.2.3.4  # 新增白名單
+```bash
+sudo clp server -ufw -allow=8080
+```
 
-# 系統 DNS 與時區同步
-sudo clp server -dns=auto          # 自動設定 Google/Cloudflare DNS
-sudo clp server -timezone=Asia/Taipei # 一鍵同步系統與全機所有 PHP 版本時區
+阻擋外網 Ping：
 
-# 郵件測試與磁碟空間瘦身
-sudo clp server -smtp -test=admin@example.com  # 發送測試信驗證 SMTP
-sudo clp server -clean             # 清理日誌、APT 暫存套件與暫存檔，並顯示釋放了多少空間
+```bash
+sudo clp server -ufw -icmp=drop
+```
+
+**SSH 維運與緊急復原**
+
+查看 SSH 設定與金鑰數量：
+
+```bash
+sudo clp server -ssh
+```
+
+停用密碼登入：
+
+```bash
+sudo clp server -ssh -harden
+```
+
+緊急復原，暫時恢復密碼登入：
+
+```bash
+sudo clp server -ssh -unharden
+```
+
+**Fail2ban 入侵防護**
+
+查看被封鎖的 IP 清單：
+
+```bash
+sudo clp server -fail2ban
+```
+
+解鎖指定 IP：
+
+```bash
+sudo clp server -fail2ban -unban=203.0.113.10
+```
+
+一鍵解鎖所有 IP：
+
+```bash
+sudo clp server -fail2ban -unban=all
+```
+
+新增白名單：
+
+```bash
+sudo clp server -fail2ban -whitelist=1.2.3.4
+```
+
+**系統 DNS 與時區同步**
+
+自動設定 Google/Cloudflare DNS：
+
+```bash
+sudo clp server -dns=auto
+```
+
+一鍵同步系統與全機所有 PHP 版本時區：
+
+```bash
+sudo clp server -timezone=Asia/Taipei
+```
+
+**郵件測試與磁碟空間瘦身**
+
+發送測試信驗證 SMTP：
+
+```bash
+sudo clp server -smtp -test=admin@example.com
+```
+
+清理日誌、APT 暫存套件與暫存檔，並顯示釋放了多少空間：
+
+```bash
+sudo clp server -clean
 ```
 
 ---
@@ -540,20 +797,33 @@ sudo clp backup <domain|all> [options...]
 
 #### ② 實用操作範例
 
+備份指定網站資料庫至本機：
+
 ```bash
-# 備份指定網站資料庫至本機
 sudo clp backup example.com -type=db
+```
 
-# 每日備份資料庫並保留 7 天
+每日備份資料庫並保留 7 天：
+
+```bash
 sudo clp backup example.com -type=db -expire=7d
+```
 
-# 完整備份網站至本地，自動清除 30 天前備份
+完整備份網站至本地，自動清除 30 天前備份：
+
+```bash
 sudo clp backup example.com -type=full -expire=30d
+```
 
-# 精簡備份至 Google Drive (透過 rclone)
+精簡備份至 Google Drive (透過 rclone)：
+
+```bash
 sudo clp backup example.com -type=compact -to=google
+```
 
-# 全伺服器網站批次備份至雲端，排除測試網站並保留 14 天
+全伺服器網站批次備份至雲端，排除測試網站並保留 14 天：
+
+```bash
 sudo clp backup all -type=full -to=b2 -expire=14d -exclude="test.,dev.,staging."
 ```
 
@@ -563,11 +833,15 @@ sudo clp backup all -type=full -to=b2 -expire=14d -exclude="test.,dev.,staging."
 
 #### ① 互動式選單還原 (省略 `-file` 參數)
 
-```bash
-# 從本機備份清單中選取還原
-sudo clp restore example.com
+從本機備份清單中選取還原：
 
-# 從 Google Drive 雲端備份清單中選取還原
+```bash
+sudo clp restore example.com
+```
+
+從 Google Drive 雲端備份清單中選取還原：
+
+```bash
 sudo clp restore example.com -to=google
 ```
 
@@ -575,11 +849,15 @@ sudo clp restore example.com -to=google
 
 #### ② 精確命令列還原
 
-```bash
-# 指定本機特定備份檔案還原
-sudo clp restore example.com -file=example.com-db-20261005_120000.sql.gz
+指定本機特定備份檔案還原：
 
-# 指定遠端備份檔案且免確認強制還原
+```bash
+sudo clp restore example.com -file=example.com-db-20261005_120000.sql.gz
+```
+
+指定遠端備份檔案且免確認強制還原：
+
+```bash
 sudo clp restore example.com -file=example.com-full-20261005_153000.tar.gz -to=b2 --force
 ```
 
@@ -591,17 +869,27 @@ sudo clp restore example.com -file=example.com-full-20261005_153000.tar.gz -to=b
 
 #### ① 帳號管理
 
+互動式新增使用者 (密碼輸入時遮蔽)：
+
 ```bash
-# 互動式新增使用者 (密碼輸入時遮蔽)
 sudo clp httpauth example.com -add
+```
 
-# 指令指定帳號與密碼新增（注意：密碼會留在 shell 歷史紀錄中，建議使用互動模式）
+指令指定帳號與密碼新增（注意：密碼會留在 shell 歷史紀錄中，建議使用互動模式）：
+
+```bash
 sudo clp httpauth example.com -add=[admin,StrongPassword123!]
+```
 
-# 刪除指定使用者
+刪除指定使用者：
+
+```bash
 sudo clp httpauth example.com -delete=admin
+```
 
-# 列出目前所有認證使用者
+列出目前所有認證使用者：
+
+```bash
 sudo clp httpauth example.com -list
 ```
 
@@ -609,24 +897,35 @@ sudo clp httpauth example.com -list
 
 針對 `/wp-admin/` 與 `wp-login.php` 加上 HTTP 認證，阻擋暴力破解的機器人：
 
-```bash
-# 開啟後台防護
-sudo clp httpauth example.com -wp-admin
+開啟後台防護：
 
-# 關閉後台防護
+```bash
+sudo clp httpauth example.com -wp-admin
+```
+
+關閉後台防護：
+
+```bash
 sudo clp httpauth example.com -wp-admin -off
 ```
 
 #### ③ 全站或自訂路徑保護 (`-path`)
 
+全站密碼保護 (適合 Staging 預備環境)：
+
 ```bash
-# 全站密碼保護 (適合 Staging 預備環境)
 sudo clp httpauth example.com -path=/
+```
 
-# 移除全站保護
+移除全站保護：
+
+```bash
 sudo clp httpauth example.com -path=/ -off
+```
 
-# 保護特定子目錄
+保護特定子目錄：
+
+```bash
 sudo clp httpauth example.com -path=/staging
 ```
 
@@ -634,17 +933,27 @@ sudo clp httpauth example.com -path=/staging
 
 設定固定 IP 或公司網段免密碼直接通行（Nginx `satisfy any` 機制）：
 
+追加 IP 至白名單 (支援 CIDR)：
+
 ```bash
-# 追加 IP 至白名單 (支援 CIDR)
 sudo clp httpauth example.com -whitelist=203.0.113.50,192.168.1.0/24
+```
 
-# 移除特定 IP
+移除特定 IP：
+
+```bash
 sudo clp httpauth example.com -whitelist=203.0.113.50 -delete
+```
 
-# 清除全部白名單 (所有人皆須密碼)
+清除全部白名單 (所有人皆須密碼)：
+
+```bash
 sudo clp httpauth example.com -whitelist=clear
+```
 
-# 檢視綜合防護狀態看板
+檢視綜合防護狀態看板：
+
+```bash
 sudo clp httpauth example.com -list=protected
 ```
 
@@ -654,11 +963,15 @@ sudo clp httpauth example.com -list=protected
 
 針對高負載環境調校 PHP-FPM 行程池參數（`pm.max_children = 35`, `pm.process_idle_timeout = 30s`, `pm.max_requests = 300`）：
 
-```bash
-# 調校單一網站 (自動對應網站實際使用的 PHP 版本)
-sudo clp php-pm example.com
+調校單一網站 (自動對應網站實際使用的 PHP 版本)：
 
-# 批次調校全機所有網站
+```bash
+sudo clp php-pm example.com
+```
+
+批次調校全機所有網站：
+
+```bash
 sudo clp php-pm all
 ```
 
@@ -680,29 +993,59 @@ CLP Helper 提供專屬的全域設定管理模組 (`clp config`)，把偏好設
 
 #### 指令語法與範例
 
+設定系統全域預設語系為繁體中文：
+
 ```bash
-# 設定系統全域預設語系為繁體中文
 sudo clp config -set lang=zh_TW
+```
 
-# 設定系統全域預設語系為英文 (WordPress 標準)
+設定系統全域預設語系為英文 (WordPress 標準)：
+
+```bash
 sudo clp config -set lang=en_US
+```
 
-# 設定全域 Cloudflare API Token (支援直接輸入 Token 字串)
+設定全域 Cloudflare API Token (支援直接輸入 Token 字串)：
+
+```bash
 sudo clp config -set cf-token="your_cloudflare_api_token"
+```
 
-# 設定全域 Cloudflare API Token (支援直接傳入憑證檔路徑，自動提取 Token)
+設定全域 Cloudflare API Token (支援直接傳入憑證檔路徑，自動提取 Token)：
+
+```bash
 sudo clp config -set cf-token="/root/.secrets/example.ini"
+```
 
-# 查詢已設定之參數 (機敏 Token 自動遮蔽顯示: 1234****cdef，並標註來源)
+查詢已設定之參數 (機敏 Token 自動遮蔽顯示: 1234****cdef，並標註來源)：
+
+```bash
 sudo clp config -get lang
+```
+
+```bash
 sudo clp config -get cf-token
-sudo clp config -get cf-token --raw    # 取得原始未遮蔽 Token
+```
 
-# 列出所有目前已生效之全域設定
+取得原始未遮蔽 Token：
+
+```bash
+sudo clp config -get cf-token --raw
+```
+
+列出所有目前已生效之全域設定：
+
+```bash
 sudo clp config -list
+```
 
-# 清除指定設定鍵（恢復為系統預設值）
+清除指定設定鍵（恢復為系統預設值）：
+
+```bash
 sudo clp config -unset lang
+```
+
+```bash
 sudo clp config -unset cf-token
 ```
 
