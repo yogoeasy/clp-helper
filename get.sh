@@ -13,7 +13,9 @@
 #   sudo bash clp-get.sh --lang=zh_TW
 #
 # Environment variables:
-#   CLP_REF   Branch or tag to install (default: main), e.g. CLP_REF=v1.0.0
+#   CLP_REF   Branch or tag to install (default: main). Pass it after sudo so it
+#             is not dropped by sudo's environment reset:
+#               sudo CLP_REF=v1.0.0 bash clp-get.sh
 # ==============================================================================
 set -euo pipefail
 
