@@ -1,0 +1,776 @@
+# CLP Helper — WordPress Management CLI for CloudPanel
+
+> **Language / 語言切換**: **English** | [繁體中文 (Traditional Chinese)](README.zh-TW.md)
+> 
+> 💡 *歡迎使用繁體中文！若您習慣閱讀繁體中文，請點擊上方連結查閱完整手冊。Issues 與 Discussions 亦歡迎使用中文交流。*
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![OS: Ubuntu 22.04 / 24.04 / 26.04](https://img.shields.io/badge/OS-Ubuntu%2022.04%20%7C%2024.04%20%7C%2026.04%20LTS-orange.svg)](https://ubuntu.com/)
+[![Platform: CloudPanel v2](https://img.shields.io/badge/Platform-CloudPanel%20v2-blue.svg)](https://www.cloudpanel.io/)
+[![Shell: Bash 5+](https://img.shields.io/badge/Shell-Bash%205%2B-green.svg)](https://www.gnu.org/software/bash/)
+
+**CLP Helper** is a command-line toolkit for managing **WordPress sites** on **CloudPanel v2** servers. It focuses on the day-to-day work of running WordPress: creating sites, SSL, backups and restores, cloning and cross-server migration, access protection, and PHP-FPM tuning. It also includes one-click deployment and security hardening for fresh VPS instances.
+
+**CLP Helper (`clp`)** bridges the gap between CloudPanel's web GUI and underlying Linux operational automation, bringing scriptable workflows, dual-track Let's Encrypt automation (HTTP-01 & Cloudflare DNS-01), cross-server migration that never writes to the source server, and multi-cloud remote backup integration to terminal users.
+
+> **Disclaimer:** CLP Helper is an independent, community-developed project. It is not affiliated with, endorsed by, or sponsored by CloudPanel or MGT Commerce GmbH. "CloudPanel" is used only to describe compatibility. The `clp` command is separate from CloudPanel's official `clpctl`.
+
+---
+
+## Table of Contents
+
+- [1. Key Features](#1-key-features)
+- [2. System Requirements & Compatibility](#2-system-requirements--compatibility)
+- [3. Installation & Quick Start](#3-installation--quick-start)
+- [4. Command Architecture](#4-command-architecture)
+- [5. Language & Internationalization (i18n)](#5-language--internationalization-i18n)
+- [6. Modules Reference](#6-modules-reference)
+  - [1. Site Management (`clp site`)](#1-site-management-clp-site)
+  - [2. Server Operations & Hardening (`clp server`)](#2-server-operations--hardening-clp-server)
+  - [3. Backup Module (`clp backup`)](#3-backup-module-clp-backup)
+  - [4. Restore Module (`clp restore`)](#4-restore-module-clp-restore)
+  - [5. HTTP Basic Authentication (`clp httpauth`)](#5-http-basic-authentication-clp-httpauth)
+  - [6. PHP-FPM Pool Tuning (`clp php-pm`)](#6-php-fpm-pool-tuning-clp-php-pm)
+  - [7. Global Configuration Management (`clp config`)](#7-global-configuration-management-clp-config)
+- [7. Crontab Best Practices](#7-crontab-best-practices)
+- [8. Security Architecture](#8-security-architecture)
+- [9. Directory Structure](#9-directory-structure)
+- [10. License](#10-license)
+
+---
+
+## 1. Key Features
+
+- ⚡ **Full Lifecycle WordPress Management**: One-click provisioning of sites, MySQL databases, and WordPress core, with automatic caching plugin setup, Nginx reload, and SSL configuration.
+- 🔒 **Dual-Track Let's Encrypt SSL**: Supports both CloudPanel native HTTP-01 challenge and Cloudflare DNS-01 API automated challenge, with dedicated Certbot virtualenv deployment and automated weekly renewal crontab.
+- 🔄 **Same-Host Site Cloning (Staging / Clone)**: Rapidly duplicate existing sites to new domains with automatic Path Sanitization, Wordfence WAF file re-pointing, Redis cache key salt isolation, `wp search-replace`, and `robots.txt` corrections.
+- 🚀 **Zero-Write Cross-Server Migration**:
+  - Source server is **100% read-only**; no temporary files or modifications are ever created on the source.
+  - Three-tier site detection (SQLite DB ➔ Nginx configuration ➔ Physical directory).
+  - Pre-flight validation checks for active admin sessions and 10-minute post edit locks (`_edit_lock`) to prevent overwriting in-progress drafts.
+  - Database transfer via compressed SSH stream directly to target, verified before import; zero writes to source host.
+  - Supports single-site migration and batch unattended migration of all sites (`-all`).
+- 🛡️ **Server Operations & 17-Module One-Click Installer**:
+  - **System Dashboard**: Real-time 3-area audit covering system overview, running services, and security metrics.
+  - **Fresh VPS Installer**: Dynamically matches official compatible database engines (MySQL 8.4 LTS, MariaDB 11.4 LTS, etc.) with 17 core modules selectable via an interactive switchboard.
+  - **Anti-Lockout Security Hardening**: SSH dual-key validation, password authentication disabling, UFW firewall rules, Fail2ban brute-force defense, systemd journal size capping (500M), and kernel sysctl tuning.
+- 📦 **Flexible Backup & Cloud Sync**: 3 backup formats (`db`, `compact`, `full`) natively integrated with `rclone` supporting Google Drive, Backblaze B2, Cloudflare R2, and AWS S3, complete with precision expired backup cleanup (`-expire`).
+- 🔐 **HTTP Basic Authentication & IP Whitelisting**: Protect WordPress admin dashboard (`/wp-admin/` and `wp-login.php`), entire site, or custom subdirectories, with CIDR IP whitelisting for password-free bypass.
+- ⚙️ **Dynamic PHP-FPM Pool Tuning**: Automatically detects active PHP versions per site, adapts pool configuration parameters, and performs syntax tests with instant rollback safeguards.
+- 💡 **Smart Typo Suggestion**: Automatically identifies mistyped domain names using Levenshtein distance and suggests closest matching existing sites.
+
+---
+
+## 2. System Requirements & Compatibility
+
+| Item | Requirement |
+| :--- | :--- |
+| **Operating System** | Ubuntu 22.04 LTS / Ubuntu 24.04 LTS / Ubuntu 26.04 LTS (Standard and Minimal images; tested)<br>Debian 11 / Debian 12 (expected to work, but not tested) |
+| **Control Panel** | CloudPanel v2 |
+| **Permissions** | `root` user privilege (`sudo`) |
+| **Environment** | Bash 5.0+, `curl`, `rsync`, `tar`, `gzip` (installer auto-installs missing packages) |
+
+All end-to-end testing has been done on Ubuntu 22.04, 24.04, and 26.04. Debian is supported by CloudPanel and CLP Helper does not block it, but it has not been tested. Please report any issues.
+
+---
+
+## 3. Installation & Quick Start
+
+### 1. Download & Install
+
+Run one of the following on your CloudPanel server as root. All three methods give the same result.
+
+**Option 1: One-line install (recommended)**
+
+The installer script is saved to a file first, so you can inspect it before running it:
+
+```bash
+# Using curl
+curl -fsSL https://raw.githubusercontent.com/yogoeasy/clp-helper/main/get.sh -o clp-get.sh && sudo bash clp-get.sh
+
+# Or using wget
+wget -qO clp-get.sh https://raw.githubusercontent.com/yogoeasy/clp-helper/main/get.sh && sudo bash clp-get.sh
+```
+
+`get.sh` downloads the latest version from GitHub into a temporary directory, runs `install.sh`, and removes the temporary files when it finishes.
+
+**Option 2: Download the archive**
+
+```bash
+# Using curl
+curl -fsSL https://github.com/yogoeasy/clp-helper/archive/refs/heads/main.tar.gz | tar xz && sudo bash clp-helper-main/install.sh
+
+# Or using wget
+wget -qO- https://github.com/yogoeasy/clp-helper/archive/refs/heads/main.tar.gz | tar xz && sudo bash clp-helper-main/install.sh
+```
+
+You can delete the extracted `clp-helper-main` directory after installation.
+
+**Option 3: git clone**
+
+```bash
+git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/install.sh
+```
+
+You can delete the `clp-helper` directory after installation.
+
+**Interface language**: append `--lang=en_US` (or `--lang=zh_TW`) to any of the commands above, e.g. `sudo bash clp-get.sh --lang=zh_TW`.
+
+The installer will automatically:
+- Install the program to `/usr/local/lib/clp-helper/` (legacy installations at `/home/clp/clp/` are migrated automatically).
+- Create the command link `/usr/local/bin/clp`, so `clp` can be run from any directory.
+- Set file ownership and permissions, and create the `/var/log/clp` log directory.
+
+**Updating**: run any of the installation methods again. Your settings (`/etc/clp/`), backups (`/root/clpBackup/`) and site data are not affected.
+
+### 2. Verify Installation
+
+In any terminal window:
+
+```bash
+# Check version information
+clp -v
+# Output example: CLP Helper v1.0.0 (build 2026-10-13 22:44:03)
+
+# Display global help menu
+clp --help
+```
+
+### 3. Uninstallation
+
+To completely remove CLP Helper from your system:
+
+```bash
+sudo bash /usr/local/lib/clp-helper/install.sh --uninstall
+```
+
+---
+
+## 4. Command Architecture
+
+CLP Helper follows a unified, intuitive command syntax:
+
+```bash
+sudo clp <module> [target_domain] [options...]
+```
+
+### Core Modules Quick Overview
+
+| Module | Description | Common Commands |
+| :--- | :--- | :--- |
+| **`site`** | WordPress Site Management | `-new`, `-list`, `-on`, `-off`, `-ssl`, `-cf-waf`, `-clone-from`, `-migrate`, `delete` |
+| **`server`** | Server Operations & Hardening | `(no args)`, `install`, `-harden`, `-ufw`, `-ssh`, `-fail2ban`, `-clean` |
+| **`backup`** | Site & Database Backup | `-type={db\|full\|compact}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
+| **`restore`** | Site & Database Restore | `[-file=<name>]`, `-type={db\|full\|compact}`, `-to={local\|<remote>}` |
+| **`httpauth`** | HTTP Authentication & Whitelisting | `-add`, `-delete`, `-list`, `-wp-admin`, `-path`, `-whitelist` |
+| **`php-pm`** | PHP-FPM Pool Optimization | `<domain>`, `all` |
+| **`config`** | Global Preferences & Credentials | `-set <key>=<val>`, `-get <key>`, `-list`, `-unset <key>` |
+
+### Global Options
+
+| Option | Description | Example |
+| :--- | :--- | :--- |
+| `--lang=<lang>` | Specify interface language (`en_US`, `zh_TW`) | `sudo clp --lang=zh_TW --help` |
+| `-h`, `--help` | Display help menu (global or module-specific) | `sudo clp --help` |
+| `-v`, `-V`, `--version` | Display version and build information | `clp -v` |
+
+---
+
+## 5. Language & Internationalization (i18n)
+
+CLP Helper features a built-in internationalization (i18n) engine adhering to the **WordPress and GNU gettext language code standard** (`ISO-639` language code + `ISO-3166` country code), natively supporting **English (`en_US`)** and **Taiwan Traditional Chinese (`zh_TW`)**.
+
+### Language Detection Cascade
+
+The interface language is dynamically resolved in the following priority order:
+1. **Command-Line Flag** (`--lang=...` or `-lang=...`): Highest priority, applies to the current command invocation (e.g. `--lang=en_US` or `--lang=zh_TW`; legacy `--lang=en` automatically maps to `en_US`).
+2. **Environment Variable** (`CLP_LANG`): Session-wide or persistent override in shell profiles.
+3. **Global Configuration File** (`/etc/clp/clp.conf` via `clp config`): Persistent system-wide setting across all users and sessions.
+4. **System Environment Locale** (`LC_ALL`, `LC_MESSAGES`, `LANG`):
+   - Locales such as `zh_TW`, `zh_HK`, `zh_MO`, and `zh_Hant` automatically map to Taiwan Traditional Chinese (`zh_TW`).
+   - All other system locales (e.g. `en_US`, `en_GB`, `C`, `POSIX`) default to English (`en_US`).
+5. **Fallback Default**: English (`en_US`) serves as the universal fallback for international server environments.
+
+### Usage & Examples
+
+#### 1. Runtime Override via Command-Line Flag
+Pass `--lang=zh_TW` or `--lang=en_US` directly to any command:
+
+```bash
+# Display help menu in Traditional Chinese
+sudo clp --lang=zh_TW --help
+
+# Display help menu in English
+sudo clp --lang=en_US --help
+
+# Check version in Traditional Chinese
+clp --lang=zh_TW -v
+
+# Check version in English
+clp --lang=en_US -v
+
+# Run module commands with language flag
+sudo clp --lang=zh_TW site -list
+sudo clp --lang=en_US site example.com -new
+sudo clp --lang=zh_TW server
+```
+
+#### 2. Persistent Override via Environment Variable
+Set `CLP_LANG` in your current terminal session or persist it in `~/.bashrc` / `/etc/environment`:
+
+```bash
+# Switch current terminal session to Traditional Chinese
+export CLP_LANG="zh_TW"
+clp -v
+sudo clp --help
+
+# Switch current terminal session to English
+export CLP_LANG="en_US"
+clp -v
+sudo clp --help
+```
+
+#### 3. Persistent Configuration via `clp config`
+You can permanently configure your preferred system-wide default language using `clp config` without needing to export environment variables on every login:
+
+```bash
+# Set system-wide default language to Traditional Chinese
+sudo clp config -set lang=zh_TW
+
+# Set system-wide default language to English
+sudo clp config -set lang=en_US
+
+# Query the currently configured default language
+clp config -get lang
+
+# Remove language configuration (reverts to system locale auto-detection)
+sudo clp config -unset lang
+```
+
+#### 4. Installer Language Selection (`install.sh`)
+The installer also fully respects the i18n cascade and runtime language flags:
+
+```bash
+# Run installer in Traditional Chinese
+sudo bash install.sh --lang=zh_TW
+
+# Run installer in English (default on international servers)
+sudo bash install.sh --lang=en_US
+
+# Display installer help menu
+bash install.sh --help
+bash install.sh --lang=zh_TW --help
+
+# Uninstall with specified language
+sudo bash /usr/local/lib/clp-helper/install.sh --uninstall --lang=en_US
+```
+
+---
+
+## 6. Modules Reference
+
+### 1. Site Management (`clp site`)
+
+#### ① Site Listing (`clp site -list`)
+
+```bash
+# Table view: list all sites
+sudo clp site -list
+
+# Filter by state or SSL
+sudo clp site -list=enabled     # Only enabled sites
+sudo clp site -list=disabled    # Only paused sites
+sudo clp site -list=ssl         # Only sites with active SSL
+
+# Raw script mode (-raw): output domain names only, one per line
+sudo clp site -list=enabled -raw
+```
+
+#### ② Create New WordPress Site (`clp site <domain> -new`)
+
+```bash
+# Interactive creation (prompts for site user, PHP version, SSL mode, admin credentials)
+sudo clp site example.com -new
+
+# One-line creation using CloudPanel native HTTP-01 challenge
+sudo clp site example.com -new -http -php=8.4 -user=myuser
+
+# One-line creation using Cloudflare DNS-01 API challenge
+sudo clp site example.com -new -dns -php=8.4
+
+# Create site skipping SSL setup
+sudo clp site example.com -new -ssl=off
+
+# Overwrite existing site of the same name
+sudo clp site example.com -new -force-replace
+```
+
+> [!TIP]
+> When running `-new`, pressing `Enter` to leave administrator credentials blank automatically applies defaults (Username defaults to `wpadmin`, a strong password is auto-generated and saved to `/root/.clp/<domain>-wp-admin.txt`, and Email defaults to `wpadmin@wp.com`).
+
+#### ③ SSL Certificate Management (`clp site <domain> -ssl`)
+
+```bash
+# Issue Cloudflare DNS-01 SSL (auto cron renewal & verification)
+sudo clp site example.com -ssl=on -dns
+sudo clp site example.com -dns
+
+# Use specific Cloudflare API credentials file
+sudo clp site example.com -ssl=on -dns -api=my-cloudflare.ini
+
+# Issue CloudPanel native HTTP-01 SSL (domain pointing to server IP)
+sudo clp site example.com -ssl=on -http
+
+# Remove and disable SSL certificate
+sudo clp site example.com -ssl=off
+```
+
+#### ④ Clone / Duplicate Site on Same Host (`clp site -clone-from`)
+
+```bash
+# Basic clone (target site is automatically created if absent)
+sudo clp site -clone-from=example.com new-example.com
+
+# Overwrite existing target site
+sudo clp site -clone-from=example.com new-example.com -force-replace
+
+# Customize user and PHP version for target site
+sudo clp site -clone-from=example.com new-example.com -user=newuser -php=8.4
+```
+
+- **Automation Highlights**:
+  - SSL validation executed first with Fail-Fast abort to prevent wasted transfer time.
+  - Automatically detects and updates Wordfence WAF paths, neutralizing missing paths to avoid PHP 500 errors.
+  - Automatically injects unique random salt (`WP_CACHE_KEY_SALT`) for Redis cache to prevent cross-site cache poisoning.
+  - WP-CLI deep URL replacement and automatic correction of Sitemap URLs in `robots.txt`.
+
+#### ⑤ Zero-Write Cross-Server Migration (`clp site -migrate`)
+
+```bash
+# Same domain migration (keeps domain, skips search-replace)
+sudo clp site -migrate=remote-vps -from=example.com
+
+# Cross-domain migration (automatically executes DB search-replace)
+sudo clp site -migrate=remote-vps -from=example.com new-site.com
+
+# Migrate all sites from remote server to local
+sudo clp site -migrate=remote-vps -all
+
+# Batch migrate with domain exclusions
+sudo clp site -migrate=remote-vps -all -exclude="test.,dev.,staging." -force-replace
+```
+
+- **Safety Highlights**:
+  - **Read-Only on Remote**: Database is transferred via compressed SSH stream to the target host and verified before import; zero files written to source server.
+  - **Edit-Lock Detection**: Automatically detects active post editing locks (`_edit_lock`) within the last 10 minutes to prevent overwriting unsaved work.
+  - **SSH Agent Integration**: Detects key passphrases and loads them into `ssh-agent` for seamless passwordless streaming.
+
+#### ⑥ Site State Management
+
+```bash
+# Pause site (preserves files and databases)
+sudo clp site example.com -off
+
+# Resume site
+sudo clp site example.com -on
+
+# Interactive site and database deletion
+sudo clp site delete example.com
+
+# Force delete without interactive prompt
+sudo clp site delete example.com --force
+```
+
+#### ⑦ Cloudflare Edge WAF & Security Optimization (`clp site <domain> -cf-waf`)
+
+> ⚠️ **Zone-wide:** the [CLP] WAF rules and the SSL/HTTPS/TLS settings apply to the whole Cloudflare zone (every hostname in it). Running `-cf-waf` (or `-cf-waf=off`) for one domain replaces the [CLP] rules for all hostnames in that zone. Your own non-[CLP] rules are kept. Zone settings follow `clp config -set cf-default-mode / cf-always-https / cf-min-tls` when set.
+
+Automatically enforce Full (Strict) SSL, Always Use HTTPS, TLS 1.2+ on Cloudflare Anycast edge, and deploy 4 golden custom WAF rules (Protect WP Admin/Login, Block XML-RPC, Block Sensitive Files/Dumps, Block Bad Scanners):
+
+```bash
+# Optimize edge security and deploy WAF rules for domain
+sudo clp site example.com -cf-waf
+
+# Dry-run simulation (verifies token, resolves zone, outputs payload without changes)
+sudo clp site example.com -cf-waf --dry-run
+
+# Whitelist admin IP addresses for wp-login / wp-admin
+sudo clp site example.com -cf-waf --whitelist="1.2.3.4,5.6.7.8"
+
+# Check edge security and custom WAF rules status
+sudo clp site example.com -cf-waf=status
+
+# Safely remove CLP WAF rules (preserves user custom rules)
+sudo clp site example.com -cf-waf=off
+```
+
+- **Key Security Highlights**:
+  - **4-Level Token Cascade**: Supports CLI `--token`, existing Certbot `/root/.secrets/*.ini` files, global `/etc/clp/clp.conf`, or environment variables.
+  - **Namespace Isolation**: Only rules prefixed with `[CLP]` are managed; existing user rules are never overwritten or removed.
+  - **Quota Guard**: Checks custom rules limit against zone plan (Free 5 / Pro 20 / Business 100 / Enterprise 1000) before deploying, aborting and listing existing rules if exceeded to prevent API 400 errors.
+
+---
+
+### 2. Server Operations & Hardening (`clp server`)
+
+#### ① System Status & Security Audit Dashboard
+
+Run `sudo clp server` to view an instant color-coded audit dashboard:
+
+```bash
+sudo clp server
+```
+
+The dashboard covers 3 key areas:
+1. **System Overview**: OS version, kernel, uptime, public IP, CPU load, RAM/Swap usage, disk usage.
+2. **Service Status**: CloudPanel version, exact database type (MySQL 8.4 / MariaDB 11.4), Nginx, dynamically detected PHP-FPM versions, Redis, UFW firewall, Fail2ban ban count.
+3. **Security Metrics**: SSH password auth status, firewall rules, journald disk cap, unattended security upgrades.
+
+#### ② Fresh VPS One-Click Deployment (`sudo clp server install`)
+
+Designed for newly provisioned Ubuntu / Debian VPS instances (Debian untested):
+
+```bash
+# Interactive guided installer (choose database engine and 17 core modules)
+sudo clp server install
+
+# One-click install with recommended configuration (default MySQL 8.4 LTS)
+sudo clp server install -y
+
+# Specify MariaDB 11.4 LTS
+sudo clp server install -y --db=MARIADB_11.4
+
+# Dry-run test mode (makes zero changes to system)
+sudo clp server install --dry-run
+```
+
+**17 Core Deployment Modules**:
+1. `cloudpanel`: Official CloudPanel CE v2 (dynamic SHA256 integrity verification)
+2. `system_basics`: Essential maintenance packages (`ncdu`, `jq`, `rsync`, locale, timezone)
+3. `ufw`: Firewall default-deny, allow ports 22, 80, 443, 8443, drop ICMP ping
+4. `ssh_hardening`: Strict SSH key anti-lockout check, disable password authentication
+5. `fail2ban`: Brute-force protection rules and auto-ban jails
+6. `dns`: System DNS resolver optimization (Google 8.8.8.8 & Cloudflare 1.1.1.1)
+7. `sysctl`: Linux kernel performance tuning (`swappiness=10`, `file-max=500000`)
+8. `journald`: Limit systemd journal logs to 500M max disk usage
+9. `unattended_upgrades`: Automatic security patch updates
+10. `snap_retention`: Cap Snap revisions to 2 to reclaim disk space
+11. `php_timezone`: Synchronize system and multi-version PHP timezones
+12. `nginx_security`: Global block rules for `.user.ini` and `debug.log` leaks
+13. `smtp`: Postfix external SMTP relay setup
+14. `certbot`: Isolated `/opt/certbot` virtualenv with Cloudflare DNS plugin
+15. `netdata`: Netdata real-time monitoring agent on port 19999
+16. `rclone`: Official Rclone multi-cloud backup engine
+17. `wordfence`: Wordfence CLI malware scanner deployed via pipx
+
+#### ③ Interactive Security Hardening (`sudo clp server -harden`)
+
+Apply security hardening to an existing CloudPanel server step-by-step:
+
+```bash
+# Interactive prompt for each hardening item
+sudo clp server -harden
+
+# Apply all hardening rules without interactive confirmation
+sudo clp server -harden -y
+```
+
+#### ④ Tool Installation On-Demand (`sudo clp server -install=...`)
+
+```bash
+sudo clp server -install=netdata    # Install Netdata monitoring
+sudo clp server -install=rclone     # Install Rclone cloud backup
+sudo clp server -install=certbot    # Install Certbot & Cloudflare DNS plugin
+sudo clp server -install=wordfence  # Install Wordfence CLI scanner
+sudo clp server -install=smtp       # Install Postfix SMTP Relay
+sudo clp server -install=all -y     # Install all tools at once
+```
+
+#### ⑤ Standalone Operations Commands
+
+```bash
+# Firewall management
+sudo clp server -ufw               # View UFW rules
+sudo clp server -ufw -allow=8080   # Allow port
+sudo clp server -ufw -icmp=drop    # Drop external ICMP ping
+
+# SSH management & emergency recovery
+sudo clp server -ssh               # Check SSH status and authorized keys
+sudo clp server -ssh -harden       # Disable password authentication
+sudo clp server -ssh -unharden     # [Emergency Recovery]: Re-enable password auth
+
+# Fail2ban intrusion prevention
+sudo clp server -fail2ban          # View banned IPs
+sudo clp server -fail2ban -unban=203.0.113.10  # Unban specific IP
+sudo clp server -fail2ban -unban=all           # Unban all IPs
+sudo clp server -fail2ban -whitelist=1.2.3.4  # Add IP to whitelist
+
+# System DNS & Timezone synchronization
+sudo clp server -dns=auto          # Configure Google/Cloudflare DNS
+sudo clp server -timezone=Asia/Taipei # Sync timezone across system & PHP versions
+
+# SMTP verification & Disk cleanup
+sudo clp server -smtp -test=admin@example.com  # Send test email
+sudo clp server -clean             # Clean journal logs, APT cache, and temp files
+```
+
+---
+
+### 3. Backup Module (`clp backup`)
+
+#### ① Parameters Specification
+
+```bash
+sudo clp backup <domain|all> [options...]
+```
+
+| Option | Default | Description |
+| :--- | :--- | :--- |
+| `-type={db\|full\|compact}` | `full` | • `db`: Database only (`.sql.gz`)<br>• `compact`: Files without DB (current-year uploads only, excludes caches)<br>• `full`: Complete archive of DB and all site files (`.tar.gz`) |
+| `-to={local\|<remote>}` | `local` | • `local`: Local server storage (`/root/clpBackup`)<br>• `<remote>`: Remote target defined in rclone config (`google`, `b2`, `r2`) |
+| `-path=<path>` | By destination | Custom local or remote folder path |
+| `-expire=<Nd>` | None | Automatically remove expired backups of the same type (`-expire=7d`, `-expire=30d`) |
+| `-exclude=<pattern>` | None | Exclude specific sites (for `backup all`, comma-separated) |
+
+#### ② Usage Examples
+
+```bash
+# Backup single site database locally
+sudo clp backup example.com -type=db
+
+# Daily DB backup retaining 7 days of archives
+sudo clp backup example.com -type=db -expire=7d
+
+# Full site backup to local with 30-day retention
+sudo clp backup example.com -type=full -expire=30d
+
+# Compact backup synced to Google Drive via rclone
+sudo clp backup example.com -type=compact -to=google
+
+# Batch backup all sites to Backblaze B2, excluding staging sites, 14-day retention
+sudo clp backup all -type=full -to=b2 -expire=14d -exclude="test.,dev.,staging."
+```
+
+---
+
+### 4. Restore Module (`clp restore`)
+
+#### ① Interactive Menu Restore (omitting `-file`)
+
+```bash
+# Restore from local backups list
+sudo clp restore example.com
+
+# Restore from Google Drive cloud backups list
+sudo clp restore example.com -to=google
+```
+
+The system will list all available snapshots. Select a number and confirm with `yes` to execute database restoration, file extraction, PHP-FPM reload, and WordPress cache flushing.
+
+#### ② Exact Command Line Restore
+
+```bash
+# Specify local backup file
+sudo clp restore example.com -file=example.com-db-20261005_120000.sql.gz
+
+# Specify remote backup file and force restore without prompt
+sudo clp restore example.com -file=example.com-full-20261005_153000.tar.gz -to=b2 --force
+```
+
+---
+
+### 5. HTTP Basic Authentication (`clp httpauth`)
+
+Password protection and access control for sites. Password files are stored securely outside document roots at `/home/<user>/.htpasswd`:
+
+#### ① User Management
+
+```bash
+# Interactive user creation (masked password input)
+sudo clp httpauth example.com -add
+
+# Command-line creation with inline credentials (Note: inline password will appear in shell history; interactive mode is recommended)
+sudo clp httpauth example.com -add=[admin,StrongPassword123!]
+
+# Delete user
+sudo clp httpauth example.com -delete=admin
+
+# List current authenticated users
+sudo clp httpauth example.com -list
+```
+
+#### ② WordPress Admin Protection (`-wp-admin`)
+
+Enforce HTTP Auth on `/wp-admin/` and `wp-login.php` to prevent automated brute-force attempts:
+
+```bash
+# Enable admin protection
+sudo clp httpauth example.com -wp-admin
+
+# Disable admin protection
+sudo clp httpauth example.com -wp-admin -off
+```
+
+#### ③ Full-Site or Path Protection (`-path`)
+
+```bash
+# Full site protection (ideal for staging environments)
+sudo clp httpauth example.com -path=/
+
+# Remove full site protection
+sudo clp httpauth example.com -path=/ -off
+
+# Protect specific subdirectory
+sudo clp httpauth example.com -path=/staging
+```
+
+#### ④ IP / CIDR Whitelisting (`-whitelist`)
+
+Allow specified IP addresses or office subnets direct access without passwords (Nginx `satisfy any` mechanism):
+
+```bash
+# Add IPs or CIDR blocks to whitelist
+sudo clp httpauth example.com -whitelist=203.0.113.50,192.168.1.0/24
+
+# Remove specific IP from whitelist
+sudo clp httpauth example.com -whitelist=203.0.113.50 -delete
+
+# Clear all whitelisted IPs (all users must authenticate)
+sudo clp httpauth example.com -whitelist=clear
+
+# View protection summary dashboard
+sudo clp httpauth example.com -list=protected
+```
+
+---
+
+### 6. PHP-FPM Pool Tuning (`clp php-pm`)
+
+Tuning PHP-FPM pool parameters for high-traffic workloads (`pm.max_children = 35`, `pm.process_idle_timeout = 30s`, `pm.max_requests = 300`):
+
+```bash
+# Optimize single site (auto-detects active PHP version)
+sudo clp php-pm example.com
+
+# Optimize all sites on the server in batch
+sudo clp php-pm all
+```
+
+- Automatic timestamped backup saved to `/root/php/` prior to any change.
+- Syntax testing via `php-fpm<version> -t` with instant automatic rollback upon syntax errors.
+
+---
+
+### 7. Global Configuration Management (`clp config`)
+
+CLP Helper provides a dedicated configuration management module (`clp config`) to safely persist system preferences and API credentials in `/etc/clp/clp.conf` (strictly secured with `chmod 600`, accessible only by `root`).
+
+#### Supported Configuration Keys
+
+| Key | Description | Allowed Values / Format |
+| :--- | :--- | :--- |
+| `lang` | Default CLI interface language | `en_US`, `zh_TW` |
+| `cf-token` | Cloudflare API Token for edge WAF & SSL DNS-01 automation | Token string or credentials file path (e.g. `/root/.secrets/example.ini`) |
+
+#### Available Commands & Examples
+
+```bash
+# Set system default language to Traditional Chinese
+sudo clp config -set lang=zh_TW
+
+# Set system default language to English (WordPress standard)
+sudo clp config -set lang=en_US
+
+# Set Cloudflare API Token (direct token string)
+sudo clp config -set cf-token="your_cloudflare_api_token"
+
+# Set Cloudflare API Token (credentials file path - auto-extracts token)
+sudo clp config -set cf-token="/root/.secrets/example.ini"
+
+# Query configured value (sensitive tokens are automatically masked: 1234****cdef, shows source)
+sudo clp config -get lang
+sudo clp config -get cf-token
+sudo clp config -get cf-token --raw    # Output unmasked raw token string
+
+# List all current global configuration parameters
+sudo clp config -list
+
+# Remove a configured key (reverts to system default)
+sudo clp config -unset lang
+sudo clp config -unset cf-token
+```
+
+---
+
+## 7. Crontab Best Practices
+
+Automate recurring maintenance tasks via `sudo crontab -e` (Note: CLI log messages are output to `stderr`; always redirect using `>> file 2>&1` in crontab):
+
+```cron
+# ==============================================================================
+# CLP Helper Automated Backup & Maintenance Schedule
+# ==============================================================================
+
+# 1. Daily 03:00 - Database backup of all sites to Google Drive (7-day retention)
+0 3 * * * /usr/local/bin/clp backup all -type=db -to=google -expire=7d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-db.log 2>&1
+
+# 2. Daily 03:30 - Compact file backup of all sites to Google Drive (7-day retention)
+30 3 * * * /usr/local/bin/clp backup all -type=compact -to=google -expire=7d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-compact.log 2>&1
+
+# 3. Monthly 1st 04:00 - Full archive backup to Backblaze B2 (30-day retention)
+0 4 1 * * /usr/local/bin/clp backup all -type=full -to=b2 -expire=30d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-full.log 2>&1
+
+# 4. Weekly Sunday 05:00 - Server cleanup (journal logs, APT packages, temp files)
+0 5 * * 0 /usr/local/bin/clp server -clean >> /var/log/clp/cron-clean.log 2>&1
+```
+
+---
+
+## 8. Security Architecture
+
+1. **Anti-Lockout SSH Guarantee**: Before disabling password authentication, strictly validates public key authorization in `/root/.ssh/authorized_keys` and `SUDO_USER`. Overrides conflicting provider drop-in configs (e.g. `50-cloud-init.conf`) and verifies active parameters using `sshd -T`.
+2. **Zero-Write Cross-Server Migration**: All cross-host transfers stream data into the local instance. No agent or scripts are installed on the remote machine, ensuring source files are never altered or written to.
+3. **Path Sanitization & WAF Fault Tolerance**: Automatically detects legacy paths in plugin configurations (Wordfence WAF, WP Rocket) during site cloning and migration to prevent fatal PHP errors.
+4. **Isolated Redis Cache Salt**: Automatically injects unique random salts into `wp-config.php` for Redis caching to eliminate cross-site cache collision.
+
+---
+
+## 9. Directory Structure
+
+```text
+clp-helper/
+├── clp.sh                   # Main router and command entrypoint
+├── get.sh                   # One-line bootstrap installer (downloads from GitHub, then runs install.sh)
+├── install.sh               # One-click global installer and uninstaller
+├── LICENSE                  # MIT open source license
+├── README.md                # Documentation & manual (English)
+├── README.zh-TW.md          # Documentation & manual (Traditional Chinese)
+├── lib/                     # Core module libraries
+│   ├── backup.sh            # Backup & restore (rclone multi-cloud integration)
+│   ├── cloudflare.sh        # Cloudflare integration (DNS-01 SSL, edge WAF)
+│   ├── clp_fileops.py       # Secure file operations helper (O_NOFOLLOW / fd)
+│   ├── config.sh            # Global configuration management (clp config)
+│   ├── core.sh              # Core utilities (logging, checks, DB access, typos)
+│   ├── httpauth.sh          # HTTP Basic auth & IP whitelisting
+│   ├── httpauth_vhost.py    # Nginx vhost HTTP auth injector helper
+│   ├── i18n.sh              # Internationalization (i18n) runtime engine
+│   ├── php_fpm.sh           # Dynamic PHP-FPM detection and tuning
+│   ├── server.sh            # Server ops, hardening & 17-module installer
+│   └── site.sh              # Site management (create, clone, migrate, delete)
+├── locales/                 # i18n language dictionary files (WordPress standard)
+│   ├── en_US.sh             # English locale strings (primary / fallback: en_US)
+│   ├── en.sh                # Compatibility redirect shim to en_US.sh
+│   └── zh_TW.sh             # Taiwan Traditional Chinese locale strings (zh_TW)
+└── templates/               # Configuration templates
+    ├── cf-rules.conf        # Cloudflare custom WAF rules template
+    └── nginx-httpauth.conf  # HTTP authentication template
+```
+
+---
+
+## 10. License
+
+This project is licensed under the [MIT License](LICENSE).
+Free to modify, distribute, and use commercially.
+
+CLP Helper is an independent project and is not affiliated with CloudPanel or MGT Commerce GmbH. CloudPanel and WordPress are trademarks of their respective owners.

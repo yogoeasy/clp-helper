@@ -1,0 +1,82 @@
+# ==============================================================================
+# CLP Helper - CloudPanel CLI Tool .gitignore
+# ==============================================================================
+
+# Operating System & File System Artifacts
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Logs & Runtime Output
+logs/
+*.log
+/var/log/clp/
+
+# Backups & Database Dumps
+*.sql
+*.sql.gz
+*.tar
+*.tar.gz
+*.zip
+*.bak
+*.bak*
+*.backup
+*.backup.*
+backups/
+clpBackup/
+
+# Temporary Files & Working Caches
+tmp/
+temp/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Secrets, Environment & Credentials
+.env
+.env.*
+!.env.example
+.secrets/
+*.secrets/
+*.key
+*.pem
+*.crt
+*.cert
+*.pfx
+*.p12
+
+# Editor & IDE Directories
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.project
+.settings/
+
+# Private Review, Documentation Drafts & Spec Notes
+review.md
+clp-server.md
+document.md
+*.draft.md
+*.scratch.*
+
+# Scratch & Local Shell Scripts
+test-*.sh
+scratch*.sh
+*.local.sh
+
+# AI Assistant & History Artifacts
+.bash_history
+.claude/
+.gemini/
+.antigravity/
+
+
+__pycache__/
