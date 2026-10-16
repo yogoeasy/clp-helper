@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.0.0 (build 2026-10-16 17:09:25)`
+Output example:`CLP Helper v1.0.0 (build 2026-10-16 17:31:50)`
 
 Display global help menu:
 
@@ -1064,12 +1064,15 @@ Automate recurring maintenance tasks via `sudo crontab -e` (Note: CLI log messag
 # 2. Daily 03:30 - Compact file backup of all sites to Google Drive (7-day retention)
 30 3 * * * /usr/local/bin/clp backup all -type=compact -to=google -expire=7d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-compact.log 2>&1
 
-# 3. Monthly 1st 04:00 - Full archive backup to Backblaze B2 (30-day retention)
-0 4 1 * * /usr/local/bin/clp backup all -type=full -to=b2 -expire=30d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-full.log 2>&1
+# 3. Monthly 1st 04:00 - Full backup to Google Drive (keeps the latest 2)
+0 4 1 * * /usr/local/bin/clp backup all -type=full -to=google -expire=35d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-full.log 2>&1
 
 # 4. Weekly Sunday 05:00 - Server cleanup (journal logs, APT packages, temp files)
 0 5 * * 0 /usr/local/bin/clp server -clean >> /var/log/clp/cron-clean.log 2>&1
 ```
+
+> [!NOTE]
+> Old backups are removed only after the new backup has been uploaded successfully. A 35-day retention for the monthly backup keeps both this month's and last month's copies after every run. Files deleted from Google Drive go to the trash by default and still use space until the trash is emptied; if space is tight, add `use_trash = false` to the rclone Google Drive remote.
 
 ---
 

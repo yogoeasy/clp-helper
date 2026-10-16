@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-16 17:09:25)`
+輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-16 17:31:50)`
 
 查看全域功能說明選單：
 
@@ -1072,12 +1072,15 @@ sudo clp config -unset cf-token
 # 2. 每日凌晨 03:30 執行精簡網站檔案備份至 Google Drive (排除歷史年度圖片，保留 7 天)
 30 3 * * * /usr/local/bin/clp backup all -type=compact -to=google -expire=7d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-compact.log 2>&1
 
-# 3. 每月 1 號凌晨 04:00 執行一次全站完整封裝備份至 Backblaze B2 (保留 30 天)
-0 4 1 * * /usr/local/bin/clp backup all -type=full -to=b2 -expire=30d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-full.log 2>&1
+# 3. 每月 1 號凌晨 04:00 執行全站完整備份至 Google Drive (保留最近 2 份)
+0 4 1 * * /usr/local/bin/clp backup all -type=full -to=google -expire=35d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-full.log 2>&1
 
 # 4. 每週日凌晨 05:00 執行伺服器空間清理瘦身 (日誌與暫存清理)
 0 5 * * 0 /usr/local/bin/clp server -clean >> /var/log/clp/cron-clean.log 2>&1
 ```
+
+> [!NOTE]
+> 舊備份只會在新備份上傳成功後才清除。每月備份的保留天數設為 35 天，可以確保每次執行後都保留「本月＋上月」兩份。Google Drive 刪除的檔案預設會先移到垃圾桶，空間要等垃圾桶清空後才會釋放；若空間有限，可在 rclone 的 Google Drive 遠端設定中加入 `use_trash = false`。
 
 ---
 
