@@ -3514,6 +3514,7 @@ server_clean() {
 # 8. Main Dispatcher for Server Module
 # ------------------------------------------------------------------------------
 server_handler() {
+  local -a raw_args=("$@")
   parse_arguments "$@"
 
   # Help check
@@ -3523,7 +3524,7 @@ server_handler() {
   fi
 
   local action=""
-  local target=""
+  local -a used_pos=()
 
   # 1. 解析首個位置參數 (相容無前綴減號的子指令)
   if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
@@ -3534,18 +3535,18 @@ server_handler() {
         show_server_help
         return 0
         ;;
-      install)  action="install" ;;
-      status)   action="status" ;;
-      audit)    action="audit" ;;
-      harden)   action="harden" ;;
-      clean)    action="clean" ;;
-      ufw)      action="ufw" ;;
-      ssh)      action="ssh" ;;
-      fail2ban) action="fail2ban" ;;
-      dns)      action="dns" ;;
-      timezone) action="timezone" ;;
-      smtp)     action="smtp" ;;
-      *)        target="$p0" ;;
+      install)  action="install";  used_pos+=("${POSITIONAL[0]}") ;;
+      status)   action="status";   used_pos+=("${POSITIONAL[0]}") ;;
+      audit)    action="audit";    used_pos+=("${POSITIONAL[0]}") ;;
+      harden)   action="harden";   used_pos+=("${POSITIONAL[0]}") ;;
+      clean)    action="clean";    used_pos+=("${POSITIONAL[0]}") ;;
+      ufw)      action="ufw";      used_pos+=("${POSITIONAL[0]}") ;;
+      ssh)      action="ssh";      used_pos+=("${POSITIONAL[0]}") ;;
+      fail2ban) action="fail2ban"; used_pos+=("${POSITIONAL[0]}") ;;
+      dns)      action="dns";      used_pos+=("${POSITIONAL[0]}") ;;
+      timezone) action="timezone"; used_pos+=("${POSITIONAL[0]}") ;;
+      smtp)     action="smtp";     used_pos+=("${POSITIONAL[0]}") ;;
+      *)        ;;
     esac
   fi
 
@@ -3587,7 +3588,10 @@ server_handler() {
     action="status"
   fi
 
-  # 4. 前置權限檢查 (所有 server 指令皆須 root 身分)
+  # 4. 驗證位置參數是否有多餘項
+  reject_extra_positionals raw_args "install|harden|unharden|status|audit|clean|ufw|ssh|fail2ban|dns|timezone|smtp|y|yes|dry-run|force" "${used_pos[@]}" || return 1
+
+  # 5. 前置權限檢查 (所有 server 指令皆須 root 身分)
   check_root
 
   # 5. 指令調度分流

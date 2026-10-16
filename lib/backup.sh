@@ -638,6 +638,7 @@ backup_site() {
 # Dispatcher for `clp backup`
 # ------------------------------------------------------------------------------
 backup_handler() {
+  local -a raw_args=("$@")
   parse_arguments "$@"
 
   local domain=""
@@ -665,6 +666,8 @@ backup_handler() {
     echo -e "  sudo clp backup all -type=full -to=b2 -expire=14d -exclude='test.,dev.'"
     return 1
   fi
+
+  reject_extra_positionals raw_args "to|type|path|expire|exclude|y|yes" "$domain" "backup" || return 1
 
   local b_type
   b_type=$(opt_get "type" "full")
@@ -1061,6 +1064,7 @@ restore_site() {
 # Dispatcher for `clp restore`
 # ------------------------------------------------------------------------------
 restore_handler() {
+  local -a raw_args=("$@")
   parse_arguments "$@"
 
   local domain=""
@@ -1087,6 +1091,8 @@ restore_handler() {
     echo -e "  sudo clp restore example.com -to=google -type=full"
     return 1
   fi
+
+  reject_extra_positionals raw_args "to|type|path|file|force|y|yes" "$domain" "restore" || return 1
 
   require_site_exists "$domain" "$(_t "BACKUP_HANDLER_21")" || return 1
 

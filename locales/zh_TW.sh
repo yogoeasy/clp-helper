@@ -143,6 +143,12 @@ CLP_I18N_zh_TW_CORE_ERR_SITE_ROOT_NOT_FOUND="找不到網站根目錄: %s"
 CLP_I18N_zh_TW_CORE_TXT_INSTALLED="已安裝"
 CLP_I18N_zh_TW_CORE_TXT_READY="已就緒"
 
+# Core CLI Argument Validation
+CLP_I18N_zh_TW_CORE_ERR_EXTRA_ARGS="無法識別或多餘的參數: %s"
+CLP_I18N_zh_TW_CORE_HINT_DID_YOU_MEAN_OPT="提示: 您是否想輸入 '-%s'？"
+CLP_I18N_zh_TW_CORE_HINT_OPT_VALUE_FORMAT="提示: 選項值請使用 '=' 連接，您是否想輸入 '-%s=%s'？"
+CLP_I18N_zh_TW_CORE_HINT_OPT_GENERAL_SYNTAX="提示: 選項必須以 '-' 開頭（例如 -off），帶值時請使用 '-選項=值' 格式。"
+
 # ==============================================================================
 # Server Module Localization (zh_TW)
 # ==============================================================================
@@ -998,6 +1004,13 @@ CLP_I18N_zh_TW_HTTPAUTH_DEL_USER_2="%s%s=== 刪除 HTTP Basic Auth 使用者 (%s
 CLP_I18N_zh_TW_HTTPAUTH_DEL_USER_3="請輸入要刪除的使用者名稱 (Username): "
 CLP_I18N_zh_TW_HTTPAUTH_DEL_USER_4="使用者 '%s' 不存在於 %s！"
 CLP_I18N_zh_TW_HTTPAUTH_DEL_USER_5="已成功刪除使用者 '%s'！"
+CLP_I18N_zh_TW_HTTPAUTH_DEL_LAST_USER_WARN="警告: 刪除使用者 '%s' 後，'%s' 將沒有任何 HTTP Auth 使用者，但防護仍處於啟用狀態！受保護的頁面將沒有人能登入。"
+CLP_I18N_zh_TW_HTTPAUTH_DEL_LAST_USER_HINT_WPADMIN="若要先關閉 WordPress 後台防護，請執行: sudo clp httpauth %s -wp-admin -off"
+CLP_I18N_zh_TW_HTTPAUTH_DEL_LAST_USER_HINT_PATH="若要先關閉此路徑防護，請執行: sudo clp httpauth %s -path=%s -off"
+CLP_I18N_zh_TW_HTTPAUTH_DEL_LAST_USER_PROMPT="確定要刪除最後一位使用者嗎？[y/N]: "
+CLP_I18N_zh_TW_HTTPAUTH_DEL_LAST_USER_CANCELLED="操作已取消，未刪除使用者。"
+CLP_I18N_zh_TW_HTTPAUTH_DEL_LAST_USER_ERR_NON_TTY="在非互動模式且未帶 -y 時，無法在 HTTP Auth 防護仍啟用時刪除最後一位使用者。(網站: %s)"
+CLP_I18N_zh_TW_HTTPAUTH_DEL_LAST_USER_AUTO_YES="已啟用全域免確認 (-y)，即使防護仍開啟亦繼續刪除最後一位使用者。"
 CLP_I18N_zh_TW_HTTPAUTH_LIST_USERS_1="%s%s 📋 HTTP Basic Auth 使用者清單: %s%s"
 CLP_I18N_zh_TW_HTTPAUTH_LIST_USERS_2="密碼檔路徑: %s%s%s"
 CLP_I18N_zh_TW_HTTPAUTH_LIST_USERS_3="目前尚未建立任何使用者。"
@@ -1055,10 +1068,6 @@ CLP_I18N_zh_TW_HTTPAUTH_HANDLER_4="未指定 IP！例如: -whitelist=192.168.1.1
 CLP_I18N_zh_TW_HTTPAUTH_HANDLER_5="正在清除 %s 的所有自訂路徑保護..."
 CLP_I18N_zh_TW_HTTPAUTH_HANDLER_6="請指定路徑！例如: -path=/ 或 -path=/staging"
 CLP_I18N_zh_TW_HTTPAUTH_HANDLER_7="若要清除所有路徑保護，請使用: sudo clp httpauth %s -path -delete-all"
-CLP_I18N_zh_TW_HTTPAUTH_HANDLER_8="無法識別或多餘的參數: %s"
-CLP_I18N_zh_TW_HTTPAUTH_HANDLER_9="提示: 您是否想輸入 '-%s'？"
-CLP_I18N_zh_TW_HTTPAUTH_HANDLER_10="提示: 選項值請使用 '=' 連接，您是否想輸入 '-%s=%s'？"
-CLP_I18N_zh_TW_HTTPAUTH_HANDLER_11="提示: 選項必須以 '-' 開頭（例如 -off），帶值時請使用 '-選項=值' 格式。"
 CLP_I18N_zh_TW_BACKUP_VALIDATE_REMOTE_1="未安裝 rclone，正在嘗試呼叫安裝檢查..."
 CLP_I18N_zh_TW_BACKUP_VALIDATE_REMOTE_2="未偵測到任何已配置的 rclone 遠端儲存。請先執行 'rclone config' 進行設定。"
 CLP_I18N_zh_TW_BACKUP_VALIDATE_REMOTE_3="找不到遠端儲存: '%s'！"

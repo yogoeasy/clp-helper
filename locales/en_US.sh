@@ -144,6 +144,12 @@ CLP_I18N_en_US_CORE_ERR_SITE_ROOT_NOT_FOUND="Site document root not found: %s"
 CLP_I18N_en_US_CORE_TXT_INSTALLED="installed"
 CLP_I18N_en_US_CORE_TXT_READY="ready"
 
+# Core CLI Argument Validation
+CLP_I18N_en_US_CORE_ERR_EXTRA_ARGS="Unexpected argument(s): %s"
+CLP_I18N_en_US_CORE_HINT_DID_YOU_MEAN_OPT="Hint: Did you mean '-%s'?"
+CLP_I18N_en_US_CORE_HINT_OPT_VALUE_FORMAT="Hint: Option values must be joined with '='. Did you mean '-%s=%s'?"
+CLP_I18N_en_US_CORE_HINT_OPT_GENERAL_SYNTAX="Hint: Options must start with '-' (e.g. -off) and use '-option=value' when passing values."
+
 # ==============================================================================
 # Server Module Localization (en)
 # ==============================================================================
@@ -999,6 +1005,13 @@ CLP_I18N_en_US_HTTPAUTH_DEL_USER_2="%s%s=== Delete HTTP Basic Auth user (%s) ===
 CLP_I18N_en_US_HTTPAUTH_DEL_USER_3="Username to delete: "
 CLP_I18N_en_US_HTTPAUTH_DEL_USER_4="User '%s' does not exist in %s!"
 CLP_I18N_en_US_HTTPAUTH_DEL_USER_5="User '%s' deleted!"
+CLP_I18N_en_US_HTTPAUTH_DEL_LAST_USER_WARN="Warning: Deleting user '%s' will leave '%s' with no HTTP Auth users while protection is active! Nobody will be able to log in to protected areas."
+CLP_I18N_en_US_HTTPAUTH_DEL_LAST_USER_HINT_WPADMIN="To disable WordPress admin protection first, run: sudo clp httpauth %s -wp-admin -off"
+CLP_I18N_en_US_HTTPAUTH_DEL_LAST_USER_HINT_PATH="To disable path protection first, run: sudo clp httpauth %s -path=%s -off"
+CLP_I18N_en_US_HTTPAUTH_DEL_LAST_USER_PROMPT="Are you sure you want to delete the last user? [y/N]: "
+CLP_I18N_en_US_HTTPAUTH_DEL_LAST_USER_CANCELLED="Deletion cancelled. The user was not deleted."
+CLP_I18N_en_US_HTTPAUTH_DEL_LAST_USER_ERR_NON_TTY="Cannot delete the last user while HTTP Auth protection is active in non-interactive mode without -y. (Site: %s)"
+CLP_I18N_en_US_HTTPAUTH_DEL_LAST_USER_AUTO_YES="Auto-confirm (-y) enabled; proceeding to delete the last user despite active protection."
 CLP_I18N_en_US_HTTPAUTH_LIST_USERS_1="%s%s 📋 HTTP Basic Auth users: %s%s"
 CLP_I18N_en_US_HTTPAUTH_LIST_USERS_2="Password file: %s%s%s"
 CLP_I18N_en_US_HTTPAUTH_LIST_USERS_3="No users have been created yet."
@@ -1056,10 +1069,6 @@ CLP_I18N_en_US_HTTPAUTH_HANDLER_4="No IP specified! e.g. -whitelist=192.168.1.10
 CLP_I18N_en_US_HTTPAUTH_HANDLER_5="Removing all custom path protections of %s..."
 CLP_I18N_en_US_HTTPAUTH_HANDLER_6="Please specify a path! e.g. -path=/ or -path=/staging"
 CLP_I18N_en_US_HTTPAUTH_HANDLER_7="To remove all path protections, use: sudo clp httpauth %s -path -delete-all"
-CLP_I18N_en_US_HTTPAUTH_HANDLER_8="Unexpected argument(s): %s"
-CLP_I18N_en_US_HTTPAUTH_HANDLER_9="Hint: Did you mean '-%s'?"
-CLP_I18N_en_US_HTTPAUTH_HANDLER_10="Hint: Option values must be joined with '='. Did you mean '-%s=%s'?"
-CLP_I18N_en_US_HTTPAUTH_HANDLER_11="Hint: Options must start with '-' (e.g. -off) and use '-option=value' when passing values."
 CLP_I18N_en_US_BACKUP_VALIDATE_REMOTE_1="rclone is not installed; running the installation check..."
 CLP_I18N_en_US_BACKUP_VALIDATE_REMOTE_2="No rclone remote is configured. Run 'rclone config' first."
 CLP_I18N_en_US_BACKUP_VALIDATE_REMOTE_3="Remote storage not found: '%s'!"

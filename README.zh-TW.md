@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-16 11:30:00)`
+輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-16 14:17:48)`
 
 查看全域功能說明選單：
 
@@ -155,6 +155,16 @@ clp --help
 sudo bash /usr/local/lib/clp-helper/install.sh --uninstall
 ```
 
+### 4. 設定中文語系
+
+主機的系統語系不是中文時，預設以英文顯示。若要改成臺灣正體中文介面：
+
+```bash
+sudo clp config -set lang=zh_TW
+```
+
+設定會寫入設定檔，之後執行 `clp` 都會以中文顯示。其他語系設定方式請見[五、多語系與 i18n 設定說明](#五多語系與-i18n-設定說明-language--internationalization)。
+
 ---
 
 ## 四、指令總覽與架構 (Command Architecture)
@@ -164,6 +174,9 @@ CLP Helper 的指令架構設計遵循統一、直覺的語法規範：
 ```bash
 sudo clp <module> [target_domain] [options...]
 ```
+
+> [!NOTE]
+> 需要帶值的選項一律使用 `-option=value` 語法（例如 `-type=full`、`-to=google`、`-cf-waf=off`）。以空白分隔的選項值或無法識別的多餘位置參數將會直接報錯並提供正確語法提示，以避免誤套用非預期的設定。
 
 ### 核心模組速覽
 

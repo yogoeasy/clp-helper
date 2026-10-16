@@ -3572,6 +3572,7 @@ site_cf_waf() {
 # Dispatcher for `clp site`
 # ------------------------------------------------------------------------------
 site_handler() {
+  local -a raw_args=("$@")
   parse_arguments "$@"
 
   # 語法支援:
@@ -3600,6 +3601,11 @@ site_handler() {
       target_domain="$first_pos"
     fi
   fi
+
+  local -a used_pos=("site")
+  [[ -n "$action" ]] && used_pos+=("$action")
+  [[ -n "$target_domain" ]] && used_pos+=("$target_domain")
+  reject_extra_positionals raw_args "on|off|new|list|delete|del|ssl|dns|http|cf-waf|cf_waf|clone-from|clone_from|migrate|y|yes|force-replace|force_replace" "${used_pos[@]}" || return 1
 
   # 檢查 options
   if has_opt "list" || [[ "$action" == "list" ]]; then

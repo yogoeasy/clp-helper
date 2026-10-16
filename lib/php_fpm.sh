@@ -265,6 +265,7 @@ optimize_all_php_fpm() {
 # CLI Handler for `clp php-pm`
 # ------------------------------------------------------------------------------
 php_fpm_handler() {
+  local -a raw_args=("$@")
   parse_arguments "$@"
 
   local domain=""
@@ -281,6 +282,8 @@ php_fpm_handler() {
     log_error "$(_t "PHP_FPM_ERR_TARGET_REQUIRED")"
     return 1
   fi
+
+  reject_extra_positionals raw_args "y|yes" "$domain" || return 1
 
   if [[ "$domain" != "all" ]]; then
     require_site_exists "$domain" "$(_t "PHP_FPM_STEP_OPTIMIZE_SINGLE" "$domain")" || return 1

@@ -841,6 +841,84 @@ opt_get() {
 }
 
 # ------------------------------------------------------------------------------
+# 5b. Positional Argument Validation
+# ------------------------------------------------------------------------------
+# reject_extra_positionals <raw_args_var_name> <known_flags_regex> [used_positionals...]
+#   檢查 POSITIONAL 中是否存在未被指令使用的多餘位置參數。
+#   若有多餘參數：輸出錯誤並針對常見寫法提供提示，回傳 1；無多餘參數則回傳 0。
+reject_extra_positionals() {
+  local _raw_var="$1"
+  local _known_flags="${2:-}"
+  shift 2
+  local -a _used_pos=("$@")
+
+  local -a _raw_args=()
+  if [[ -n "$_raw_var" ]]; then
+    eval "_raw_args=(\"\${${_raw_var}[@]}\")" 2>/dev/null || true
+  fi
+
+  # 比對 POSITIONAL 與已使用的位置參數
+  local -a _used_matched=()
+  local i
+  for ((i = 0; i < ${#_used_pos[@]}; i++)); do
+    _used_matched+=(0)
+  done
+
+  local -a extra_args=()
+  for pos in "${POSITIONAL[@]}"; do
+    local clean_p
+    clean_p=$(clean_domain "$pos")
+    local matched=false
+    local j=0
+    for used in "${_used_pos[@]}"; do
+      if [[ -n "$used" && "${_used_matched[$j]}" -eq 0 ]]; then
+        local clean_u
+        clean_u=$(clean_domain "$used")
+        if [[ "$pos" == "$used" || "$clean_p" == "$used" || "$clean_p" == "$clean_u" ]]; then
+          _used_matched[$j]=1
+          matched=true
+          break
+        fi
+      fi
+      j=$((j + 1))
+    done
+    if [[ "$matched" == "false" ]]; then
+      extra_args+=("$pos")
+    fi
+  done
+
+  [[ ${#extra_args[@]} -eq 0 ]] && return 0
+
+  log_error "$(_t "CORE_ERR_EXTRA_ARGS" "${extra_args[*]}")"
+  local extra
+  for extra in "${extra_args[@]}"; do
+    local extra_lower
+    extra_lower=$(echo "$extra" | tr '[:upper:]' '[:lower:]')
+    local prev_opt=""
+    local k
+    for ((k = 1; k < ${#_raw_args[@]}; k++)); do
+      if [[ "${_raw_args[$k]}" == "$extra" ]]; then
+        local prev="${_raw_args[$((k - 1))]}"
+        if [[ "$prev" =~ ^--?([a-zA-Z0-9_-]+)$ ]]; then
+          prev_opt="${BASH_REMATCH[1]}"
+          break
+        fi
+      fi
+    done
+
+    # 若緊接在需要帶值的選項後面（例如 -cf-waf off、-delete user、-file backup.sql.gz、-expire 30d、-ufw off）
+    if [[ -n "$prev_opt" && "$prev_opt" =~ ^(delete|del|add|path|whitelist|list|user|username|pass|password|cf-waf|cf_waf|file|expire|to|type|ufw|allow|deny|icmp|unban|install|ssl|clone-from|clone_from|migrate|from|timezone|dns|smtp|exclude|port)$ ]]; then
+      log_info "$(_t "CORE_HINT_OPT_VALUE_FORMAT" "$prev_opt" "$extra")"
+    elif [[ -n "$_known_flags" && "$extra_lower" =~ ^(${_known_flags})$ ]]; then
+      log_info "$(_t "CORE_HINT_DID_YOU_MEAN_OPT" "$extra_lower")"
+    else
+      log_info "$(_t "CORE_HINT_OPT_GENERAL_SYNTAX")"
+    fi
+  done
+  return 1
+}
+
+# ------------------------------------------------------------------------------
 # 6. CloudPanel Site Helpers
 # ------------------------------------------------------------------------------
 find_site_user() {

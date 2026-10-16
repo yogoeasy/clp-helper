@@ -294,6 +294,64 @@ httpauth_del_user() {
     return 0
   fi
 
+  # 檢查是否為最後一位使用者且網站仍有啟用中的 HTTP Auth 防護
+  local user_count=0
+  if [[ -f "$htpasswd_file" ]]; then
+    user_count=$(awk -F':' 'NF > 1 && $1 !~ /^[[:space:]]*#/ && $1 != "" { n++ } END { print n + 0 }' "$htpasswd_file")
+  fi
+
+  if [[ "$user_count" -le 1 ]]; then
+    local vhost
+    vhost=$(find_nginx_vhost "$domain" 2>/dev/null || true)
+    local wpadmin_active=false
+    local -a active_paths=()
+
+    if [[ -n "$vhost" && -f "$vhost" ]]; then
+      if grep -q "CLP HTTPAUTH WPADMIN START" "$vhost" 2>/dev/null; then
+        wpadmin_active=true
+      elif grep -A 8 -E 'location\s*~\*?\s*[\^/]*\s*\(wp-admin/\|wp-login\.php\)' "$vhost" 2>/dev/null | grep -E -q '^[[:space:]]*auth_basic[[:space:]]+"'; then
+        wpadmin_active=true
+      fi
+
+      if grep -q "CLP HTTPAUTH ROOT START" "$vhost" 2>/dev/null; then
+        active_paths+=("/")
+      fi
+      while IFS= read -r line; do
+        if [[ "$line" =~ CLP\ HTTPAUTH\ PATH:\ (.*)\ START ]]; then
+          active_paths+=("${BASH_REMATCH[1]}")
+        fi
+      done < <(grep "CLP HTTPAUTH PATH: " "$vhost" 2>/dev/null || true)
+    fi
+
+    if [[ "$wpadmin_active" == "true" || ${#active_paths[@]} -gt 0 ]]; then
+      log_warn "======================================================================"
+      log_warn "$(_t "HTTPAUTH_DEL_LAST_USER_WARN" "$username" "$domain")"
+      if [[ "$wpadmin_active" == "true" ]]; then
+        echo -e "  • wp-admin: $(_t "HTTPAUTH_DEL_LAST_USER_HINT_WPADMIN" "$domain")"
+      fi
+      local p
+      for p in "${active_paths[@]}"; do
+        echo -e "  • path ${p}: $(_t "HTTPAUTH_DEL_LAST_USER_HINT_PATH" "$domain" "$p")"
+      done
+      log_warn "======================================================================"
+
+      if has_opt "y" || has_opt "yes"; then
+        log_info "$(_t "HTTPAUTH_DEL_LAST_USER_AUTO_YES")"
+      elif [[ ! -t 0 ]]; then
+        log_error "$(_t "HTTPAUTH_DEL_LAST_USER_ERR_NON_TTY" "$domain")"
+        return 1
+      else
+        local confirm=""
+        read -r -p "$(_t "HTTPAUTH_DEL_LAST_USER_PROMPT")" confirm || confirm="n"
+        confirm=$(echo "${confirm:-n}" | tr -d '[:space:]')
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+          log_info "$(_t "HTTPAUTH_DEL_LAST_USER_CANCELLED")"
+          return 0
+        fi
+      fi
+    fi
+  fi
+
   httpauth_remove_user_line "$htpasswd_file" "$username"
 
   log_success "$(_t "HTTPAUTH_DEL_USER_5" "${username}")"
@@ -896,42 +954,7 @@ httpauth_handler() {
     return 1
   fi
 
-  local -a extra_args=()
-  for i in "${!POSITIONAL[@]}"; do
-    [[ "$i" -eq "$domain_idx" ]] && continue
-    local pos="${POSITIONAL[$i]}"
-    local clean_pos
-    clean_pos=$(clean_domain "$pos")
-    [[ "$clean_pos" == "httpauth" ]] && continue
-    extra_args+=("$pos")
-  done
-
-  if [[ ${#extra_args[@]} -gt 0 ]]; then
-    log_error "$(_t "HTTPAUTH_HANDLER_8" "${extra_args[*]}")"
-    local extra
-    for extra in "${extra_args[@]}"; do
-      local extra_lower
-      extra_lower=$(echo "$extra" | tr '[:upper:]' '[:lower:]')
-      local prev_opt=""
-      local j
-      for ((j = 1; j < ${#raw_args[@]}; j++)); do
-        if [[ "${raw_args[$j]}" == "$extra" ]]; then
-          if [[ "${raw_args[$((j - 1))]}" =~ ^--?(delete|del|add|path|whitelist|list|user|username|pass|password)$ ]]; then
-            prev_opt="${BASH_REMATCH[1]}"
-            break
-          fi
-        fi
-      done
-      if [[ "$extra_lower" =~ ^(off|on|list|add|delete|del|wp-admin|wp_admin|path|whitelist|delete-all|delete_all|remove|set|replace|overwrite|y|yes)$ ]]; then
-        log_info "$(_t "HTTPAUTH_HANDLER_9" "$extra_lower")"
-      elif [[ -n "$prev_opt" ]]; then
-        log_info "$(_t "HTTPAUTH_HANDLER_10" "$prev_opt" "$extra")"
-      else
-        log_info "$(_t "HTTPAUTH_HANDLER_11")"
-      fi
-    done
-    return 1
-  fi
+  reject_extra_positionals raw_args "off|list|add|delete|del|wp-admin|wp_admin|path|whitelist|delete-all|delete_all|remove|set|replace|overwrite|y|yes" "$domain" "httpauth" || return 1
 
   require_site_exists "$domain" "$(_t "HTTPAUTH_HANDLER_3")" || return 1
 

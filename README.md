@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.0.0 (build 2026-10-16 11:30:00)`
+Output example:`CLP Helper v1.0.0 (build 2026-10-16 14:17:48)`
 
 Display global help menu:
 
@@ -166,6 +166,9 @@ CLP Helper follows a unified, intuitive command syntax:
 ```bash
 sudo clp <module> [target_domain] [options...]
 ```
+
+> [!NOTE]
+> Options that take a value must use the `-option=value` format (e.g. `-type=full`, `-to=google`, `-cf-waf=off`). Space-separated option values or extra unrecognized positional arguments will be rejected with an error and a syntax hint to prevent accidental misconfigurations.
 
 ### Core Modules Quick Overview
 
