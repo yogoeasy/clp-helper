@@ -7,7 +7,7 @@
 set -euo pipefail
 
 CLP_VERSION="1.0.0"
-CLP_BUILD_TIME="2026-10-16 14:17:48"
+CLP_BUILD_TIME="2026-10-16 17:09:25"
 
 # Colors
 C_RED=$'\033[0;31m'

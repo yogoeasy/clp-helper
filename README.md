@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.0.0 (build 2026-10-16 14:17:48)`
+Output example:`CLP Helper v1.0.0 (build 2026-10-16 17:09:25)`
 
 Display global help menu:
 
@@ -613,7 +613,7 @@ Dry-run test mode (makes zero changes to system):
 sudo clp server install --dry-run
 ```
 
-**17 Core Deployment Modules**:
+**16 Core Deployment Modules**:
 1. `cloudpanel`: Official CloudPanel CE v2 (dynamic SHA256 integrity verification)
 2. `system_basics`: Essential maintenance packages (`ncdu`, `jq`, `rsync`, locale, timezone)
 3. `ufw`: Firewall default-deny, allow ports 22, 80, 443, 8443, drop ICMP ping
@@ -630,7 +630,6 @@ sudo clp server install --dry-run
 14. `certbot`: Isolated `/opt/certbot` virtualenv with Cloudflare DNS plugin
 15. `netdata`: Netdata real-time monitoring agent on port 19999
 16. `rclone`: Official Rclone multi-cloud backup engine
-17. `wordfence`: Wordfence CLI malware scanner deployed via pipx
 
 #### ③ Interactive Security Hardening (`sudo clp server -harden`)
 
@@ -666,12 +665,6 @@ Install Certbot & Cloudflare DNS plugin:
 
 ```bash
 sudo clp server -install=certbot
-```
-
-Install Wordfence CLI scanner:
-
-```bash
-sudo clp server -install=wordfence
 ```
 
 Install Postfix SMTP Relay:

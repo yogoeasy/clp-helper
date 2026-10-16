@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-16 14:17:48)`
+輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-16 17:09:25)`
 
 查看全域功能說明選單：
 
@@ -621,7 +621,7 @@ sudo clp server install -y --db=MARIADB_11.4
 sudo clp server install --dry-run
 ```
 
-**17 個核心部署模組一覽**：
+**16 個核心部署模組一覽**：
 1. `cloudpanel`：官方最新版 CloudPanel (動態 SHA256 驗證)
 2. `system_basics`：維運必備套件 (`ncdu`, `jq`, `rsync`, 時區與語系)
 3. `ufw`：防火牆預設拒絕，放行 22, 80, 443, 8443，阻擋 ICMP Ping
@@ -638,7 +638,6 @@ sudo clp server install --dry-run
 14. `certbot`：部署 `/opt/certbot` 獨立虛擬環境與 Cloudflare DNS 套件
 15. `netdata`：安裝 Netdata 即時效能監控 Agent (Port 19999)
 16. `rclone`：安裝官方 Rclone 多遠端雲端備份引擎
-17. `wordfence`：透過 pipx 部署 Wordfence CLI 惡意程式碼掃描器
 
 #### ③ 互動式資安加固流程 (`sudo clp server -harden`)
 
@@ -674,12 +673,6 @@ sudo clp server -install=rclone
 
 ```bash
 sudo clp server -install=certbot
-```
-
-安裝 Wordfence CLI 掃描器：
-
-```bash
-sudo clp server -install=wordfence
 ```
 
 安裝 Postfix Relay 郵件服務：

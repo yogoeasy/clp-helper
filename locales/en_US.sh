@@ -167,7 +167,7 @@ CLP_I18N_en_US_SERVER_HELP_OPT_INSTALL_DB="Specify database engine (Default: MYS
 CLP_I18N_en_US_SERVER_HELP_OPT_INSTALL_TZ="Specify system timezone (e.g. Asia/Taipei, UTC)"
 CLP_I18N_en_US_SERVER_HELP_DESC_HARDEN="Step-by-step security hardening workflow (supports -y for auto-apply)"
 CLP_I18N_en_US_SERVER_HELP_DESC_HARDEN_ITEMS="Items: UFW / SSH keys only / Fail2ban / Nginx security / Sysctl / Journald / Auto-upgrades"
-CLP_I18N_en_US_SERVER_HELP_DESC_INSTALL_PKG="Install single utility (netdata/rclone/certbot/wordfence/smtp/basics)"
+CLP_I18N_en_US_SERVER_HELP_DESC_INSTALL_PKG="Install single utility (netdata/rclone/certbot/smtp/basics)"
 CLP_I18N_en_US_SERVER_HELP_DESC_INSTALL_ALL="Batch install all utilities (step-by-step confirmation, supports -y)"
 CLP_I18N_en_US_SERVER_HELP_MAINTENANCE_TITLE="MAINTENANCE"
 CLP_I18N_en_US_SERVER_HELP_DESC_UFW="Firewall management (-ufw, -ufw=on/off, -allow=PORT, -deny=PORT, -icmp=drop|allow)"
@@ -210,7 +210,6 @@ CLP_I18N_en_US_SERVER_MOD_DESC_SMTP="Postfix SMTP relay configuration for extern
 CLP_I18N_en_US_SERVER_MOD_DESC_CERTBOT="Certbot (Let's Encrypt + Cloudflare DNS plugin)"
 CLP_I18N_en_US_SERVER_MOD_DESC_NETDATA="Netdata real-time monitoring agent (Port 19999)"
 CLP_I18N_en_US_SERVER_MOD_DESC_RCLONE="Rclone cloud multi-remote backup tool"
-CLP_I18N_en_US_SERVER_MOD_DESC_WORDFENCE="Wordfence CLI malware scanner"
 
 # Server Module - System Bootstrap (ensure_system_bootstrap)
 CLP_I18N_en_US_SERVER_BOOTSTRAP_STEP_INIT="Checking and executing system environment bootstrap initialization (Ubuntu Minimal / cloud compatibility protection)..."
@@ -539,12 +538,7 @@ CLP_I18N_en_US_SERVER_RCLONE_INFO_DRY_RUN="[DRY-RUN] Simulating installing Rclon
 CLP_I18N_en_US_SERVER_RCLONE_INFO_ALREADY_INSTALLED="rclone is already installed on the system."
 CLP_I18N_en_US_SERVER_RCLONE_SUCCESS="rclone installed successfully! Run 'rclone config' to set up remotes."
 
-CLP_I18N_en_US_SERVER_WORDFENCE_STEP="Installing Wordfence CLI malware scanner..."
-CLP_I18N_en_US_SERVER_WORDFENCE_INFO_DRY_RUN="[DRY-RUN] Simulating installing Wordfence CLI"
-CLP_I18N_en_US_SERVER_WORDFENCE_INFO_ALREADY_INSTALLED="Wordfence CLI is already installed on the system."
-CLP_I18N_en_US_SERVER_WORDFENCE_INFO_PIP_INSTALL="Installing Wordfence CLI via pipx/pip..."
-CLP_I18N_en_US_SERVER_WORDFENCE_SUCCESS="Wordfence CLI installed successfully! Run 'wordfence configure' to set up API key."
-CLP_I18N_en_US_SERVER_WORDFENCE_WARN_PATH="Wordfence CLI installation completed, but you may need to restart your terminal session to update PATH."
+CLP_I18N_en_US_SERVER_WORDFENCE_ERR_EOL="Wordfence CLI Free has reached end-of-life (discontinued October 2026); clp no longer provides installation."
 
 # Server Module - Additional Setup Diagnostics & Interactive Keys
 CLP_I18N_en_US_SERVER_SSH_INFO_FIXED_OVERRIDE="Fixed PasswordAuthentication override in %s."
@@ -636,14 +630,13 @@ CLP_I18N_en_US_SERVER_HARDEN_SUCCESS="Hardening completed! Applied %s security s
 
 # Server Module - Install Component Subcommand
 CLP_I18N_en_US_SERVER_COMP_STEP_BATCH="Starting batch installation of auxiliary tools (prompting for each)..."
-CLP_I18N_en_US_SERVER_COMP_PROMPT_NETDATA="[1/6] Install Netdata real-time monitoring agent (Port 19999)?"
-CLP_I18N_en_US_SERVER_COMP_PROMPT_RCLONE="[2/6] Install Rclone cloud storage backup tool?"
-CLP_I18N_en_US_SERVER_COMP_PROMPT_CERTBOT="[3/6] Install Certbot (Python venv + Cloudflare DNS plugin)?"
-CLP_I18N_en_US_SERVER_COMP_PROMPT_WORDFENCE="[4/6] Install Wordfence CLI malware scanner?"
-CLP_I18N_en_US_SERVER_COMP_PROMPT_SMTP="[5/6] Install and configure Postfix SMTP mail relay?"
-CLP_I18N_en_US_SERVER_COMP_PROMPT_BASICS="[6/6] Install essential system utilities (ncdu, jq, rsync...)?"
+CLP_I18N_en_US_SERVER_COMP_PROMPT_NETDATA="[1/5] Install Netdata real-time monitoring agent (Port 19999)?"
+CLP_I18N_en_US_SERVER_COMP_PROMPT_RCLONE="[2/5] Install Rclone cloud storage backup tool?"
+CLP_I18N_en_US_SERVER_COMP_PROMPT_CERTBOT="[3/5] Install Certbot (Python venv + Cloudflare DNS plugin)?"
+CLP_I18N_en_US_SERVER_COMP_PROMPT_SMTP="[4/5] Install and configure Postfix SMTP mail relay?"
+CLP_I18N_en_US_SERVER_COMP_PROMPT_BASICS="[5/5] Install essential system utilities (ncdu, jq, rsync...)?"
 CLP_I18N_en_US_SERVER_COMP_SUCCESS_BATCH="Auxiliary tools batch installation completed."
-CLP_I18N_en_US_SERVER_COMP_ERR_UNKNOWN="Unknown component: '%s'. Supported: netdata, rclone, certbot, wordfence, smtp, basics, all"
+CLP_I18N_en_US_SERVER_COMP_ERR_UNKNOWN="Unknown component: '%s'. Supported: netdata, rclone, certbot, smtp, basics, all"
 
 # Server Module - Maintenance (UFW, SSH, Fail2ban, DNS, Timezone, SMTP, Clean)
 CLP_I18N_en_US_SERVER_UFW_MANAGE_INFO_ENABLING="Enabling UFW firewall..."

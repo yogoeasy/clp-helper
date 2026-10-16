@@ -3,11 +3,11 @@
 # CLP Helper - CloudPanel CLI Tool
 # File: lib/server.sh
 # Description: Server Management, Hardening & Fresh VPS Installer Module
-#              Absorbs clp-install.sh (17 modules) and provides:
+#              Absorbs clp-install.sh (16 modules) and provides:
 #              - clp server install (Fresh VPS automated deployment)
 #              - clp server (status & security audit dashboard)
 #              - clp server -harden (Step-by-step interactive hardening)
-#              - clp server -install=<component> (netdata/rclone/certbot/wordfence/smtp/basics)
+#              - clp server -install=<component> (netdata/rclone/certbot/smtp/basics)
 #              - clp server -ufw, -ssh, -fail2ban, -dns, -timezone, -smtp, -clean
 # ==============================================================================
 
@@ -60,7 +60,7 @@ show_server_help() {
 }
 
 # ------------------------------------------------------------------------------
-# 1. Constants & 17 Core Modules Registry
+# 1. Constants & 16 Core Modules Registry
 # ------------------------------------------------------------------------------
 CLP_SERVER_VERSION="${CLP_VERSION:-1.0.0}"
 CLP_DOCS_URL="https://www.cloudpanel.io/docs/v2/getting-started/other/"
@@ -208,7 +208,6 @@ MODULES=(
   "certbot"
   "netdata"
   "rclone"
-  "wordfence"
 )
 
 get_mod_desc() {
@@ -252,7 +251,6 @@ get_mod_desc() {
     certbot)             _t "SERVER_MOD_DESC_CERTBOT" ;;
     netdata)             _t "SERVER_MOD_DESC_NETDATA" ;;
     rclone)              _t "SERVER_MOD_DESC_RCLONE" ;;
-    wordfence)           _t "SERVER_MOD_DESC_WORDFENCE" ;;
     *)                   echo "$1" ;;
   esac
 }
@@ -296,7 +294,7 @@ init_modules_default() {
       ufw|ssh_hardening|fail2ban|dns|sysctl|journald|unattended_upgrades|snap_retention|php_timezone|nginx_security)
         set_mod_enabled "$mod" "yes"
         ;;
-      smtp|certbot|netdata|rclone|wordfence)
+      smtp|certbot|netdata|rclone)
         set_mod_enabled "$mod" "no"
         ;;
     esac
@@ -1249,30 +1247,6 @@ setup_rclone() {
   return 0
 }
 
-# Module 17: Wordfence CLI
-setup_wordfence() {
-  local dry_run="${1:-false}"
-  log_step "$(_t "SERVER_WORDFENCE_STEP")"
-  if [[ "$dry_run" == "true" ]]; then
-    log_info "$(_t "SERVER_WORDFENCE_INFO_DRY_RUN")"
-    return 0
-  fi
-
-  apt-get -o DPkg::Lock::Timeout=60 update -y
-  apt-get -o DPkg::Lock::Timeout=60 install -y pipx whois openssl
-  pipx ensurepath 2>/dev/null || true
-
-  log_info "$(_t "SERVER_WORDFENCE_INFO_PIP_INSTALL")"
-  PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install wordfence 2>/dev/null || pipx install wordfence || true
-
-  if command -v wordfence >/dev/null 2>&1; then
-    log_success "$(_t "SERVER_WORDFENCE_SUCCESS")"
-  else
-    log_warn "$(_t "SERVER_WORDFENCE_WARN_PATH")"
-  fi
-  return 0
-}
-
 # ------------------------------------------------------------------------------
 # 2.8 Dynamic Database Engines Resolver (Online Sync + OS-Aware Fallback)
 # ------------------------------------------------------------------------------
@@ -1964,6 +1938,11 @@ server_install() {
     fi
   done
 
+  # Wordfence CLI 已終止支援，若帶有此參數提示警告並繼續
+  if has_opt "wordfence"; then
+    log_warn "$(_t "SERVER_WORDFENCE_ERR_EOL")"
+  fi
+
   # 若使用者未明確自訂關閉，核心項目預設為 yes
   if ! has_opt "cloudpanel" && ! has_opt "cloudpanel-"; then
     set_mod_enabled "cloudpanel" "yes"
@@ -2595,9 +2574,6 @@ server_install() {
         rclone)
           setup_rclone "$dry_run" || status_code=1
           ;;
-        wordfence)
-          setup_wordfence "$dry_run" || status_code=1
-          ;;
       esac
 
       if [[ $status_code -eq 0 ]]; then
@@ -3021,7 +2997,8 @@ server_install_component() {
       setup_certbot "false"
       ;;
     wordfence)
-      setup_wordfence "false"
+      log_error "$(_t "SERVER_WORDFENCE_ERR_EOL")"
+      return 1
       ;;
     smtp)
       setup_smtp "" "587" "" "" "false"
@@ -3041,9 +3018,6 @@ server_install_component() {
       fi
       if prompt_confirm "$(_t "SERVER_COMP_PROMPT_CERTBOT")" "y"; then
         setup_certbot "false" || comp_failed=1
-      fi
-      if prompt_confirm "$(_t "SERVER_COMP_PROMPT_WORDFENCE")" "n"; then
-        setup_wordfence "false"
       fi
       if prompt_confirm "$(_t "SERVER_COMP_PROMPT_SMTP")" "n"; then
         setup_smtp "" "587" "" "" "false" || comp_failed=1

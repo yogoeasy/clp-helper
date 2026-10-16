@@ -166,7 +166,7 @@ CLP_I18N_zh_TW_SERVER_HELP_OPT_INSTALL_DB="指定資料庫引擎 (預設: MYSQL_
 CLP_I18N_zh_TW_SERVER_HELP_OPT_INSTALL_TZ="指定系統時區 (如 Asia/Taipei, UTC)"
 CLP_I18N_zh_TW_SERVER_HELP_DESC_HARDEN="伺服器資安加固流程 (逐項詢問確認，支援 -y 免確認全套用)"
 CLP_I18N_zh_TW_SERVER_HELP_DESC_HARDEN_ITEMS="項目: UFW / SSH 金鑰強制 / Fail2ban / Nginx 防護 / Sysctl / Journald / 自動更新"
-CLP_I18N_zh_TW_SERVER_HELP_DESC_INSTALL_PKG="輔助工具安裝 (單項: netdata/rclone/certbot/wordfence/smtp/basics)"
+CLP_I18N_zh_TW_SERVER_HELP_DESC_INSTALL_PKG="輔助工具安裝 (單項: netdata/rclone/certbot/smtp/basics)"
 CLP_I18N_zh_TW_SERVER_HELP_DESC_INSTALL_ALL="一次性批次安裝全部輔助工具 (逐項詢問確認，支援 -y)"
 CLP_I18N_zh_TW_SERVER_HELP_MAINTENANCE_TITLE="單項維運子指令 (MAINTENANCE)"
 CLP_I18N_zh_TW_SERVER_HELP_DESC_UFW="防火牆維運 (-ufw, -ufw=on/off, -allow=PORT, -deny=PORT, -icmp=drop|allow)"
@@ -209,7 +209,6 @@ CLP_I18N_zh_TW_SERVER_MOD_DESC_SMTP="Postfix SMTP Relay 外部發信轉發配置
 CLP_I18N_zh_TW_SERVER_MOD_DESC_CERTBOT="Certbot (Let's Encrypt + Cloudflare DNS 外掛)"
 CLP_I18N_zh_TW_SERVER_MOD_DESC_NETDATA="Netdata 實時效能監控 Agent (Port 19999)"
 CLP_I18N_zh_TW_SERVER_MOD_DESC_RCLONE="Rclone 雲端多遠端備份工具"
-CLP_I18N_zh_TW_SERVER_MOD_DESC_WORDFENCE="Wordfence CLI 惡意代碼掃描器"
 
 # Server Module - System Bootstrap (ensure_system_bootstrap)
 CLP_I18N_zh_TW_SERVER_BOOTSTRAP_STEP_INIT="檢查並執行系統環境 Bootstrap 初始化 (Ubuntu Minimal / 雲端環境相容性防護)..."
@@ -538,12 +537,7 @@ CLP_I18N_zh_TW_SERVER_RCLONE_INFO_DRY_RUN="[DRY-RUN] 模擬安裝 Rclone"
 CLP_I18N_zh_TW_SERVER_RCLONE_INFO_ALREADY_INSTALLED="系統已安裝 rclone。"
 CLP_I18N_zh_TW_SERVER_RCLONE_SUCCESS="rclone 安裝成功！可執行 'rclone config' 進行雲端空間掛載設定。"
 
-CLP_I18N_zh_TW_SERVER_WORDFENCE_STEP="安裝 Wordfence CLI 惡意代碼掃描器..."
-CLP_I18N_zh_TW_SERVER_WORDFENCE_INFO_DRY_RUN="[DRY-RUN] 模擬安裝 Wordfence CLI"
-CLP_I18N_zh_TW_SERVER_WORDFENCE_INFO_ALREADY_INSTALLED="系統已安裝 Wordfence CLI。"
-CLP_I18N_zh_TW_SERVER_WORDFENCE_INFO_PIP_INSTALL="透過 pipx / pip 安裝 Wordfence CLI..."
-CLP_I18N_zh_TW_SERVER_WORDFENCE_SUCCESS="Wordfence CLI 安裝成功！可執行 'wordfence configure' 設置 API 金鑰。"
-CLP_I18N_zh_TW_SERVER_WORDFENCE_WARN_PATH="Wordfence CLI 安裝完成但可能需重啟終端連線以載入 PATH。"
+CLP_I18N_zh_TW_SERVER_WORDFENCE_ERR_EOL="Wordfence CLI 免費版已停止支援（2026年10月終止服務），clp 不再提供安裝。"
 
 # Server Module - Additional Setup Diagnostics & Interactive Keys
 CLP_I18N_zh_TW_SERVER_SSH_INFO_FIXED_OVERRIDE="已修正 %s 中的 PasswordAuthentication 覆蓋項。"
@@ -635,14 +629,13 @@ CLP_I18N_zh_TW_SERVER_HARDEN_SUCCESS="加固作業完成！共計套用 %s 項�
 
 # Server Module - Install Component Subcommand
 CLP_I18N_zh_TW_SERVER_COMP_STEP_BATCH="即將進行輔助工具批次安裝 (逐項提示確認)..."
-CLP_I18N_zh_TW_SERVER_COMP_PROMPT_NETDATA="[1/6] 是否安裝 Netdata 實時效能監控 Agent (Port 19999)？"
-CLP_I18N_zh_TW_SERVER_COMP_PROMPT_RCLONE="[2/6] 是否安裝 Rclone 雲端儲存備份工具？"
-CLP_I18N_zh_TW_SERVER_COMP_PROMPT_CERTBOT="[3/6] 是否安裝 Certbot (Python venv + Cloudflare DNS 外掛)？"
-CLP_I18N_zh_TW_SERVER_COMP_PROMPT_WORDFENCE="[4/6] 是否安裝 Wordfence CLI 惡意代碼掃描器？"
-CLP_I18N_zh_TW_SERVER_COMP_PROMPT_SMTP="[5/6] 是否安裝與配置 Postfix SMTP 郵件轉發？"
-CLP_I18N_zh_TW_SERVER_COMP_PROMPT_BASICS="[6/6] 是否補齊系統基礎工具包 (ncdu, jq, rsync...)？"
+CLP_I18N_zh_TW_SERVER_COMP_PROMPT_NETDATA="[1/5] 是否安裝 Netdata 實時效能監控 Agent (Port 19999)？"
+CLP_I18N_zh_TW_SERVER_COMP_PROMPT_RCLONE="[2/5] 是否安裝 Rclone 雲端儲存備份工具？"
+CLP_I18N_zh_TW_SERVER_COMP_PROMPT_CERTBOT="[3/5] 是否安裝 Certbot (Python venv + Cloudflare DNS 外掛)？"
+CLP_I18N_zh_TW_SERVER_COMP_PROMPT_SMTP="[4/5] 是否安裝與配置 Postfix SMTP 郵件轉發？"
+CLP_I18N_zh_TW_SERVER_COMP_PROMPT_BASICS="[5/5] 是否補齊系統基礎工具包 (ncdu, jq, rsync...)？"
 CLP_I18N_zh_TW_SERVER_COMP_SUCCESS_BATCH="輔助工具批次安裝作業完成。"
-CLP_I18N_zh_TW_SERVER_COMP_ERR_UNKNOWN="未知的安裝元件: '%s'。支援項目: netdata, rclone, certbot, wordfence, smtp, basics, all"
+CLP_I18N_zh_TW_SERVER_COMP_ERR_UNKNOWN="未知的安裝元件: '%s'。支援項目: netdata, rclone, certbot, smtp, basics, all"
 
 # Server Module - Maintenance (UFW, SSH, Fail2ban, DNS, Timezone, SMTP, Clean)
 CLP_I18N_zh_TW_SERVER_UFW_MANAGE_INFO_ENABLING="正在啟用 UFW 防火牆..."
