@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.0.0 (build 2026-10-13 23:17:08)`
+Output example:`CLP Helper v1.0.0 (build 2026-10-16 11:30:00)`
 
 Display global help menu:
 

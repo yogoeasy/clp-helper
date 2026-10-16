@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-13 23:17:08)`
+輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-16 11:30:00)`
 
 查看全域功能說明選單：
 

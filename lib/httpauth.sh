@@ -846,17 +846,34 @@ httpauth_handler() {
     return 1
   fi
 
+  local -a raw_args=("$@")
   parse_arguments "$@"
 
   local domain=""
-  for pos in "${POSITIONAL[@]}"; do
+  local domain_idx=-1
+  local i
+  for i in "${!POSITIONAL[@]}"; do
+    local pos="${POSITIONAL[$i]}"
     local clean_pos
     clean_pos=$(clean_domain "$pos")
-    if [[ "$clean_pos" != "httpauth" && -n "$clean_pos" ]]; then
+    if [[ "$clean_pos" != "httpauth" && -n "$clean_pos" ]] && is_valid_domain "$clean_pos"; then
       domain="$clean_pos"
+      domain_idx=$i
       break
     fi
   done
+  if [[ -z "$domain" ]]; then
+    for i in "${!POSITIONAL[@]}"; do
+      local pos="${POSITIONAL[$i]}"
+      local clean_pos
+      clean_pos=$(clean_domain "$pos")
+      if [[ "$clean_pos" != "httpauth" && -n "$clean_pos" ]]; then
+        domain="$clean_pos"
+        domain_idx=$i
+        break
+      fi
+    done
+  fi
 
   if [[ -z "$domain" ]]; then
     log_error "$(_t "HTTPAUTH_HANDLER_1")"
@@ -876,6 +893,43 @@ httpauth_handler() {
     echo -e "  sudo clp httpauth example.com -whitelist=192.168.1.100 -delete"
     echo -e "  sudo clp httpauth example.com -whitelist=off"
     echo -e "  sudo clp httpauth example.com -whitelist -delete-all"
+    return 1
+  fi
+
+  local -a extra_args=()
+  for i in "${!POSITIONAL[@]}"; do
+    [[ "$i" -eq "$domain_idx" ]] && continue
+    local pos="${POSITIONAL[$i]}"
+    local clean_pos
+    clean_pos=$(clean_domain "$pos")
+    [[ "$clean_pos" == "httpauth" ]] && continue
+    extra_args+=("$pos")
+  done
+
+  if [[ ${#extra_args[@]} -gt 0 ]]; then
+    log_error "$(_t "HTTPAUTH_HANDLER_8" "${extra_args[*]}")"
+    local extra
+    for extra in "${extra_args[@]}"; do
+      local extra_lower
+      extra_lower=$(echo "$extra" | tr '[:upper:]' '[:lower:]')
+      local prev_opt=""
+      local j
+      for ((j = 1; j < ${#raw_args[@]}; j++)); do
+        if [[ "${raw_args[$j]}" == "$extra" ]]; then
+          if [[ "${raw_args[$((j - 1))]}" =~ ^--?(delete|del|add|path|whitelist|list|user|username|pass|password)$ ]]; then
+            prev_opt="${BASH_REMATCH[1]}"
+            break
+          fi
+        fi
+      done
+      if [[ "$extra_lower" =~ ^(off|on|list|add|delete|del|wp-admin|wp_admin|path|whitelist|delete-all|delete_all|remove|set|replace|overwrite|y|yes)$ ]]; then
+        log_info "$(_t "HTTPAUTH_HANDLER_9" "$extra_lower")"
+      elif [[ -n "$prev_opt" ]]; then
+        log_info "$(_t "HTTPAUTH_HANDLER_10" "$prev_opt" "$extra")"
+      else
+        log_info "$(_t "HTTPAUTH_HANDLER_11")"
+      fi
+    done
     return 1
   fi
 
