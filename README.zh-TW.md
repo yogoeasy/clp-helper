@@ -52,7 +52,7 @@
   - **系統看板**：三大面向即時檢視系統概要、各項服務運作與資安指標。
   - **全新安裝**：動態匹配最新官方相容資料庫 (MySQL 8.4 LTS, MariaDB 11.4 LTS 等)，提供 17 個核心模組自由勾選。
   - **防自鎖安全加固**：SSH 雙重金鑰檢驗、停用密碼登入、UFW 防火牆規則、Fail2ban 暴力破解攔截、systemd 日誌上限 (500M) 與核心參數最佳化。
-- 📦 **靈活備份與雲端同步**：三種備份型態（`db` 資料庫、`compact` 精簡打包、`full` 完整封裝），直接整合 `rclone` 支援 Google Drive、Backblaze B2、Cloudflare R2 與 AWS S3，可以依備份類型自動刪除過期的備份 (`-expire`)。
+- 📦 **靈活備份與雲端同步**：四種備份型態（`db` 資料庫、`compact` 精簡打包、`archive` 歷年 uploads 封存、`full` 完整封裝），直接整合 `rclone` 支援 Google Drive、Backblaze B2、Cloudflare R2 與 AWS S3，可以依備份類型自動刪除過期的備份 (`-expire`)。
 - 🔐 **HTTP Basic 認證與 IP 白名單**：保護 WordPress 後台 (`/wp-admin/` 與 `wp-login.php`)、全站或任意自訂子目錄，支援 IP/CIDR 白名單免密碼直通。
 - ⚙️ **PHP-FPM 動態效能調校**：動態辨識各網站設定之實際 PHP 版本，自動調整行程池（Process Pool）參數；修改前會先備份，並做語法檢查。
 - 💡 **智慧防呆與打字錯誤提示 (Smart Typo Suggestion)**：網域名稱打錯時，會自動找出最接近的現有網域提示你（Levenshtein 演算法）。
@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-16 17:31:50)`
+輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-17 21:30:03)`
 
 查看全域功能說明選單：
 
@@ -182,10 +182,10 @@ sudo clp <module> [target_domain] [options...]
 
 | 模組 | 主要功能 | 常用操作指令 |
 | :--- | :--- | :--- |
-| **`site`** | WordPress 網站管理 | `-new`, `-list`, `-on`, `-off`, `-ssl`, `-cf-waf`, `-clone-from`, `-migrate`, `delete` |
+| **`site`** | WordPress 網站管理 | `-new`, `-list`, `-on`, `-off`, `-ssl`, `-cf-waf`, `-cf-only`, `-varnish`, `-clone-from`, `-migrate`, `delete` |
 | **`server`** | 主機維運與安全加固 | `(無參數狀態檢查)`, `install`, `-harden`, `-ufw`, `-ssh`, `-fail2ban`, `-clean` |
-| **`backup`** | 網站與資料庫備份 | `-type={db\|full\|compact}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
-| **`restore`** | 備份還原作業 | `[-file=<name>]`, `-type={db\|full\|compact}`, `-to={local\|<remote>}` |
+| **`backup`** | 網站與資料庫備份 | `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
+| **`restore`** | 備份還原作業 | `[-file=<name>]`, `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}` |
 | **`httpauth`** | HTTP 認證與存取防護 | `-add`, `-delete`, `-list`, `-wp-admin`, `-path`, `-whitelist` |
 | **`php-pm`** | PHP-FPM 行程池調校 | `<domain>`, `all` |
 | **`config`** | 全域偏好設定與金鑰管理 | `-set <key>=<val>`, `-get <key>`, `-list`, `-unset <key>` |
@@ -576,6 +576,131 @@ sudo clp site example.com -cf-waf=off
   - **自訂規則隔離保護**：僅變更標註 `[CLP]` 前綴之規則，使用者原有業務規則絕不覆蓋。
   - **配額上限檢查**：部署前依 zone 方案檢查自訂規則數量上限（Free 5／Pro 20／Business 100／Enterprise 1000），超過時停止並列出現有規則，避免 API 400 錯誤。
 
+#### ⑧ 只允許來自 Cloudflare 的流量 (`clp site <domain> -cf-only`)
+
+對應 CloudPanel 後台每個網站的「Allow traffic from Cloudflare only」。開啟後，直接連主機 IP 的請求在 Nginx 就回應 403，不會進入 PHP，可以擋下繞過 Cloudflare 直接掃描主機的流量。CloudPanel 後台只能一個一個網站開關，這個指令可以對單一網站或所有網站批次開關。
+
+開啟：
+
+```bash
+sudo clp site example.com -cf-only
+```
+
+關閉：
+
+```bash
+sudo clp site example.com -cf-only=off
+```
+
+查看單一網站或所有網站的狀態（資料庫、vhost、DNS 是否經過 Cloudflare）：
+
+```bash
+sudo clp site example.com -cf-only=status
+```
+
+```bash
+sudo clp site -cf-only=status
+```
+
+先預覽、再批次開啟所有網站（`-exclude` 用法與 `backup all` 相同）：
+
+```bash
+sudo clp site -cf-only -all -dry-run
+```
+
+```bash
+sudo clp site -cf-only -all -exclude="test.,dev."
+```
+
+批次關閉所有網站：
+
+```bash
+sudo clp site -cf-only=off -all
+```
+
+- **DNS 檢查**：開啟前會解析網域與 www／非 www 的 A／AAAA 記錄，必須全部是 Cloudflare 的位址（橘雲）。灰雲或指向其他主機的網域開啟後會連不上，所以會擋下並列出原因；確定要開啟可加 `-force`。批次開啟時會自動略過 DNS 不符的網站。
+- **同時修改 vhost 與 CloudPanel 資料庫**：只修改主要 server 區塊的兩處（`access_log` 改用 `cloudflare` 格式、加上 `include /etc/nginx/cloudflare/ips;`），格式與 CloudPanel 後台產生的相同；同時更新資料庫欄位，之後在後台重新產生 vhost 也會保留這個設定，後台的開關也會顯示正確。
+- **安全措施**：修改前備份 vhost、資料庫欄位的原值與資料庫（`/root/.clp/cf-only-backup/`，資料庫備份保留最近 3 份）；`nginx -t` 失敗會還原 vhost，資料庫寫入失敗也會還原；已是目標狀態時不變更。停用中的網站不處理。
+- **批次確認**：批次變更前會列出要處理與略過的網站，需輸入 `yes` 確認；使用 `-y` 時直接執行，非互動模式沒有 `-y` 會報錯。
+- **注意：`X-Real-IP` 繞過**：如果 `/etc/nginx/nginx.conf` 有 `set_real_ip_from 0.0.0.0/0;`（目前查過的 CloudPanel 主機都是這個設定），任何人直連主機並帶上 `X-Real-IP: <Cloudflare IP>` 標頭都能繞過這個設定。clp 會顯示警告，但不會修改 `nginx.conf`。
+
+#### ⑨ Varnish 快取沒有作用？(`clp site <domain> -varnish=status|fix`)
+
+CloudPanel 後台顯示 Varnish 已開啟，但網站可能完全沒有被快取，每個請求都還是執行 PHP，流量一大就會把記憶體吃光。可以用下面的指令檢查與修正。
+
+檢查單一網站或所有網站：
+
+```bash
+sudo clp site example.com -varnish=status
+```
+
+```bash
+sudo clp site -varnish=status
+```
+
+修正單一網站（先預覽）：
+
+```bash
+sudo clp site example.com -varnish=fix -dry-run
+```
+
+```bash
+sudo clp site example.com -varnish=fix
+```
+
+批次修正所有需要修的網站（`-exclude` 用法與 `backup all` 相同）：
+
+```bash
+sudo clp site -varnish=fix -all -dry-run
+```
+
+```bash
+sudo clp site -varnish=fix -all -exclude="test.,dev."
+```
+
+**為什麼會沒有快取**
+
+1. **Varnish 只快取 PHP 送出 `Cache-Control` 的頁面**：這些標頭由 `/home/<user>/.varnish-cache/controller.php` 送出，它必須透過 PHP 的 `auto_prepend_file` 載入。瀏覽器看到的 `Cache-Control: no-store` 是 Varnish 固定加上的，與是否快取無關，判斷時不要看它。
+2. **開關要在 CloudPanel 後台切換**（或在 Vhost 分頁按 Save）：後台的 Varnish 開關對應 `/home/<user>/.varnish-cache/settings.json` 的 `enabled`，切換時 CloudPanel 也會重新產生 vhost，在 `PHP_VALUE` 加上 `auto_prepend_file`。WordPress 後台「CLP Varnish Cache」外掛的開關只改 `settings.json`，不會更新 vhost。（CloudPanel 資料庫的 `site.varnish_cache` 是建立 WordPress 網站時的預設值，通常都是 1，不代表後台開關是開的。）
+3. **Wordfence 防火牆最佳化時要選「Include」，不要選「Override」，而且要先開 Varnish、再做 Wordfence 最佳化**：Wordfence 會建立 `.user.ini` 改用自己的 `wordfence-waf.php`，它的優先順序比 vhost 高，所以 `wordfence-waf.php` 必須 include `controller.php`。順序相反或選了 Override 時，用 `clp site <domain> -varnish=fix` 補上。
+4. **`.user.ini` 修改後最多 5 分鐘才生效**（PHP 的 `user_ini.cache_ttl`）。`-varnish=fix` 不會修改 `.user.ini`，修改的 vhost 與 `wordfence-waf.php` 都會立即生效。
+5. **Wordfence 提醒 `.user.ini` 可能被公開讀取**：`clp server -harden` 的 Nginx 安全規則已經擋下 `.user.ini`（規則在 `/etc/nginx/clp-security.conf`，由 `/etc/nginx/global_settings` 載入）。
+
+**`-varnish=fix` 做什麼**
+
+- vhost：在 8080 區塊的 `PHP_VALUE` 中，於 `upload_max_filesize=…;` 之後加上 `auto_prepend_file=/home/<user>/.varnish-cache/controller.php;`，位置與內容和 CloudPanel 產生的相同；`nginx -t` 失敗會還原。
+- `wordfence-waf.php`：`.user.ini` 指向它、而它沒有 include `controller.php` 時，加上與 Wordfence「Include」相同格式的區塊；會先以 `php -l` 檢查，並保留檔案的擁有者與權限。
+- 修改前會備份到 `/root/.clp/varnish-backup/<時間>/<網域>/`；修改後重新檢查是否已有快取。
+- **不處理**：Varnish 未開啟（後台開關關閉，也就是 `settings.json` 的 `enabled` 為 false）、資料庫的 `varnish_cache` 為 0（CloudPanel 重新產生 vhost 時不會加上那一行，修了也會被蓋掉；檢查結果中另外標示）、`.user.ini` 指向其他檔案、vhost 已有其他 `auto_prepend_file`、原因不明的網站；這些只會在檢查結果中列出。
+
+**自己檢查**：
+
+```bash
+curl -s -D- -o /dev/null -H "Host: example.com" -H "X-Forwarded-Proto: https" http://127.0.0.1:8080/ | grep -i x-cache-lifetime
+```
+
+有 `X-Cache-Lifetime` 就表示 Varnish 會快取這個頁面。
+
+**修正後要確認的事**
+
+修正後，Varnish 會把頁面存起來，在 `cacheLifetime`（預設 7 天，`604800` 秒）內直接用同一份內容回應所有訪客，不再每次執行 PHP。這些網站過去從未被快取，建議先挑幾個網站或一台主機試，確認以下功能正常後再全部修正。
+
+- **已經自動排除、不會被快取的**：
+  - 已登入的使用者（有 `wordpress_logged_in_` cookie 的請求一律不經過快取，`controller.php` 也會檢查 `is_user_logged_in()`）。
+  - POST 請求（表單送出的那一次）。
+  - `settings.json` 的 `excludes`，預設為 `/my-account/`、`/cart/`、`/checkout/`、`wp-login.php`。
+- **可能出問題、需要實際操作確認的**：
+  1. **表單送出失敗**：有些表單外掛會在頁面中放有時效的驗證碼（例如 WordPress nonce，通常 12～24 小時失效）。頁面被快取 7 天後，訪客拿到的是過期的驗證碼，送出時會出現「連結已過期」或「驗證失敗」。請用未登入的身分實際送出一次，最好隔天再試一次。
+  2. **購物車與會員資訊**：未登入訪客加入購物車後，購物車的 cookie（例如 WooCommerce 的 `woocommerce_items_in_cart`）不會讓請求略過快取，其他頁面上「購物車 N 件」這類小工具可能顯示舊的狀態。購物車與結帳頁本身已排除。
+  3. **Cookie 被移除**：會被快取的回應，Varnish 會刪除 `Set-Cookie`；依賴 cookie 的功能（語言切換、首次造訪彈窗等）可能失效。
+  4. **隨時間變動的內容**：庫存、「已售完」、倒數計時、隨機推薦、依地區顯示的內容，可能停在被快取的那一刻。
+  5. **修改內容後**：在 WordPress 後台更新文章或頁面時，CLP Varnish Cache 外掛通常會清除相關快取；用其他方式修改的內容（外掛設定、直接改資料庫）需要手動清除快取。
+- **怎麼確認**：用無痕視窗（未登入）實際操作：送出表單、加入購物車後瀏覽其他頁面、註冊／登入／登出、切換語言。
+- **有問題時**：
+  - 在 CloudPanel 該網站的 Varnish Cache 分頁，把有問題的網址加入排除清單（寫入 `settings.json` 的 `excludes`），例如 `/contact/`。
+  - 在同一分頁縮短快取時間（例如 1 天），降低表單驗證碼過期的機會。
+  - 在 WordPress 後台的 CLP Varnish Cache 外掛或 CloudPanel 後台清除快取。
+
 ---
 
 ### 2. 伺服器管理與安全加固 (`clp server`)
@@ -795,13 +920,37 @@ sudo clp backup <domain|all> [options...]
 
 | 參數 | 預設值 | 說明 |
 | :--- | :--- | :--- |
-| `-type={db\|full\|compact}` | `full` | • `db`: 僅備份資料庫 (`.sql.gz`)<br>• `compact`: 精簡備份（不含 DB，uploads 僅保留當年度，排除快取）<br>• `full`: 完整打包資料庫與全站所有實體檔案 (`.tar.gz`) |
+| `-type={db\|full\|compact\|archive}` | `full` | • `db`: 僅備份資料庫 (`.sql.gz`)<br>• `full`: 完整打包資料庫與全站實體檔案 (`.tar.gz`)<br>• `compact`: 精簡備份（不含 DB，uploads 僅保留當年度）<br>• `archive`: 歷年封存（uploads 中今年以外的全部內容，加上 `wp-content/shield`、`WPvivid_Uploads`），與 `compact` 互補 |
 | `-to={local\|<remote>}` | `local` | • `local`: 儲存於本機伺服器 (`/root/clpBackup`)<br>• `<remote>`: 指定 rclone 設定檔中之雲端名稱 (如 `google`, `b2`, `r2`) |
 | `-path=<path>` | 依目的地 | 自訂本機目錄或雲端資料夾路徑 |
-| `-expire=<Nd>` | 無 | 自動清除過期備份（如 `-expire=7d` 或 `-expire=30d`），精準僅清除同類型備份，絕不誤刪 |
+| `-expire=<Nd>` | 無 | 自動清除過期備份（如 `-expire=7d` 或 `-expire=30d`），只會清除同類型的備份 |
 | `-exclude=<pattern>` | 無 | 排除特定網站（適用於 `backup all`，支援逗號分隔） |
+| `-skip-disabled` | 無 | 搭配 `backup all`：跳過已停用的網站（`clp site <domain> -off`，vhost 不在 `sites-enabled`）。預設停用的網站也會備份；指定單一網站時一律照常備份 |
 
-#### ② 實用操作範例
+#### ② 各備份類型的內容
+
+所有類型都**不會**備份以下目錄（快取與其他備份外掛的本機備份），還原時也不會刪除它們：
+
+- `wp-content/cache`
+- UpdraftPlus `wp-content/updraft`、WPvivid `wp-content/wpvividbackups`、All-in-One WP Migration `wp-content/ai1wm-backups`
+- Duplicator `wp-content/backups-dup-lite`、`wp-content/backups-dup-pro`、`wp-snapshots`
+- Backup Migration `wp-content/backup-migration*`、BackUpWordPress `wp-content/backupwordpress-*-backups`
+- BackWPup `wp-content/uploads/backwpup-*`、Solid Backups (BackupBuddy) `wp-content/uploads/backupbuddy_backups`、`backupbuddy_temp`、WP Staging `wp-content/uploads/wp-staging/backups`
+
+| 類型 | 資料庫 | 網站檔案 | `wp-content/uploads` | `shield`、`WPvivid_Uploads` |
+| :--- | :---: | :---: | :--- | :---: |
+| `full` | ✅ | ✅ | 全部 | ✅ |
+| `compact` | — | ✅ | 只有當年度目錄（`uploads/<今年>/`）與 uploads 根目錄的隱藏檔 | — |
+| `archive` | — | — | 當年度以外的全部（歷年目錄、`elementor/` 等非年份目錄、uploads 根目錄的一般檔案） | ✅ |
+| `db` | ✅ | — | — | — |
+
+**`full` 與 `compact` + `db` + `archive` 的差異**：
+
+- **檔案範圍相同**：三者合起來涵蓋的檔案與 `full` 相同。
+- **時間點不同**：`full` 是同一時間打包；三個檔案則分開產生（例如 `db`、`compact` 每日，`archive` 每月）。還原後，歷年 uploads 可能比網站檔案與資料庫舊，最多差一個排程週期。
+- **結論**：需要單一時間點、完整的網站狀態時用 `full`；`compact` + `db` + `archive` 是節省空間的日常組合。
+
+#### ③ 實用操作範例
 
 備份指定網站資料庫至本機：
 
@@ -825,6 +974,12 @@ sudo clp backup example.com -type=full -expire=30d
 
 ```bash
 sudo clp backup example.com -type=compact -to=google
+```
+
+歷年封存備份至 Google Drive，保留 35 天：
+
+```bash
+sudo clp backup example.com -type=archive -to=google -expire=35d
 ```
 
 全伺服器網站批次備份至雲端，排除測試網站並保留 14 天：
@@ -851,7 +1006,7 @@ sudo clp restore example.com
 sudo clp restore example.com -to=google
 ```
 
-執行後系統會自動列出歷史備份清單，輸入號碼並輸入 `yes` 確認即可自動執行資料庫匯入、檔案還原、重新載入 PHP-FPM 與清除 WordPress 快取。
+執行後系統會自動列出歷史備份清單，輸入號碼並輸入 `yes` 確認即可自動執行資料庫匯入、檔案還原、重新載入 PHP-FPM 與清除 WordPress 快取。可以用 `-type={db|full|compact|archive}` 只列出特定類型。
 
 #### ② 精確命令列還原
 
@@ -866,6 +1021,55 @@ sudo clp restore example.com -file=example.com-db-20261005_120000.sql.gz
 ```bash
 sudo clp restore example.com -file=example.com-full-20261005_153000.tar.gz -to=b2 --force
 ```
+
+#### ③ 還原後與備份完全一致（刪除多出來的檔案）
+
+還原檔案時預設會刪除網站上「備份中沒有」的檔案（rsync `--delete`），例如被植入的惡意檔案或已移除的外掛，讓還原結果等於備份當時的狀態。
+
+- **只處理該類型自己的範圍**：
+  - `full`：整個網站目錄。
+  - `compact`：備份當年的 `uploads/<年份>/` 與網站其他檔案；不會動 uploads 中其他年份與非年份目錄、`shield`、`WPvivid_Uploads`。
+  - `archive`：只處理 `wp-content/uploads`（備份當年的目錄除外），以及備份中有的 `shield`、`WPvivid_Uploads`；網站其他檔案不會動。
+  - `db`：只匯入資料庫，不涉及檔案。
+- **年份以備份當時為準**：從檔名的時間戳記判斷，不是還原當天的年份。
+- **一律保護**：目前的 `wp-config.php`（備份中的版本另存到快照目錄）、上方列出的快取與備份外掛目錄。
+- **確認提示**：互動模式下會先列出將刪除的項目數量與前 20 筆，輸入 `yes` 才會繼續；使用 `-y` 或 `--force` 時直接執行。
+- **保留舊行為**：加上 `-keep-extra` 只覆蓋、不刪除。
+- **可以復原**：還原前會先建立快照（`/root/clpBackup/rollback/`），涵蓋所有可能被刪除的檔案；還原失敗會自動回復。
+
+#### ④ 還原前快照
+
+- **先檢查空間**：建立快照前，會估算網站目錄（不含上方的快取與備份外掛目錄）加上資料庫的大小，再加 10% 餘裕，與 `/root/clpBackup` 的剩餘空間比較。
+- **空間不足或快照失敗**：會刪除不完整的快照，此時尚未變更任何內容。互動模式下會詢問是否在沒有快照的情況下繼續（需輸入 `yes`）；使用 `-y` 或 `--force` 時一律中止。
+- **略過快照**：加上 `-no-snapshot` 就不建立快照，還原失敗時也無法自動回復，風險自負。
+
+```bash
+sudo clp restore example.com -type=compact -no-snapshot
+```
+
+保留網站上多出來的檔案：
+
+```bash
+sudo clp restore example.com -type=compact -keep-extra
+```
+
+#### ⑤ 用 compact + db + archive 還原完整網站
+
+`restore` 一次還原一個檔案。三個類型各自只會處理自己範圍內的檔案，所以依序還原三個檔案即可得到完整網站，建議順序為 `db` → `compact` → `archive`：
+
+```bash
+sudo clp restore example.com -type=db -to=google
+```
+
+```bash
+sudo clp restore example.com -type=compact -to=google
+```
+
+```bash
+sudo clp restore example.com -type=archive -to=google
+```
+
+注意：每次還原前都會建立一次完整的網站快照，三次還原會產生三份快照，請確認 `/root/clpBackup` 有足夠空間。
 
 ---
 
@@ -1072,15 +1276,18 @@ sudo clp config -unset cf-token
 # 2. 每日凌晨 03:30 執行精簡網站檔案備份至 Google Drive (排除歷史年度圖片，保留 7 天)
 30 3 * * * /usr/local/bin/clp backup all -type=compact -to=google -expire=7d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-compact.log 2>&1
 
-# 3. 每月 1 號凌晨 04:00 執行全站完整備份至 Google Drive (保留最近 2 份)
-0 4 1 * * /usr/local/bin/clp backup all -type=full -to=google -expire=35d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-full.log 2>&1
+# 3. 每月 1 號凌晨 04:00 執行歷年 uploads 封存備份至 Google Drive (保留最近 2 份；與 1、2 合起來即為完整網站)
+0 4 1 * * /usr/local/bin/clp backup all -type=archive -to=google -expire=35d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-archive.log 2>&1
 
-# 4. 每週日凌晨 05:00 執行伺服器空間清理瘦身 (日誌與暫存清理)
+# 4. (可選) 每月 2 號凌晨 04:00 執行全站完整備份至 Google Drive (同一時間點的完整網站，保留最近 2 份)
+0 4 2 * * /usr/local/bin/clp backup all -type=full -to=google -expire=35d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-full.log 2>&1
+
+# 5. 每週日凌晨 05:00 執行伺服器空間清理瘦身 (日誌與暫存清理)
 0 5 * * 0 /usr/local/bin/clp server -clean >> /var/log/clp/cron-clean.log 2>&1
 ```
 
 > [!NOTE]
-> 舊備份只會在新備份上傳成功後才清除。每月備份的保留天數設為 35 天，可以確保每次執行後都保留「本月＋上月」兩份。Google Drive 刪除的檔案預設會先移到垃圾桶，空間要等垃圾桶清空後才會釋放；若空間有限，可在 rclone 的 Google Drive 遠端設定中加入 `use_trash = false`。
+> 舊備份只會在新備份上傳成功後才清除。每月備份（3、4）的保留天數設為 35 天，可以確保每次執行後都保留「本月＋上月」兩份。Google Drive 刪除的檔案預設會先移到垃圾桶，空間要等垃圾桶清空後才會釋放；若空間有限，可在 rclone 的 Google Drive 遠端設定中加入 `use_trash = false`。
 
 ---
 

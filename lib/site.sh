@@ -3569,6 +3569,659 @@ site_cf_waf() {
 }
 
 # ------------------------------------------------------------------------------
+# CloudPanel「Allow traffic from Cloudflare only」(clp site -cf-only)
+#   CloudPanel 的設定存在 site.allow_traffic_from_cloudflare_only，並依此重新產生 vhost：
+#   主要 server 區塊的 access_log 改用 cloudflare 格式，{{settings}} 處加上
+#   include /etc/nginx/cloudflare/ips;（CloudPanel 維護的 Cloudflare IP allow 清單 + deny all）。
+#   clp 同時修改 vhost 與資料庫，之後在後台重新產生 vhost 也會保留這個設定。
+# ------------------------------------------------------------------------------
+CF_ONLY_DB="/home/clp/htdocs/app/data/db.sq3"
+CF_ONLY_IPS="/etc/nginx/cloudflare/ips"
+CF_ONLY_BACKUP_DIR=""
+
+cf_only_py() {
+  python3 -I "${CLP_LIB_DIR}/cf_only.py" "$@"
+}
+
+cf_only_precheck() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    log_error "$(_t "CORE_ERR_PYTHON3_REQUIRED")"
+    return 1
+  fi
+  if [[ ! -f "$CF_ONLY_DB" ]]; then
+    log_error "$(_t "SITE_CF_ONLY_ERR_NO_DB" "$CF_ONLY_DB")"
+    return 1
+  fi
+  if [[ ! -f "$CF_ONLY_IPS" ]]; then
+    log_error "$(_t "SITE_CF_ONLY_ERR_NO_IPS" "$CF_ONLY_IPS")"
+    return 1
+  fi
+}
+
+# nginx.conf 若信任所有來源的 X-Real-IP，任何人都能偽造 Cloudflare IP 繞過此設定（只警告，不修改）
+cf_only_warn_real_ip() {
+  if grep -Eq '^[[:space:]]*set_real_ip_from[[:space:]]+0\.0\.0\.0/0[[:space:]]*;' /etc/nginx/nginx.conf 2>/dev/null; then
+    log_warn "$(_t "SITE_CF_ONLY_WARN_REAL_IP")"
+  fi
+}
+
+# cf_only_backup_init：本次執行的備份目錄（vhost 副本、資料庫欄位原值、資料庫備份）；資料庫備份只保留最近 3 份
+cf_only_backup_init() {
+  [[ -n "$CF_ONLY_BACKUP_DIR" ]] && return 0
+  local base="/root/.clp/cf-only-backup"
+  CF_ONLY_BACKUP_DIR="${base}/$(date +%Y%m%d_%H%M%S)"
+  ( umask 077; mkdir -p "$CF_ONLY_BACKUP_DIR" ) || return 1
+  if ! cf_only_py db-backup "$CF_ONLY_DB" "${CF_ONLY_BACKUP_DIR}/db.sq3"; then
+    log_error "$(_t "SITE_CF_ONLY_ERR_DB_BACKUP")"
+    return 1
+  fi
+  chmod 600 "${CF_ONLY_BACKUP_DIR}/db.sq3" 2>/dev/null || true
+  local old
+  while IFS= read -r old; do
+    rm -f "${old}/db.sq3"
+  done < <(find "$base" -mindepth 2 -maxdepth 2 -name db.sq3 -printf '%h\n' 2>/dev/null | sort -r | tail -n +4)
+  log_info "$(_t "SITE_CF_ONLY_INFO_BACKUP" "$CF_ONLY_BACKUP_DIR")"
+}
+
+# cf_only_dns_check <domain>：網域與 www／非 www 對應名稱的 A／AAAA 記錄必須全部在 Cloudflare 範圍內
+cf_only_dns_check() {
+  local domain="$1" out rc=0 name addr res
+  out=$(cf_only_py dns-check "$domain" "$CF_ONLY_IPS" 2>&1) || rc=$?
+  if [[ "$rc" -eq 2 ]]; then
+    log_error "$out"
+    return 1
+  fi
+  local any=0
+  while IFS=$'\t' read -r name addr res; do
+    [[ -z "$name" ]] && continue
+    case "$res" in
+      ok) any=1 ;;
+      bad) any=1; log_warn "$(_t "SITE_CF_ONLY_DNS_BAD" "$name" "$addr")" ;;
+      none) ;;
+    esac
+  done <<< "$out"
+  if [[ "$rc" -eq 1 ]]; then
+    log_error "$(_t "SITE_CF_ONLY_ERR_DNS" "$domain")"
+    return 1
+  fi
+  [[ "$any" -eq 0 ]] && log_info "$(_t "SITE_CF_ONLY_INFO_DNS_NONE" "$domain")"
+  return 0
+}
+
+# cf_only_apply <domain> <on|off> <force:0|1> <dry_run:0|1>
+#   設定 CF_ONLY_RESULT=changed|already|dry-run|failed；失敗時回傳 1
+cf_only_apply() {
+  local domain="$1" action="$2" force="$3" dry_run="$4"
+  CF_ONLY_RESULT="failed"
+  local vhost="/etc/nginx/sites-enabled/${domain}.conf"
+  if [[ ! -f "$vhost" ]]; then
+    if [[ -f "/etc/nginx/sites-available/${domain}.conf" ]]; then
+      log_error "$(_t "SITE_CF_ONLY_ERR_DISABLED" "$domain" "$domain")"
+    else
+      log_error "$(_t "SITE_CF_ONLY_ERR_NO_VHOST" "$vhost")"
+    fi
+    return 1
+  fi
+
+  local st_out st_rc=0 vstate names
+  st_out=$(cf_only_py vhost-status "$vhost" 2>&1) || st_rc=$?
+  if [[ "$st_rc" -ne 0 ]]; then
+    log_error "$(_t "SITE_CF_ONLY_ERR_STRUCTURE" "$vhost" "$st_out")"
+    return 1
+  fi
+  vstate=$(sed -n 1p <<< "$st_out")
+  names=$(sed -n 2p <<< "$st_out")
+  local want_db=0
+  [[ "$action" == "on" ]] && want_db=1
+  local db_val
+  db_val=$(cf_only_py db-get "$CF_ONLY_DB" "$domain" 2>/dev/null | cut -f2)
+  if [[ -z "$db_val" ]]; then
+    log_error "$(_t "SITE_CF_ONLY_ERR_NOT_IN_DB" "$domain")"
+    return 1
+  fi
+
+  if [[ "$vstate" == "$action" && "$db_val" == "$want_db" ]]; then
+    log_info "$(_t "SITE_CF_ONLY_INFO_ALREADY" "$domain" "$action")"
+    CF_ONLY_RESULT="already"
+    return 0
+  fi
+
+  if [[ "$action" == "on" ]]; then
+    if [[ "$force" -eq 1 ]]; then
+      log_warn "$(_t "SITE_CF_ONLY_WARN_FORCE" "$domain")"
+    elif ! cf_only_dns_check "$domain"; then
+      return 1
+    fi
+    # 主要網域與 www 以外的 server_name（例如 CloudPanel 測試用的 www1.*）不檢查，只提醒
+    local n base="${domain#www.}" others=()
+    for n in $names; do
+      [[ "$n" == "$base" || "$n" == "www.${base}" ]] || others+=("$n")
+    done
+    [[ ${#others[@]} -gt 0 ]] && log_info "$(_t "SITE_CF_ONLY_INFO_OTHER_NAMES" "${others[*]}")"
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log_info "$(_t "SITE_CF_ONLY_INFO_DRY_RUN" "$domain" "$action")"
+    CF_ONLY_RESULT="dry-run"
+    return 0
+  fi
+
+  cf_only_backup_init || return 1
+  local vbak="${CF_ONLY_BACKUP_DIR}/${domain}.conf"
+  cp -p "$vhost" "$vbak" || return 1
+
+  # 1. vhost（已是目標狀態時只同步資料庫）
+  local vhost_changed=0
+  if [[ "$vstate" != "$action" ]]; then
+    local tmp set_rc=0
+    tmp=$(mktemp "${CF_ONLY_BACKUP_DIR}/.vhost.XXXXXX") || return 1
+    cf_only_py vhost-set "$action" "$vhost" "$tmp" 2> "${tmp}.err" || set_rc=$?
+    if [[ "$set_rc" -ne 0 && "$set_rc" -ne 3 ]]; then
+      log_error "$(_t "SITE_CF_ONLY_ERR_STRUCTURE" "$vhost" "$(cat "${tmp}.err")")"
+      rm -f "$tmp" "${tmp}.err"
+      return 1
+    fi
+    if [[ "$set_rc" -eq 0 ]]; then
+      if ! atomic_replace "$tmp" "$vhost"; then
+        rm -f "$tmp" "${tmp}.err"
+        return 1
+      fi
+      vhost_changed=1
+    fi
+    rm -f "$tmp" "${tmp}.err"
+
+    if [[ "$vhost_changed" -eq 1 ]]; then
+      if ! nginx -t >/dev/null 2>&1; then
+        log_error "$(_t "SITE_CF_ONLY_ERR_NGINX_TEST" "$domain")"
+        atomic_replace "$vbak" "$vhost" || log_error "$(_t "SITE_CF_ONLY_ERR_RESTORE" "$vbak" "$vhost")"
+        return 1
+      fi
+      systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
+    fi
+  fi
+
+  # 2. CloudPanel 資料庫
+  if [[ "$db_val" != "$want_db" ]]; then
+    local prev
+    if ! prev=$(cf_only_py db-set "$CF_ONLY_DB" "$domain" "$want_db" 2>&1); then
+      log_error "$(_t "SITE_CF_ONLY_ERR_DB_SET" "$domain" "$prev")"
+      if [[ "$vhost_changed" -eq 1 ]]; then
+        atomic_replace "$vbak" "$vhost" || log_error "$(_t "SITE_CF_ONLY_ERR_RESTORE" "$vbak" "$vhost")"
+        nginx -t >/dev/null 2>&1 && { systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true; }
+      fi
+      return 1
+    fi
+    printf '%s\t%s\n' "$domain" "$prev" >> "${CF_ONLY_BACKUP_DIR}/db-previous-values.tsv"
+  fi
+
+  log_success "$(_t "SITE_CF_ONLY_SUCCESS" "$domain" "$action")"
+  CF_ONLY_RESULT="changed"
+  return 0
+}
+
+# cf_only_status_line <domain>：輸出 "<db>\t<vhost>\t<dns>"
+cf_only_status_line() {
+  local domain="$1" db vstate dns="-"
+  db=$(cf_only_py db-get "$CF_ONLY_DB" "$domain" 2>/dev/null | cut -f2)
+  [[ -z "$db" ]] && db="?"
+  local vhost="/etc/nginx/sites-enabled/${domain}.conf"
+  if [[ -f "$vhost" ]]; then
+    vstate=$(cf_only_py vhost-status "$vhost" 2>/dev/null | sed -n 1p) || true
+    [[ -z "$vstate" ]] && vstate="error"
+  elif [[ -f "/etc/nginx/sites-available/${domain}.conf" ]]; then
+    vstate="disabled"
+  else
+    vstate="missing"
+  fi
+  local out rc=0
+  out=$(cf_only_py dns-check "$domain" "$CF_ONLY_IPS" 2>/dev/null) || rc=$?
+  if [[ "$rc" -eq 1 ]]; then
+    dns="bad"
+  elif [[ "$rc" -eq 0 ]]; then
+    if grep -q $'\tok$' <<< "$out"; then dns="ok"; else dns="none"; fi
+  fi
+  printf '%s\t%s\t%s\n' "$db" "$vstate" "$dns"
+}
+
+cf_only_status() {
+  local domain="$1"
+  cf_only_warn_real_ip
+  local -a domains=()
+  if [[ -n "$domain" ]]; then
+    domains=("$domain")
+  else
+    while IFS=$'\t' read -r d _; do
+      [[ -n "$d" ]] && domains+=("$d")
+    done < <(cf_only_py db-get "$CF_ONLY_DB")
+  fi
+  echo ""
+  printf "%-40s %-6s %-9s %-6s %s\n" "$(_t "SITE_CF_ONLY_COL_DOMAIN")" "DB" "vhost" "DNS" "$(_t "SITE_CF_ONLY_COL_NOTE")"
+  echo "----------------------------------------------------------------------------------------"
+  local d line db vs dns note
+  for d in "${domains[@]}"; do
+    line=$(cf_only_status_line "$d")
+    IFS=$'\t' read -r db vs dns <<< "$line"
+    note=""
+    if [[ "$vs" == "on" || "$vs" == "off" ]]; then
+      if { [[ "$vs" == "on" ]] && [[ "$db" != "1" ]]; } || { [[ "$vs" == "off" ]] && [[ "$db" != "0" ]]; }; then
+        note="$(_t "SITE_CF_ONLY_NOTE_MISMATCH")"
+      fi
+    elif [[ "$vs" == "mixed" ]]; then
+      note="$(_t "SITE_CF_ONLY_NOTE_MIXED")"
+    fi
+    if [[ "$vs" != "on" && "$dns" == "bad" ]]; then
+      note="${note:+$note; }$(_t "SITE_CF_ONLY_NOTE_DNS_BAD")"
+    fi
+    printf "%-40s %-6s %-9s %-6s %s\n" "$d" "$db" "$vs" "$dns" "$note"
+  done
+  echo ""
+  if [[ -n "$domain" ]]; then
+    cf_only_py dns-check "$domain" "$CF_ONLY_IPS" 2>/dev/null | sed 's/^/    /' || true
+  fi
+  return 0
+}
+
+# cf_only_batch <on|off> <dry_run> <force>
+cf_only_batch() {
+  local action="$1" dry_run="$2" force="$3"
+  local -a todo=() skipped=() ex_patterns=()
+  local exclude
+  exclude=$(opt_get "exclude" "")
+  [[ -n "$exclude" ]] && IFS=',' read -ra ex_patterns <<< "$exclude"
+  local d line db vs dns pat
+  while IFS=$'\t' read -r d _; do
+    [[ -z "$d" ]] && continue
+    local excluded=0
+    for pat in ${ex_patterns[@]+"${ex_patterns[@]}"}; do
+      if domain_matches_exclude "$d" "$pat"; then excluded=1; break; fi
+    done
+    [[ "$excluded" -eq 1 ]] && continue
+    line=$(cf_only_status_line "$d")
+    IFS=$'\t' read -r db vs dns <<< "$line"
+    if [[ "$vs" == "disabled" || "$vs" == "missing" || "$vs" == "error" ]]; then
+      skipped+=("${d} (${vs})")
+      continue
+    fi
+    local want_db=0
+    [[ "$action" == "on" ]] && want_db=1
+    if [[ "$vs" == "$action" && "$db" == "$want_db" ]]; then
+      continue
+    fi
+    if [[ "$action" == "on" && "$dns" == "bad" && "$force" -eq 0 ]]; then
+      skipped+=("${d} ($(_t "SITE_CF_ONLY_NOTE_DNS_BAD"))")
+      continue
+    fi
+    todo+=("$d")
+  done < <(cf_only_py db-get "$CF_ONLY_DB")
+
+  echo ""
+  log_info "$(_t "SITE_CF_ONLY_BATCH_TODO" "$action" "${#todo[@]}")"
+  for d in "${todo[@]}"; do echo "    $d"; done
+  if [[ ${#skipped[@]} -gt 0 ]]; then
+    log_info "$(_t "SITE_CF_ONLY_BATCH_SKIPPED" "${#skipped[@]}")"
+    for d in "${skipped[@]}"; do echo "    $d"; done
+  fi
+  [[ ${#todo[@]} -eq 0 ]] && return 0
+  if [[ "$dry_run" -eq 1 ]]; then
+    log_info "$(_t "SITE_CF_ONLY_BATCH_DRY_RUN")"
+    return 0
+  fi
+
+  if ! has_opt "y" && ! has_opt "yes" && [[ "${CLP_AUTO_YES:-false}" != "true" ]]; then
+    if [[ ! -t 0 ]]; then
+      log_error "$(_t "SITE_CF_ONLY_ERR_NON_TTY")"
+      return 1
+    fi
+    local confirm=""
+    read -r -p "$(_t "SITE_CF_ONLY_BATCH_PROMPT" "${#todo[@]}")" confirm || confirm=""
+    if [[ "$confirm" != "yes" && "$confirm" != "y" ]]; then
+      log_info "$(_t "SITE_CF_ONLY_CANCELLED")"
+      return 0
+    fi
+  fi
+
+  local ok=0 failed=()
+  for d in "${todo[@]}"; do
+    echo -e "\n${C_CYAN}>>> ${d}${C_NC}"
+    # DNS 已在清單階段檢查過；-force 時略過
+    if cf_only_apply "$d" "$action" "$force" 0; then
+      ok=$((ok + 1))
+    else
+      failed+=("$d")
+    fi
+  done
+  echo ""
+  if [[ ${#failed[@]} -eq 0 ]]; then
+    log_success "$(_t "SITE_CF_ONLY_BATCH_DONE" "$ok" "${#todo[@]}")"
+    return 0
+  fi
+  log_error "$(_t "SITE_CF_ONLY_BATCH_PARTIAL" "$ok" "${#todo[@]}" "${failed[*]}")"
+  return 1
+}
+
+# site_cf_only <domain>
+#   clp site <domain> -cf-only[=on|off|status]
+#   clp site -cf-only=status
+#   clp site -cf-only[=off] -all [-exclude=<patterns>] [-dry-run] [-y] [-force]
+site_cf_only() {
+  local domain
+  domain=$(clean_domain "${1:-}")
+  local val
+  val=$(opt_get "cf_only" "$(opt_get "cf-only" "")")
+  val=$(echo "$val" | tr '[:upper:]' '[:lower:]')
+  local action
+  case "$val" in
+    ""|true|on) action="on" ;;
+    off) action="off" ;;
+    status) action="status" ;;
+    *)
+      log_error "$(_t "SITE_CF_ONLY_ERR_VALUE" "$val")"
+      return 1
+      ;;
+  esac
+  local all=0 dry_run=0 force=0
+  has_opt "all" && all=1
+  { has_opt "dry-run" || has_opt "dry_run"; } && dry_run=1
+  has_opt "force" && force=1
+
+  cf_only_precheck || return 1
+
+  if [[ "$action" == "status" ]]; then
+    if [[ -n "$domain" && "$all" -eq 0 ]]; then
+      require_site_exists "$domain" "-cf-only" || return 1
+    fi
+    [[ "$all" -eq 1 ]] && domain=""
+    cf_only_status "$domain"
+    return $?
+  fi
+
+  if [[ "$all" -eq 1 ]]; then
+    if [[ -n "$domain" ]]; then
+      log_error "$(_t "SITE_CF_ONLY_ERR_ALL_WITH_DOMAIN")"
+      return 1
+    fi
+    cf_only_warn_real_ip
+    cf_only_batch "$action" "$dry_run" "$force"
+    return $?
+  fi
+
+  if [[ -z "$domain" ]]; then
+    log_error "$(_t "SITE_CF_ONLY_ERR_USAGE")"
+    return 1
+  fi
+  require_site_exists "$domain" "-cf-only" || return 1
+  [[ "$action" == "on" ]] && cf_only_warn_real_ip
+  cf_only_apply "$domain" "$action" "$force" "$dry_run"
+}
+
+# ------------------------------------------------------------------------------
+# Varnish 快取診斷與修正 (clp site -varnish=status|fix)
+#   CloudPanel 的 Varnish 只快取 PHP 送出 Cache-Control 的頁面，這些 header 由
+#   /home/<user>/.varnish-cache/controller.php 送出，必須經由 auto_prepend_file 載入：
+#   vhost 8080 區塊的 PHP_VALUE 要有那一行；若 Wordfence 的 .user.ini 改用 wordfence-waf.php，
+#   wordfence-waf.php 也要 include controller.php。
+# ------------------------------------------------------------------------------
+VARNISH_DB="/home/clp/htdocs/app/data/db.sq3"
+VARNISH_BACKUP_DIR=""
+
+varnish_py() {
+  python3 -I "${CLP_LIB_DIR}/varnish_fix.py" "$@"
+}
+
+# varnish_diagnose <domain>：設定 VD_* 變數；失敗回傳 1
+varnish_diagnose() {
+  local domain="$1" out rc=0
+  out=$(varnish_py diagnose "$VARNISH_DB" "$domain" 2>&1) || rc=$?
+  VD_ERROR=""
+  if [[ "$rc" -ne 0 ]]; then
+    VD_ERROR="$out"
+    VD_CONCLUSION="error"
+    return 1
+  fi
+  local k v
+  VD_TYPE="" VD_DB="" VD_SETTINGS="" VD_VHOST="" VD_USERINI="" VD_WFWAF="" VD_CACHED="" VD_CONCLUSION="" VD_USER="" VD_ROOT=""
+  while IFS='=' read -r k v; do
+    case "$k" in
+      type) VD_TYPE="$v" ;; varnish_db) VD_DB="$v" ;; settings) VD_SETTINGS="$v" ;;
+      vhost) VD_VHOST="$v" ;; userini) VD_USERINI="$v" ;; wfwaf) VD_WFWAF="$v" ;;
+      cached) VD_CACHED="$v" ;; conclusion) VD_CONCLUSION="$v" ;; user) VD_USER="$v" ;; root) VD_ROOT="$v" ;;
+    esac
+  done <<< "$out"
+}
+
+varnish_conclusion_text() {
+  case "$1" in
+    ok) _t "SITE_VARNISH_C_OK" ;;
+    fix-vhost) _t "SITE_VARNISH_C_FIX_VHOST" ;;
+    fix-wfwaf) _t "SITE_VARNISH_C_FIX_WFWAF" ;;
+    fix-both) _t "SITE_VARNISH_C_FIX_BOTH" ;;
+    off) _t "SITE_VARNISH_C_OFF" ;;
+    off-db) _t "SITE_VARNISH_C_OFF_DB" ;;
+    not-php) _t "SITE_VARNISH_C_NOT_PHP" ;;
+    disabled-site) _t "SITE_VARNISH_C_DISABLED" ;;
+    skip-other) _t "SITE_VARNISH_C_SKIP_OTHER" ;;
+    skip-vhost) _t "SITE_VARNISH_C_SKIP_VHOST" ;;
+    unknown) _t "SITE_VARNISH_C_UNKNOWN" ;;
+    *) _t "SITE_VARNISH_C_ERROR" ;;
+  esac
+}
+
+varnish_print_row() {
+  local domain="$1"
+  printf "%-32s %-9s %-8s %-10s %-9s %-6s %s\n" "$domain" "${VD_SETTINGS:--}" "${VD_VHOST:--}" \
+    "${VD_USERINI%%:*}" "${VD_WFWAF:--}" "${VD_CACHED:--}" "$(varnish_conclusion_text "$VD_CONCLUSION")"
+}
+
+varnish_print_header() {
+  echo ""
+  printf "%-32s %-9s %-8s %-10s %-9s %-6s %s\n" "Domain" "settings" "vhost" ".user.ini" "wf-waf" "cached" "$(_t "SITE_VARNISH_COL_RESULT")"
+  echo "--------------------------------------------------------------------------------------------------------"
+}
+
+varnish_backup_init() {
+  [[ -n "$VARNISH_BACKUP_DIR" ]] && return 0
+  VARNISH_BACKUP_DIR="/root/.clp/varnish-backup/$(date +%Y%m%d_%H%M%S)"
+  ( umask 077; mkdir -p "$VARNISH_BACKUP_DIR" ) || return 1
+  log_info "$(_t "SITE_CF_ONLY_INFO_BACKUP" "$VARNISH_BACKUP_DIR")"
+}
+
+# varnish_fix_site <domain> <dry_run>：依診斷結論修正；設定 VF_RESULT=fixed|nothing|dry-run|skipped|failed
+varnish_fix_site() {
+  local domain="$1" dry_run="$2"
+  VF_RESULT="failed"
+  if ! varnish_diagnose "$domain"; then
+    log_error "$VD_ERROR"
+    return 1
+  fi
+  local before="$VD_CONCLUSION"
+  case "$before" in
+    ok)
+      log_info "$(_t "SITE_VARNISH_INFO_ALREADY_OK" "$domain")"
+      VF_RESULT="nothing"; return 0 ;;
+    fix-vhost|fix-wfwaf|fix-both) ;;
+    *)
+      log_warn "$(_t "SITE_VARNISH_WARN_NOT_FIXABLE" "$domain" "$(varnish_conclusion_text "$before")")"
+      VF_RESULT="skipped"; return 0 ;;
+  esac
+  if [[ "$dry_run" -eq 1 ]]; then
+    log_info "$(_t "SITE_VARNISH_INFO_DRY_RUN" "$domain" "$(varnish_conclusion_text "$before")")"
+    VF_RESULT="dry-run"; return 0
+  fi
+  varnish_backup_init || return 1
+  local bdir="${VARNISH_BACKUP_DIR}/${domain}"
+  ( umask 077; mkdir -p "$bdir" ) || return 1
+
+  # 1. vhost
+  if [[ "$before" == "fix-vhost" || "$before" == "fix-both" ]]; then
+    local vhost="/etc/nginx/sites-enabled/${domain}.conf"
+    cp -p "$vhost" "${bdir}/${domain}.conf" || return 1
+    local tmp rc=0
+    tmp=$(mktemp "${bdir}/.vhost.XXXXXX") || return 1
+    varnish_py fix-vhost "$vhost" "/home/${VD_USER}/.varnish-cache/controller.php" "$tmp" 2> "${tmp}.err" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      if ! atomic_replace "$tmp" "$vhost"; then
+        rm -f "$tmp" "${tmp}.err"; return 1
+      fi
+      if ! nginx -t >/dev/null 2>&1; then
+        log_error "$(_t "SITE_VARNISH_ERR_NGINX_TEST" "$domain")"
+        atomic_replace "${bdir}/${domain}.conf" "$vhost" || log_error "$(_t "SITE_CF_ONLY_ERR_RESTORE" "${bdir}/${domain}.conf" "$vhost")"
+        rm -f "$tmp" "${tmp}.err"; return 1
+      fi
+      systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
+      log_success "$(_t "SITE_VARNISH_OK_VHOST" "$domain")"
+    elif [[ "$rc" -ne 3 ]]; then
+      log_error "$(_t "SITE_CF_ONLY_ERR_STRUCTURE" "$vhost" "$(cat "${tmp}.err")")"
+      rm -f "$tmp" "${tmp}.err"; return 1
+    fi
+    rm -f "$tmp" "${tmp}.err"
+  fi
+
+  # 2. wordfence-waf.php（不修改 .user.ini）
+  if [[ "$before" == "fix-wfwaf" || "$before" == "fix-both" ]]; then
+    local err rc=0
+    err=$(varnish_py fix-wfwaf "$VD_ROOT" "$VD_USER" "$bdir" 2>&1) || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      [[ -n "$err" ]] && log_warn "$err"
+      log_success "$(_t "SITE_VARNISH_OK_WFWAF" "$domain")"
+    elif [[ "$rc" -ne 3 ]]; then
+      log_error "$(_t "SITE_VARNISH_ERR_WFWAF" "$domain" "$err")"
+      return 1
+    fi
+  fi
+
+  # 3. 重新檢查實際結果（nginx reload 為非同步，稍候再測）
+  sleep 2
+  local after
+  after=$(varnish_py probe "$domain" 2>/dev/null || echo error)
+  if [[ "$after" == "yes" ]]; then
+    log_success "$(_t "SITE_VARNISH_OK_CACHED" "$domain")"
+    VF_RESULT="fixed"; return 0
+  fi
+  log_warn "$(_t "SITE_VARNISH_WARN_STILL_NOT_CACHED" "$domain" "$VARNISH_BACKUP_DIR")"
+  VF_RESULT="fixed"
+  return 1
+}
+
+varnish_status() {
+  local domain="$1"
+  local -a domains=()
+  if [[ -n "$domain" ]]; then
+    domains=("$domain")
+  else
+    while IFS= read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(varnish_py list "$VARNISH_DB")
+  fi
+  varnish_print_header
+  local d
+  for d in "${domains[@]}"; do
+    varnish_diagnose "$d" || true
+    varnish_print_row "$d"
+  done
+  echo ""
+  if [[ -n "$domain" && -n "$VD_ERROR" ]]; then
+    log_error "$VD_ERROR"
+    return 1
+  fi
+  return 0
+}
+
+varnish_batch_fix() {
+  local dry_run="$1"
+  local exclude pat d
+  exclude=$(opt_get "exclude" "")
+  local -a ex_patterns=() todo=()
+  [[ -n "$exclude" ]] && IFS=',' read -ra ex_patterns <<< "$exclude"
+  varnish_print_header
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    local excluded=0
+    for pat in ${ex_patterns[@]+"${ex_patterns[@]}"}; do
+      if domain_matches_exclude "$d" "$pat"; then excluded=1; break; fi
+    done
+    [[ "$excluded" -eq 1 ]] && continue
+    varnish_diagnose "$d" || true
+    varnish_print_row "$d"
+    case "$VD_CONCLUSION" in fix-vhost|fix-wfwaf|fix-both) todo+=("$d") ;; esac
+  done < <(varnish_py list "$VARNISH_DB")
+  echo ""
+  log_info "$(_t "SITE_VARNISH_BATCH_TODO" "${#todo[@]}")"
+  [[ ${#todo[@]} -eq 0 ]] && return 0
+  log_warn "$(_t "SITE_VARNISH_WARN_CACHE_START")"
+  if [[ "$dry_run" -eq 1 ]]; then
+    log_info "$(_t "SITE_CF_ONLY_BATCH_DRY_RUN")"
+    return 0
+  fi
+  if ! has_opt "y" && ! has_opt "yes" && [[ "${CLP_AUTO_YES:-false}" != "true" ]]; then
+    if [[ ! -t 0 ]]; then
+      log_error "$(_t "SITE_CF_ONLY_ERR_NON_TTY")"
+      return 1
+    fi
+    local confirm=""
+    read -r -p "$(_t "SITE_CF_ONLY_BATCH_PROMPT" "${#todo[@]}")" confirm || confirm=""
+    if [[ "$confirm" != "yes" && "$confirm" != "y" ]]; then
+      log_info "$(_t "SITE_CF_ONLY_CANCELLED")"
+      return 0
+    fi
+  fi
+  local ok=0 failed=()
+  for d in "${todo[@]}"; do
+    echo -e "\n${C_CYAN}>>> ${d}${C_NC}"
+    if varnish_fix_site "$d" 0; then ok=$((ok + 1)); else failed+=("$d"); fi
+  done
+  echo ""
+  if [[ ${#failed[@]} -eq 0 ]]; then
+    log_success "$(_t "SITE_CF_ONLY_BATCH_DONE" "$ok" "${#todo[@]}")"
+    return 0
+  fi
+  log_error "$(_t "SITE_CF_ONLY_BATCH_PARTIAL" "$ok" "${#todo[@]}" "${failed[*]}")"
+  return 1
+}
+
+# site_varnish <domain>
+#   clp site <domain> -varnish=status | -varnish=fix [-dry-run]
+#   clp site -varnish=status
+#   clp site -varnish=fix -all [-exclude=...] [-dry-run] [-y]
+site_varnish() {
+  local domain
+  domain=$(clean_domain "${1:-}")
+  local val
+  val=$(echo "$(opt_get "varnish" "")" | tr '[:upper:]' '[:lower:]')
+  local all=0 dry_run=0
+  has_opt "all" && all=1
+  { has_opt "dry-run" || has_opt "dry_run"; } && dry_run=1
+  if ! command -v python3 >/dev/null 2>&1; then
+    log_error "$(_t "CORE_ERR_PYTHON3_REQUIRED")"; return 1
+  fi
+  if [[ ! -f "$VARNISH_DB" ]]; then
+    log_error "$(_t "SITE_CF_ONLY_ERR_NO_DB" "$VARNISH_DB")"; return 1
+  fi
+  case "$val" in
+    status)
+      if [[ -n "$domain" && "$all" -eq 0 ]]; then
+        require_site_exists "$domain" "-varnish" || return 1
+        varnish_status "$domain"
+      else
+        varnish_status ""
+      fi
+      ;;
+    fix)
+      if [[ "$all" -eq 1 ]]; then
+        [[ -n "$domain" ]] && { log_error "$(_t "SITE_CF_ONLY_ERR_ALL_WITH_DOMAIN")"; return 1; }
+        varnish_batch_fix "$dry_run"
+        return $?
+      fi
+      [[ -z "$domain" ]] && { log_error "$(_t "SITE_VARNISH_ERR_USAGE")"; return 1; }
+      require_site_exists "$domain" "-varnish" || return 1
+      varnish_status "$domain" || return 1
+      varnish_fix_site "$domain" "$dry_run"
+      ;;
+    *)
+      log_error "$(_t "SITE_VARNISH_ERR_USAGE")"
+      return 1
+      ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
 # Dispatcher for `clp site`
 # ------------------------------------------------------------------------------
 site_handler() {
@@ -3581,6 +4234,8 @@ site_handler() {
   # 3. clp site <domain> -on / -off / -delete
   # 4. clp site <domain> -new ...
   # 5. clp site <domain> -cf-waf[=status|=off]
+  # 5b. clp site <domain> -cf-only[=off|=status] / clp site -cf-only[=off|=status] -all
+  # 5c. clp site <domain> -varnish=status|fix / clp site -varnish=status / clp site -varnish=fix -all
   # 6. clp site -clone-from=<domain1> <domain2>
   # 7. clp site -migrate=<remote_host> -from=<domain1> [<domain2>]
 
@@ -3605,7 +4260,7 @@ site_handler() {
   local -a used_pos=("site")
   [[ -n "$action" ]] && used_pos+=("$action")
   [[ -n "$target_domain" ]] && used_pos+=("$target_domain")
-  reject_extra_positionals raw_args "on|off|new|list|delete|del|ssl|dns|http|cf-waf|cf_waf|clone-from|clone_from|migrate|y|yes|force-replace|force_replace" "${used_pos[@]}" || return 1
+  reject_extra_positionals raw_args "on|off|new|list|delete|del|ssl|dns|http|cf-waf|cf_waf|cf-only|cf_only|varnish|fix|all|status|exclude|clone-from|clone_from|migrate|y|yes|force-replace|force_replace" "${used_pos[@]}" || return 1
 
   # 檢查 options
   if has_opt "list" || [[ "$action" == "list" ]]; then
@@ -3616,6 +4271,18 @@ site_handler() {
   if has_opt "delete" || [[ "$action" == "delete" ]]; then
     site_delete "$target_domain"
     return 0
+  fi
+
+  # Varnish 快取診斷與修正
+  if has_opt "varnish"; then
+    site_varnish "$target_domain"
+    return $?
+  fi
+
+  # CloudPanel「Allow traffic from Cloudflare only」
+  if has_opt "cf-only" || has_opt "cf_only"; then
+    site_cf_only "$target_domain"
+    return $?
   fi
 
   if has_opt "on"; then

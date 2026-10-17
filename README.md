@@ -54,7 +54,7 @@
   - **System Dashboard**: Real-time 3-area audit covering system overview, running services, and security metrics.
   - **Fresh VPS Installer**: Dynamically matches official compatible database engines (MySQL 8.4 LTS, MariaDB 11.4 LTS, etc.) with 17 core modules selectable via an interactive switchboard.
   - **Anti-Lockout Security Hardening**: SSH dual-key validation, password authentication disabling, UFW firewall rules, Fail2ban brute-force defense, systemd journal size capping (500M), and kernel sysctl tuning.
-- 📦 **Flexible Backup & Cloud Sync**: 3 backup formats (`db`, `compact`, `full`) natively integrated with `rclone` supporting Google Drive, Backblaze B2, Cloudflare R2, and AWS S3, complete with precision expired backup cleanup (`-expire`).
+- 📦 **Flexible Backup & Cloud Sync**: 4 backup formats (`db`, `compact`, `archive` for past years' uploads, `full`) natively integrated with `rclone` supporting Google Drive, Backblaze B2, Cloudflare R2, and AWS S3, complete with precision expired backup cleanup (`-expire`).
 - 🔐 **HTTP Basic Authentication & IP Whitelisting**: Protect WordPress admin dashboard (`/wp-admin/` and `wp-login.php`), entire site, or custom subdirectories, with CIDR IP whitelisting for password-free bypass.
 - ⚙️ **Dynamic PHP-FPM Pool Tuning**: Automatically detects active PHP versions per site, adapts pool configuration parameters, and performs syntax tests with instant rollback safeguards.
 - 💡 **Smart Typo Suggestion**: Automatically identifies mistyped domain names using Levenshtein distance and suggests closest matching existing sites.
@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.0.0 (build 2026-10-16 17:31:50)`
+Output example:`CLP Helper v1.0.0 (build 2026-10-17 21:30:03)`
 
 Display global help menu:
 
@@ -174,10 +174,10 @@ sudo clp <module> [target_domain] [options...]
 
 | Module | Description | Common Commands |
 | :--- | :--- | :--- |
-| **`site`** | WordPress Site Management | `-new`, `-list`, `-on`, `-off`, `-ssl`, `-cf-waf`, `-clone-from`, `-migrate`, `delete` |
+| **`site`** | WordPress Site Management | `-new`, `-list`, `-on`, `-off`, `-ssl`, `-cf-waf`, `-cf-only`, `-varnish`, `-clone-from`, `-migrate`, `delete` |
 | **`server`** | Server Operations & Hardening | `(no args)`, `install`, `-harden`, `-ufw`, `-ssh`, `-fail2ban`, `-clean` |
-| **`backup`** | Site & Database Backup | `-type={db\|full\|compact}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
-| **`restore`** | Site & Database Restore | `[-file=<name>]`, `-type={db\|full\|compact}`, `-to={local\|<remote>}` |
+| **`backup`** | Site & Database Backup | `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
+| **`restore`** | Site & Database Restore | `[-file=<name>]`, `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}` |
 | **`httpauth`** | HTTP Authentication & Whitelisting | `-add`, `-delete`, `-list`, `-wp-admin`, `-path`, `-whitelist` |
 | **`php-pm`** | PHP-FPM Pool Optimization | `<domain>`, `all` |
 | **`config`** | Global Preferences & Credentials | `-set <key>=<val>`, `-get <key>`, `-list`, `-unset <key>` |
@@ -568,6 +568,131 @@ sudo clp site example.com -cf-waf=off
   - **Namespace Isolation**: Only rules prefixed with `[CLP]` are managed; existing user rules are never overwritten or removed.
   - **Quota Guard**: Checks custom rules limit against zone plan (Free 5 / Pro 20 / Business 100 / Enterprise 1000) before deploying, aborting and listing existing rules if exceeded to prevent API 400 errors.
 
+#### ⑧ Allow Traffic from Cloudflare Only (`clp site <domain> -cf-only`)
+
+Same as CloudPanel's per-site "Allow traffic from Cloudflare only" setting. When enabled, requests that connect to the server IP directly get a 403 from Nginx and never reach PHP, which blocks scanners that bypass Cloudflare. The CloudPanel UI only toggles one site at a time; this command works on a single site or on all sites at once.
+
+Enable:
+
+```bash
+sudo clp site example.com -cf-only
+```
+
+Disable:
+
+```bash
+sudo clp site example.com -cf-only=off
+```
+
+Show the status of one site or of all sites (database, vhost, whether DNS goes through Cloudflare):
+
+```bash
+sudo clp site example.com -cf-only=status
+```
+
+```bash
+sudo clp site -cf-only=status
+```
+
+Preview, then enable all sites (`-exclude` works like `backup all`):
+
+```bash
+sudo clp site -cf-only -all -dry-run
+```
+
+```bash
+sudo clp site -cf-only -all -exclude="test.,dev."
+```
+
+Disable all sites:
+
+```bash
+sudo clp site -cf-only=off -all
+```
+
+- **DNS check**: before enabling, the domain and its www / non-www counterpart are resolved, and every A/AAAA record must be a Cloudflare address (orange cloud). A grey-cloud domain, or one pointing elsewhere, would become unreachable, so it is refused with the reason; add `-force` to enable anyway. Batch enabling skips sites that fail the check.
+- **Updates both the vhost and the CloudPanel database**: only two places in the main server block change (`access_log` switches to the `cloudflare` format and `include /etc/nginx/cloudflare/ips;` is added), in the same format CloudPanel generates. The database field is updated too, so the setting survives when CloudPanel regenerates the vhost and the toggle in the UI shows the right state.
+- **Safety**: the vhost, the previous database value and the database itself are backed up first (`/root/.clp/cf-only-backup/`, the last 3 database copies are kept); if `nginx -t` fails or the database write fails, the vhost is restored. Sites already in the requested state are left alone. Disabled sites are not processed.
+- **Batch confirmation**: before a batch change, the sites to change and to skip are listed and you must type `yes`; `-y` proceeds directly, and non-interactive mode without `-y` is refused.
+- **Warning: `X-Real-IP` bypass**: if `/etc/nginx/nginx.conf` contains `set_real_ip_from 0.0.0.0/0;` (as on every CloudPanel server we checked), anyone who connects directly with an `X-Real-IP: <Cloudflare IP>` header can bypass this setting. clp shows a warning but does not modify `nginx.conf`.
+
+#### ⑨ Varnish Not Caching? (`clp site <domain> -varnish=status|fix`)
+
+The CloudPanel UI may show Varnish as enabled while the site is not cached at all: every request still runs PHP, and a traffic spike can exhaust memory. Use these commands to check and fix it.
+
+Check one site or all sites:
+
+```bash
+sudo clp site example.com -varnish=status
+```
+
+```bash
+sudo clp site -varnish=status
+```
+
+Fix one site (preview first):
+
+```bash
+sudo clp site example.com -varnish=fix -dry-run
+```
+
+```bash
+sudo clp site example.com -varnish=fix
+```
+
+Fix every site that needs it (`-exclude` works like `backup all`):
+
+```bash
+sudo clp site -varnish=fix -all -dry-run
+```
+
+```bash
+sudo clp site -varnish=fix -all -exclude="test.,dev."
+```
+
+**Why caching does not happen**
+
+1. **Varnish only caches pages for which PHP sends `Cache-Control`**: `/home/<user>/.varnish-cache/controller.php` sends those headers and must be loaded through PHP's `auto_prepend_file`. The `Cache-Control: no-store` your browser sees is always added by Varnish and says nothing about caching; ignore it.
+2. **Toggle Varnish in the CloudPanel UI** (or press Save on the Vhost tab): the UI toggle is `enabled` in `/home/<user>/.varnish-cache/settings.json`, and switching it also makes CloudPanel regenerate the vhost and add `auto_prepend_file` to `PHP_VALUE`. The toggle of the "CLP Varnish Cache" WordPress plugin only changes `settings.json` and does not update the vhost. (`site.varnish_cache` in the CloudPanel database is a default set when a WordPress site is created, usually 1; it does not mean the UI toggle is on.)
+3. **When optimizing the Wordfence firewall, choose "Include", not "Override", and enable Varnish before the Wordfence optimization**: Wordfence writes a `.user.ini` that switches to its own `wordfence-waf.php`, which takes precedence over the vhost, so `wordfence-waf.php` must include `controller.php`. If the order was reversed or Override was chosen, run `clp site <domain> -varnish=fix`.
+4. **Changes to `.user.ini` take up to 5 minutes** (PHP's `user_ini.cache_ttl`). `-varnish=fix` never edits `.user.ini`; its changes to the vhost and `wordfence-waf.php` take effect immediately.
+5. **Wordfence warns that `.user.ini` may be publicly readable**: the Nginx security rules of `clp server -harden` already block `.user.ini` (in `/etc/nginx/clp-security.conf`, loaded from `/etc/nginx/global_settings`).
+
+**What `-varnish=fix` does**
+
+- vhost: adds `auto_prepend_file=/home/<user>/.varnish-cache/controller.php;` right after `upload_max_filesize=…;` in the `PHP_VALUE` of the 8080 block, at the same place and in the same form as CloudPanel; restored if `nginx -t` fails.
+- `wordfence-waf.php`: if `.user.ini` points to it and it does not include `controller.php`, adds a block in the same format as Wordfence's "Include" option, checked with `php -l`, keeping the file's owner and permissions.
+- Backups go to `/root/.clp/varnish-backup/<time>/<domain>/`; after the fix, caching is checked again.
+- **Left alone** (only reported): Varnish disabled (the UI toggle is off, i.e. `enabled` is false in `settings.json`), `varnish_cache` is 0 in the database (CloudPanel would drop the line again when it regenerates the vhost; shown separately), `.user.ini` pointing to another file, a vhost that already has another `auto_prepend_file`, and sites where the cause is unknown.
+
+**Checking it yourself**:
+
+```bash
+curl -s -D- -o /dev/null -H "Host: example.com" -H "X-Forwarded-Proto: https" http://127.0.0.1:8080/ | grep -i x-cache-lifetime
+```
+
+If `X-Cache-Lifetime` is present, Varnish will cache the page.
+
+**What to check after the fix**
+
+After the fix, Varnish stores pages and serves the same copy to every visitor for `cacheLifetime` (7 days by default, `604800` seconds) without running PHP. These sites were never cached before, so try a few sites or one server first and check the following before fixing everything.
+
+- **Already excluded from the cache**:
+  - Logged-in users (requests with a `wordpress_logged_in_` cookie always bypass the cache, and `controller.php` also checks `is_user_logged_in()`).
+  - POST requests (the form submission itself).
+  - `excludes` in `settings.json`, by default `/my-account/`, `/cart/`, `/checkout/` and `wp-login.php`.
+- **Things that can break and need a real test**:
+  1. **Form submissions fail**: some form plugins put a time-limited token in the page (for example a WordPress nonce, usually valid for 12–24 hours). If the page is cached for 7 days, visitors get an expired token and see "link expired" or "verification failed". Submit the form while logged out, ideally again the next day.
+  2. **Cart and member information**: after a guest adds something to the cart, the cart cookies (for example WooCommerce's `woocommerce_items_in_cart`) do not make requests bypass the cache, so widgets such as "Cart (N)" on other pages may show a stale state. The cart and checkout pages themselves are excluded.
+  3. **Cookies are removed**: for cacheable responses Varnish strips `Set-Cookie`, so features that rely on cookies (language switchers, first-visit pop-ups, etc.) may stop working.
+  4. **Time-dependent content**: stock levels, "sold out", countdowns, random recommendations and geo-based content may freeze at the moment the page was cached.
+  5. **After editing content**: updating a post or page in WordPress usually makes the CLP Varnish Cache plugin purge the related cache; changes made in other ways (plugin settings, direct database edits) need a manual purge.
+- **How to check**: in a private window (logged out), submit a form, add to cart and browse other pages, register / log in / log out, and switch languages.
+- **If something breaks**:
+  - Add the URL to the exclusion list on the site's Varnish Cache tab in CloudPanel (stored in `excludes` of `settings.json`), for example `/contact/`.
+  - Shorten the cache lifetime on the same tab (for example 1 day) to make expired form tokens less likely.
+  - Purge the cache from the CLP Varnish Cache plugin in WordPress or from CloudPanel.
+
 ---
 
 ### 2. Server Operations & Hardening (`clp server`)
@@ -787,13 +912,37 @@ sudo clp backup <domain|all> [options...]
 
 | Option | Default | Description |
 | :--- | :--- | :--- |
-| `-type={db\|full\|compact}` | `full` | • `db`: Database only (`.sql.gz`)<br>• `compact`: Files without DB (current-year uploads only, excludes caches)<br>• `full`: Complete archive of DB and all site files (`.tar.gz`) |
+| `-type={db\|full\|compact\|archive}` | `full` | • `db`: Database only (`.sql.gz`)<br>• `full`: Complete archive of DB and all site files (`.tar.gz`)<br>• `compact`: Files without DB (current-year uploads only)<br>• `archive`: Past years' uploads (everything in uploads except the current year, plus `wp-content/shield` and `WPvivid_Uploads`); complements `compact` |
 | `-to={local\|<remote>}` | `local` | • `local`: Local server storage (`/root/clpBackup`)<br>• `<remote>`: Remote target defined in rclone config (`google`, `b2`, `r2`) |
 | `-path=<path>` | By destination | Custom local or remote folder path |
 | `-expire=<Nd>` | None | Automatically remove expired backups of the same type (`-expire=7d`, `-expire=30d`) |
 | `-exclude=<pattern>` | None | Exclude specific sites (for `backup all`, comma-separated) |
+| `-skip-disabled` | None | With `backup all`: skip disabled sites (`clp site <domain> -off`, vhost not in `sites-enabled`). By default disabled sites are backed up too; a single named site is always backed up |
 
-#### ② Usage Examples
+#### ② What Each Type Contains
+
+No backup type includes the following folders (caches and other backup plugins' local backups), and a restore never deletes them:
+
+- `wp-content/cache`
+- UpdraftPlus `wp-content/updraft`, WPvivid `wp-content/wpvividbackups`, All-in-One WP Migration `wp-content/ai1wm-backups`
+- Duplicator `wp-content/backups-dup-lite`, `wp-content/backups-dup-pro`, `wp-snapshots`
+- Backup Migration `wp-content/backup-migration*`, BackUpWordPress `wp-content/backupwordpress-*-backups`
+- BackWPup `wp-content/uploads/backwpup-*`, Solid Backups (BackupBuddy) `wp-content/uploads/backupbuddy_backups`, `backupbuddy_temp`, WP Staging `wp-content/uploads/wp-staging/backups`
+
+| Type | Database | Site files | `wp-content/uploads` | `shield`, `WPvivid_Uploads` |
+| :--- | :---: | :---: | :--- | :---: |
+| `full` | ✅ | ✅ | Everything | ✅ |
+| `compact` | — | ✅ | Only the current-year folder (`uploads/<year>/`) and hidden files at the uploads root | — |
+| `archive` | — | — | Everything except the current year (past years, non-year folders such as `elementor/`, regular files at the uploads root) | ✅ |
+| `db` | ✅ | — | — | — |
+
+**`full` vs. `compact` + `db` + `archive`**:
+
+- **Same file coverage**: together the three cover the same files as `full`.
+- **Different points in time**: `full` is packed at a single moment, while the three files are created separately (for example `db` and `compact` daily, `archive` monthly). After a restore, past years' uploads may be older than the site files and database by up to one schedule interval.
+- **In short**: use `full` when you need the complete site at a single point in time; `compact` + `db` + `archive` is the space-saving everyday combination.
+
+#### ③ Usage Examples
 
 Backup single site database locally:
 
@@ -817,6 +966,12 @@ Compact backup synced to Google Drive via rclone:
 
 ```bash
 sudo clp backup example.com -type=compact -to=google
+```
+
+Past years' uploads to Google Drive with 35-day retention:
+
+```bash
+sudo clp backup example.com -type=archive -to=google -expire=35d
 ```
 
 Batch backup all sites to Backblaze B2, excluding staging sites, 14-day retention:
@@ -843,7 +998,7 @@ Restore from Google Drive cloud backups list:
 sudo clp restore example.com -to=google
 ```
 
-The system will list all available snapshots. Select a number and confirm with `yes` to execute database restoration, file extraction, PHP-FPM reload, and WordPress cache flushing.
+The system will list all available snapshots. Select a number and confirm with `yes` to execute database restoration, file extraction, PHP-FPM reload, and WordPress cache flushing. Use `-type={db|full|compact|archive}` to list only one type.
 
 #### ② Exact Command Line Restore
 
@@ -858,6 +1013,55 @@ Specify remote backup file and force restore without prompt:
 ```bash
 sudo clp restore example.com -file=example.com-full-20261005_153000.tar.gz -to=b2 --force
 ```
+
+#### ③ Restored Files Match the Backup (Extra Files Are Deleted)
+
+By default, a file restore deletes files on the site that are not in the backup (rsync `--delete`), such as injected malware or removed plugins, so the result matches the site at backup time.
+
+- **Each type only touches its own scope**:
+  - `full`: the whole site directory.
+  - `compact`: `uploads/<year>/` of the backup year and the rest of the site files; other years and non-year folders in uploads, `shield` and `WPvivid_Uploads` are left alone.
+  - `archive`: only `wp-content/uploads` (except the backup year's folder), plus `shield` and `WPvivid_Uploads` if they are in the backup; other site files are left alone.
+  - `db`: imports the database only; no files are touched.
+- **The year comes from the backup**: it is read from the timestamp in the file name, not the date of the restore.
+- **Always protected**: the current `wp-config.php` (the backup's copy is saved in the snapshot folder) and the cache and backup-plugin folders listed above.
+- **Confirmation**: in interactive mode, the number of items to be deleted and the first 20 are shown, and you must type `yes` to continue; with `-y` or `--force` it proceeds directly.
+- **Previous behavior**: add `-keep-extra` to overwrite without deleting.
+- **Recoverable**: a snapshot is taken before every restore (`/root/clpBackup/rollback/`) and covers every file that can be deleted; a failed restore is rolled back automatically.
+
+#### ④ Pre-Restore Snapshot
+
+- **Disk space check first**: before the snapshot, the size of the site directory (without the cache and backup-plugin folders above) plus the database, with a 10% margin, is compared with the free space of `/root/clpBackup`.
+- **Not enough space or snapshot failure**: the incomplete snapshot is removed and nothing has been changed yet. In interactive mode you are asked whether to continue without a snapshot (type `yes`); with `-y` or `--force` the restore is aborted.
+- **Skipping the snapshot**: add `-no-snapshot` to restore without a snapshot. A failed restore then cannot be rolled back automatically; use it at your own risk.
+
+```bash
+sudo clp restore example.com -type=compact -no-snapshot
+```
+
+Keep extra files on the site:
+
+```bash
+sudo clp restore example.com -type=compact -keep-extra
+```
+
+#### ⑤ Restoring a Complete Site from compact + db + archive
+
+`restore` handles one file at a time. Each type only touches its own scope, so restoring the three files one after another rebuilds the complete site. Recommended order: `db` → `compact` → `archive`:
+
+```bash
+sudo clp restore example.com -type=db -to=google
+```
+
+```bash
+sudo clp restore example.com -type=compact -to=google
+```
+
+```bash
+sudo clp restore example.com -type=archive -to=google
+```
+
+Note: every restore takes a full site snapshot first, so three restores create three snapshots. Make sure `/root/clpBackup` has enough free space.
 
 ---
 
@@ -1064,15 +1268,18 @@ Automate recurring maintenance tasks via `sudo crontab -e` (Note: CLI log messag
 # 2. Daily 03:30 - Compact file backup of all sites to Google Drive (7-day retention)
 30 3 * * * /usr/local/bin/clp backup all -type=compact -to=google -expire=7d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-compact.log 2>&1
 
-# 3. Monthly 1st 04:00 - Full backup to Google Drive (keeps the latest 2)
-0 4 1 * * /usr/local/bin/clp backup all -type=full -to=google -expire=35d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-full.log 2>&1
+# 3. Monthly 1st 04:00 - Past years' uploads (archive) to Google Drive (keeps the latest 2; together with 1 and 2 this is the complete site)
+0 4 1 * * /usr/local/bin/clp backup all -type=archive -to=google -expire=35d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-archive.log 2>&1
 
-# 4. Weekly Sunday 05:00 - Server cleanup (journal logs, APT packages, temp files)
+# 4. (Optional) Monthly 2nd 04:00 - Full backup to Google Drive (the complete site at a single point in time, keeps the latest 2)
+0 4 2 * * /usr/local/bin/clp backup all -type=full -to=google -expire=35d -exclude="test.,dev.,staging." >> /var/log/clp/cron-backup-full.log 2>&1
+
+# 5. Weekly Sunday 05:00 - Server cleanup (journal logs, APT packages, temp files)
 0 5 * * 0 /usr/local/bin/clp server -clean >> /var/log/clp/cron-clean.log 2>&1
 ```
 
 > [!NOTE]
-> Old backups are removed only after the new backup has been uploaded successfully. A 35-day retention for the monthly backup keeps both this month's and last month's copies after every run. Files deleted from Google Drive go to the trash by default and still use space until the trash is emptied; if space is tight, add `use_trash = false` to the rclone Google Drive remote.
+> Old backups are removed only after the new backup has been uploaded successfully. A 35-day retention for the monthly backups (3 and 4) keeps both this month's and last month's copies after every run. Files deleted from Google Drive go to the trash by default and still use space until the trash is emptied; if space is tight, add `use_trash = false` to the rclone Google Drive remote.
 
 ---
 
