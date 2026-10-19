@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.0.0 (build 2026-10-17 21:30:03)`
+Output example:`CLP Helper v1.0.0 (build 2026-10-18 14:11:27)`
 
 Display global help menu:
 
@@ -179,7 +179,7 @@ sudo clp <module> [target_domain] [options...]
 | **`backup`** | Site & Database Backup | `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
 | **`restore`** | Site & Database Restore | `[-file=<name>]`, `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}` |
 | **`httpauth`** | HTTP Authentication & Whitelisting | `-add`, `-delete`, `-list`, `-wp-admin`, `-path`, `-whitelist` |
-| **`php-pm`** | PHP-FPM Pool Optimization | `<domain>`, `all` |
+| **`php-pm`** | PHP-FPM Pool Optimization | `<domain>`, `all`, `-max-children=`, `-idle-timeout=`, `-max-requests=` |
 | **`config`** | Global Preferences & Credentials | `-set <key>=<val>`, `-get <key>`, `-list`, `-unset <key>` |
 
 ### Global Options
@@ -1180,6 +1180,47 @@ sudo clp php-pm all
 - Automatic timestamped backup saved to `/root/php/` prior to any change.
 - Syntax testing via `php-fpm<version> -t` with instant automatic rollback upon syntax errors.
 
+#### Custom Pool Values
+
+All three values can be passed when tuning one site or `all`, or stored as defaults with `clp config`. Each run shows where every value came from.
+
+| Setting | Command option | `clp config` key | Default | Format |
+| :--- | :--- | :--- | :--- | :--- |
+| `pm.max_children` | `-max-children=N` | `php-max-children` | `35` | 1–999999 |
+| `pm.process_idle_timeout` | `-idle-timeout=T` | `php-idle-timeout` | `30s` | number, optionally with `s`/`m`/`h`/`d`, e.g. `60s`, `5m` |
+| `pm.max_requests` | `-max-requests=N` | `php-max-requests` | `300` | 0–999999999 (`0` = never recycle workers) |
+
+**Priority**: command option > environment variable (`PHP_FPM_MAX_CHILDREN`, `PHP_FPM_IDLE_TIMEOUT`, `PHP_FPM_MAX_REQUESTS`) > `clp config` > default. When only some options are given, the others still follow this order.
+
+Use specific values for one site this time:
+
+```bash
+sudo clp php-pm example.com -max-children=80 -max-requests=500
+```
+
+Use specific values for all sites this time:
+
+```bash
+sudo clp php-pm all -max-children=50 -idle-timeout=60s
+```
+
+Store defaults (used by later `clp php-pm` runs and by the automatic tuning after creating or restoring a site):
+
+```bash
+sudo clp config -set php-max-children=50
+```
+
+```bash
+sudo clp config -set php-idle-timeout=60s
+```
+
+```bash
+sudo clp config -set php-max-requests=500
+```
+
+> [!NOTE]
+> Command options only apply to that run. A later `clp php-pm all` without options goes back to the `clp config` or default values; to keep different values for one site, pass the options for that site each time.
+
 ---
 
 ### 7. Global Configuration Management (`clp config`)
@@ -1192,6 +1233,9 @@ CLP Helper provides a dedicated configuration management module (`clp config`) t
 | :--- | :--- | :--- |
 | `lang` | Default CLI interface language | `en_US`, `zh_TW` |
 | `cf-token` | Cloudflare API Token for edge WAF & SSL DNS-01 automation | Token string or credentials file path (e.g. `/root/.secrets/example.ini`) |
+| `php-max-children` | Default `pm.max_children` for `clp php-pm` | 1–999999, default `35` |
+| `php-idle-timeout` | Default `pm.process_idle_timeout` for `clp php-pm` | e.g. `30s`, `5m`, default `30s` |
+| `php-max-requests` | Default `pm.max_requests` for `clp php-pm` | 0–999999999, default `300` |
 
 #### Available Commands & Examples
 

@@ -907,7 +907,7 @@ reject_extra_positionals() {
     done
 
     # 若緊接在需要帶值的選項後面（例如 -cf-waf off、-delete user、-file backup.sql.gz、-expire 30d、-ufw off）
-    if [[ -n "$prev_opt" && "$prev_opt" =~ ^(delete|del|add|path|whitelist|list|user|username|pass|password|cf-waf|cf_waf|file|expire|to|type|ufw|allow|deny|icmp|unban|install|ssl|clone-from|clone_from|migrate|from|timezone|dns|smtp|exclude|port)$ ]]; then
+    if [[ -n "$prev_opt" && "$prev_opt" =~ ^(delete|del|add|path|whitelist|list|user|username|pass|password|cf-waf|cf_waf|file|expire|to|type|ufw|allow|deny|icmp|unban|install|ssl|clone-from|clone_from|migrate|from|timezone|dns|smtp|exclude|port|max-children|idle-timeout|max-requests)$ ]]; then
       log_info "$(_t "CORE_HINT_OPT_VALUE_FORMAT" "$prev_opt" "$extra")"
     elif [[ -n "$_known_flags" && "$extra_lower" =~ ^(${_known_flags})$ ]]; then
       log_info "$(_t "CORE_HINT_DID_YOU_MEAN_OPT" "$extra_lower")"

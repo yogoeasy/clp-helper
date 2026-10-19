@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-17 21:30:03)`
+輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-18 14:11:27)`
 
 查看全域功能說明選單：
 
@@ -187,7 +187,7 @@ sudo clp <module> [target_domain] [options...]
 | **`backup`** | 網站與資料庫備份 | `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
 | **`restore`** | 備份還原作業 | `[-file=<name>]`, `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}` |
 | **`httpauth`** | HTTP 認證與存取防護 | `-add`, `-delete`, `-list`, `-wp-admin`, `-path`, `-whitelist` |
-| **`php-pm`** | PHP-FPM 行程池調校 | `<domain>`, `all` |
+| **`php-pm`** | PHP-FPM 行程池調校 | `<domain>`, `all`, `-max-children=`, `-idle-timeout=`, `-max-requests=` |
 | **`config`** | 全域偏好設定與金鑰管理 | `-set <key>=<val>`, `-get <key>`, `-list`, `-unset <key>` |
 
 ### 全域共用選項 (Global Options)
@@ -1188,6 +1188,47 @@ sudo clp php-pm all
 - 調校前自動在 `/root/php/` 留下帶有時間戳記之設定檔備份。
 - 調校後自動以 `php-fpm<version> -t` 檢查語法，檢查失敗時立即還原。
 
+#### 自訂調校參數
+
+三個參數都可以在單站或 `all` 執行時帶入，也可以用 `clp config` 存成預設值。執行時會顯示每個值實際使用的來源。
+
+| 參數 | 指令參數 | `clp config` 設定鍵 | 預設值 | 格式 |
+| :--- | :--- | :--- | :--- | :--- |
+| `pm.max_children` | `-max-children=N` | `php-max-children` | `35` | 1～999999 |
+| `pm.process_idle_timeout` | `-idle-timeout=T` | `php-idle-timeout` | `30s` | 數字，可加 `s`／`m`／`h`／`d`，例如 `60s`、`5m` |
+| `pm.max_requests` | `-max-requests=N` | `php-max-requests` | `300` | 0～999999999（`0` 表示不回收行程） |
+
+**優先順序**：指令參數 > 環境變數（`PHP_FPM_MAX_CHILDREN`、`PHP_FPM_IDLE_TIMEOUT`、`PHP_FPM_MAX_REQUESTS`）> `clp config` > 預設值。只帶部分參數時，其餘參數仍依此順序決定。
+
+這次指定單一網站的值：
+
+```bash
+sudo clp php-pm example.com -max-children=80 -max-requests=500
+```
+
+這次全部網站都使用指定的值：
+
+```bash
+sudo clp php-pm all -max-children=50 -idle-timeout=60s
+```
+
+存成預設值（之後 `clp php-pm`、新建網站、還原等自動調校都會使用）：
+
+```bash
+sudo clp config -set php-max-children=50
+```
+
+```bash
+sudo clp config -set php-idle-timeout=60s
+```
+
+```bash
+sudo clp config -set php-max-requests=500
+```
+
+> [!NOTE]
+> 指令參數只套用在這一次執行。之後再執行 `clp php-pm all`（未帶參數）時，會改回 `clp config` 或預設值；個別網站要固定不同的值，需要每次對該網站帶入參數。
+
 ---
 
 ### 7. 全域設定管理模組 (`clp config`)
@@ -1200,6 +1241,9 @@ CLP Helper 提供專屬的全域設定管理模組 (`clp config`)，把偏好設
 | :--- | :--- | :--- |
 | `lang` | CLP Helper 預設命令列介面語言 | `en_US`, `zh_TW` |
 | `cf-token` | Cloudflare API 權杖 (用於邊緣 WAF 與 SSL DNS-01 自動化) | Token 字串或憑證檔路徑 (如 `/root/.secrets/example.ini`) |
+| `php-max-children` | `clp php-pm` 的 `pm.max_children` 預設值 | 1～999999，預設 `35` |
+| `php-idle-timeout` | `clp php-pm` 的 `pm.process_idle_timeout` 預設值 | 例如 `30s`、`5m`，預設 `30s` |
+| `php-max-requests` | `clp php-pm` 的 `pm.max_requests` 預設值 | 0～999999999，預設 `300` |
 
 #### 指令語法與範例
 

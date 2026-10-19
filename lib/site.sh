@@ -4089,10 +4089,14 @@ varnish_fix_site() {
     fi
   fi
 
-  # 3. 重新檢查實際結果（nginx reload 為非同步，稍候再測）
-  sleep 2
-  local after
-  after=$(varnish_py probe "$domain" 2>/dev/null || echo error)
+  # 3. 重新檢查實際結果（nginx reload 為非同步；opcache.revalidate_freq 也可能讓
+  #    剛改的 wordfence-waf.php 晚幾秒才生效，所以最多重試 5 次、每次間隔 2 秒）
+  local after="" i
+  for i in 1 2 3 4 5; do
+    sleep 2
+    after=$(varnish_py probe "$domain" 2>/dev/null || echo error)
+    [[ "$after" == "yes" ]] && break
+  done
   if [[ "$after" == "yes" ]]; then
     log_success "$(_t "SITE_VARNISH_OK_CACHED" "$domain")"
     VF_RESULT="fixed"; return 0

@@ -16,11 +16,78 @@ PHP_BACKUP_DIR="/root/php"
 declare -gA PHP_FPM_RELOAD_VERSIONS=()
 
 # ==============================================================================
-# PHP-FPM Pool 調校參數設定 (若需修改 pool 預設參數，請調整此處)
+# PHP-FPM Pool 調校參數
+#   優先順序：指令參數 (-max-children= / -idle-timeout= / -max-requests=)
+#             > 環境變數 (PHP_FPM_MAX_CHILDREN 等) > clp config (php-max-children 等) > 預設值
 # ==============================================================================
-PHP_FPM_MAX_CHILDREN="${PHP_FPM_MAX_CHILDREN:-35}"
-PHP_FPM_IDLE_TIMEOUT="${PHP_FPM_IDLE_TIMEOUT:-30s}"
-PHP_FPM_MAX_REQUESTS="${PHP_FPM_MAX_REQUESTS:-300}"
+PHP_FPM_DEFAULT_MAX_CHILDREN="35"
+PHP_FPM_DEFAULT_IDLE_TIMEOUT="30s"
+PHP_FPM_DEFAULT_MAX_REQUESTS="300"
+# 載入時保存環境變數覆寫值（之後每次調校前由 php_fpm_resolve_settings 重新決定實際使用的值）
+PHP_FPM_ENV_MAX_CHILDREN="${PHP_FPM_MAX_CHILDREN:-}"
+PHP_FPM_ENV_IDLE_TIMEOUT="${PHP_FPM_IDLE_TIMEOUT:-}"
+PHP_FPM_ENV_MAX_REQUESTS="${PHP_FPM_MAX_REQUESTS:-}"
+PHP_FPM_MAX_CHILDREN="$PHP_FPM_DEFAULT_MAX_CHILDREN"
+PHP_FPM_IDLE_TIMEOUT="$PHP_FPM_DEFAULT_IDLE_TIMEOUT"
+PHP_FPM_MAX_REQUESTS="$PHP_FPM_DEFAULT_MAX_REQUESTS"
+PHP_FPM_SETTINGS_SOURCE=""
+
+if ! command -v get_config_value >/dev/null 2>&1 && [[ -f "${CLP_ROOT_DIR}/lib/config.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "${CLP_ROOT_DIR}/lib/config.sh"
+fi
+
+# _php_fpm_pick <cli_value> <env_value> <config_key> <default>：輸出 "<value>\t<source>"
+_php_fpm_pick() {
+  local cli="$1" env="$2" key="$3" def="$4" conf=""
+  if [[ -n "$cli" && "$cli" != "true" ]]; then
+    printf '%s\tcli\n' "$cli"; return 0
+  fi
+  if [[ -n "$env" ]]; then
+    printf '%s\tenv\n' "$env"; return 0
+  fi
+  if command -v get_config_value >/dev/null 2>&1; then
+    conf=$(get_config_value "$key" "")
+  fi
+  if [[ -n "$conf" ]]; then
+    printf '%s\tconfig\n' "$conf"; return 0
+  fi
+  printf '%s\tdefault\n' "$def"
+}
+
+_php_fpm_src_label() {
+  case "$1" in
+    cli) _t "PHP_FPM_SRC_CLI" ;;
+    env) _t "PHP_FPM_SRC_ENV" ;;
+    config) _t "PHP_FPM_SRC_CONFIG" ;;
+    *) _t "PHP_FPM_SRC_DEFAULT" ;;
+  esac
+}
+
+# php_fpm_resolve_settings：決定 PHP_FPM_MAX_CHILDREN / IDLE_TIMEOUT / MAX_REQUESTS 與各自的來源
+php_fpm_resolve_settings() {
+  local line v1 s1 v2 s2 v3 s3
+  line=$(_php_fpm_pick "$(opt_get "max-children" "$(opt_get "max_children" "")")" "$PHP_FPM_ENV_MAX_CHILDREN" "PHP_FPM_MAX_CHILDREN" "$PHP_FPM_DEFAULT_MAX_CHILDREN")
+  IFS=$'\t' read -r v1 s1 <<< "$line"
+  line=$(_php_fpm_pick "$(opt_get "idle-timeout" "$(opt_get "idle_timeout" "")")" "$PHP_FPM_ENV_IDLE_TIMEOUT" "PHP_FPM_IDLE_TIMEOUT" "$PHP_FPM_DEFAULT_IDLE_TIMEOUT")
+  IFS=$'\t' read -r v2 s2 <<< "$line"
+  line=$(_php_fpm_pick "$(opt_get "max-requests" "$(opt_get "max_requests" "")")" "$PHP_FPM_ENV_MAX_REQUESTS" "PHP_FPM_MAX_REQUESTS" "$PHP_FPM_DEFAULT_MAX_REQUESTS")
+  IFS=$'\t' read -r v3 s3 <<< "$line"
+  PHP_FPM_MAX_CHILDREN="$v1"
+  PHP_FPM_IDLE_TIMEOUT="$v2"
+  PHP_FPM_MAX_REQUESTS="$v3"
+  PHP_FPM_SETTINGS_SOURCE="pm.max_children=${v1} ($(_php_fpm_src_label "$s1")), pm.process_idle_timeout=${v2} ($(_php_fpm_src_label "$s2")), pm.max_requests=${v3} ($(_php_fpm_src_label "$s3"))"
+}
+
+# php_fpm_validate_value <max_children|idle_timeout|max_requests> <value>：clp config -set 與調校前共用的檢查
+php_fpm_validate_value() {
+  case "$1" in
+    max_children) [[ "$2" =~ ^[1-9][0-9]{0,5}$ ]] ;;
+    max_requests) [[ "$2" =~ ^(0|[1-9][0-9]{0,8})$ ]] ;;   # 0 = 不回收行程
+    idle_timeout) [[ "$2" =~ ^[1-9][0-9]{0,5}[smhd]?$ ]] ;;
+    *) return 1 ;;
+  esac
+}
 
 init_php_backup_dir() {
   if [[ ! -d "$PHP_BACKUP_DIR" ]]; then
@@ -67,8 +134,11 @@ optimize_site_php_fpm() {
     return 1
   fi
 
-  # 參數值驗證（環境變數覆寫值會直接寫入 pool 設定）
-  if [[ ! "$PHP_FPM_MAX_CHILDREN" =~ ^[0-9]+$ || ! "$PHP_FPM_MAX_REQUESTS" =~ ^[0-9]+$ || ! "$PHP_FPM_IDLE_TIMEOUT" =~ ^[0-9]+[smhd]?$ ]]; then
+  # 參數值驗證（指令參數、環境變數、clp config 的值都會直接寫入 pool 設定）
+  php_fpm_resolve_settings
+  if ! php_fpm_validate_value max_children "$PHP_FPM_MAX_CHILDREN" || \
+     ! php_fpm_validate_value max_requests "$PHP_FPM_MAX_REQUESTS" || \
+     ! php_fpm_validate_value idle_timeout "$PHP_FPM_IDLE_TIMEOUT"; then
     log_error "$(_t "PHP_FPM_ERR_INVALID_SETTINGS" "$PHP_FPM_MAX_CHILDREN" "$PHP_FPM_IDLE_TIMEOUT" "$PHP_FPM_MAX_REQUESTS")"
     return 1
   fi
@@ -283,7 +353,10 @@ php_fpm_handler() {
     return 1
   fi
 
-  reject_extra_positionals raw_args "y|yes" "$domain" || return 1
+  reject_extra_positionals raw_args "y|yes|max-children|idle-timeout|max-requests" "$domain" || return 1
+
+  php_fpm_resolve_settings
+  log_info "$(_t "PHP_FPM_INFO_SETTINGS" "$PHP_FPM_SETTINGS_SOURCE")"
 
   if [[ "$domain" != "all" ]]; then
     require_site_exists "$domain" "$(_t "PHP_FPM_STEP_OPTIMIZE_SINGLE" "$domain")" || return 1

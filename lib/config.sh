@@ -139,6 +139,15 @@ canonical_config_key() {
     cf-min-tls|cf_min_tls|CF_MIN_TLS)
       echo "CF_MIN_TLS"
       ;;
+    php-max-children|php_max_children|PHP_FPM_MAX_CHILDREN)
+      echo "PHP_FPM_MAX_CHILDREN"
+      ;;
+    php-idle-timeout|php_idle_timeout|PHP_FPM_IDLE_TIMEOUT)
+      echo "PHP_FPM_IDLE_TIMEOUT"
+      ;;
+    php-max-requests|php_max_requests|PHP_FPM_MAX_REQUESTS)
+      echo "PHP_FPM_MAX_REQUESTS"
+      ;;
     *)
       echo "$k"
       ;;
@@ -189,6 +198,15 @@ display_config_key() {
       ;;
     CF_MIN_TLS)
       echo "cf-min-tls"
+      ;;
+    PHP_FPM_MAX_CHILDREN)
+      echo "php-max-children"
+      ;;
+    PHP_FPM_IDLE_TIMEOUT)
+      echo "php-idle-timeout"
+      ;;
+    PHP_FPM_MAX_REQUESTS)
+      echo "php-max-requests"
       ;;
     *)
       echo "$k"
@@ -249,6 +267,9 @@ show_config_help() {
   echo "  sudo clp config -set lang=en_US"
   echo "  sudo clp config -set cf-token=\"your_cloudflare_api_token\""
   echo "  sudo clp config -set cf-token=/root/.secrets/example.ini"
+  echo "  sudo clp config -set php-max-children=50"
+  echo "  sudo clp config -set php-idle-timeout=60s"
+  echo "  sudo clp config -set php-max-requests=500"
   echo "  sudo clp config -get lang"
   echo "  sudo clp config -get cf-token"
   echo "  sudo clp config -list"
@@ -382,6 +403,19 @@ config_handler() {
           return 1
         fi
         target_val="$norm_l"
+      elif [[ "$canon_key" =~ ^PHP_FPM_(MAX_CHILDREN|IDLE_TIMEOUT|MAX_REQUESTS)$ ]]; then
+        # 與 clp php-pm 調校前的檢查相同（php_fpm.sh 的 php_fpm_validate_value）
+        local php_ok=1 php_kind
+        php_kind=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
+        case "$php_kind" in
+          max_children) [[ "$target_val" =~ ^[1-9][0-9]{0,5}$ ]] || php_ok=0 ;;
+          max_requests) [[ "$target_val" =~ ^(0|[1-9][0-9]{0,8})$ ]] || php_ok=0 ;;
+          idle_timeout) [[ "$target_val" =~ ^[1-9][0-9]{0,5}[smhd]?$ ]] || php_ok=0 ;;
+        esac
+        if [[ "$php_ok" -eq 0 ]]; then
+          log_error "$(_t "CONFIG_ERR_INVALID_PHP_FPM" "$target_key" "$target_val")"
+          return 1
+        fi
       elif [[ "$canon_key" == "CF_API_TOKEN" ]]; then
         # Check if target_val is a file path or filename
         local is_path_like=false
