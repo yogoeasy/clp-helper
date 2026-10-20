@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-18 14:11:27)`
+輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-19 17:43:35)`
 
 查看全域功能說明選單：
 
@@ -187,7 +187,7 @@ sudo clp <module> [target_domain] [options...]
 | **`backup`** | 網站與資料庫備份 | `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
 | **`restore`** | 備份還原作業 | `[-file=<name>]`, `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}` |
 | **`httpauth`** | HTTP 認證與存取防護 | `-add`, `-delete`, `-list`, `-wp-admin`, `-path`, `-whitelist` |
-| **`php-pm`** | PHP-FPM 行程池調校 | `<domain>`, `all`, `-max-children=`, `-idle-timeout=`, `-max-requests=` |
+| **`php-pm`** | PHP-FPM 行程池調校 | `<domain>`, `-all`, `-status`, `-fix`, `-max-children=`, `-idle-timeout=`, `-max-requests=` |
 | **`config`** | 全域偏好設定與金鑰管理 | `-set <key>=<val>`, `-get <key>`, `-list`, `-unset <key>` |
 
 ### 全域共用選項 (Global Options)
@@ -1182,15 +1182,17 @@ sudo clp php-pm example.com
 批次調校全機所有網站：
 
 ```bash
-sudo clp php-pm all
+sudo clp php-pm -all
 ```
+
+舊寫法 `sudo clp php-pm all` 仍可使用。
 
 - 調校前自動在 `/root/php/` 留下帶有時間戳記之設定檔備份。
 - 調校後自動以 `php-fpm<version> -t` 檢查語法，檢查失敗時立即還原。
 
 #### 自訂調校參數
 
-三個參數都可以在單站或 `all` 執行時帶入，也可以用 `clp config` 存成預設值。執行時會顯示每個值實際使用的來源。
+三個參數都可以在單站或 `-all` 執行時帶入，也可以用 `clp config` 存成預設值。執行時會顯示每個值實際使用的來源。
 
 | 參數 | 指令參數 | `clp config` 設定鍵 | 預設值 | 格式 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -1209,7 +1211,7 @@ sudo clp php-pm example.com -max-children=80 -max-requests=500
 這次全部網站都使用指定的值：
 
 ```bash
-sudo clp php-pm all -max-children=50 -idle-timeout=60s
+sudo clp php-pm -all -max-children=50 -idle-timeout=60s
 ```
 
 存成預設值（之後 `clp php-pm`、新建網站、還原等自動調校都會使用）：
@@ -1227,7 +1229,57 @@ sudo clp config -set php-max-requests=500
 ```
 
 > [!NOTE]
-> 指令參數只套用在這一次執行。之後再執行 `clp php-pm all`（未帶參數）時，會改回 `clp config` 或預設值；個別網站要固定不同的值，需要每次對該網站帶入參數。
+> 指令參數只套用在這一次執行。之後再執行 `clp php-pm -all`（未帶參數）時，會改回 `clp config` 或預設值；個別網站要固定不同的值，需要每次對該網站帶入參數。
+
+#### 依用量建議數值（`-status`／`-fix`）
+
+`-status` 顯示每個 pool 實際的忙碌程度，並建議 `pm.max_children` 的值；`-fix` 套用建議值。只會修改 `pm = ondemand` 的 pool 的 `pm.max_children`，`pm.process_idle_timeout` 與 `pm.max_requests` 維持不變。
+
+查看全部網站或單一網站的用量與建議值：
+
+```bash
+sudo clp php-pm -status
+```
+
+```bash
+sudo clp php-pm example.com -status
+```
+
+單一網站套用建議值（可先用 `-dry-run` 預覽）：
+
+```bash
+sudo clp php-pm example.com -fix -dry-run
+```
+
+```bash
+sudo clp php-pm example.com -fix
+```
+
+全部網站（`-exclude=` 排除網站，`-y` 略過確認）：
+
+```bash
+sudo clp php-pm -fix -all -dry-run
+```
+
+```bash
+sudo clp php-pm -fix -all -exclude="test.,dev."
+```
+
+數字的來源：
+
+- **peak**：PHP-FPM 啟動以來，同時執行的最多 worker 數（pool status 頁面的 `max active processes`）；**days** 是這段統計的天數。
+- **reached**：碰到 `pm.max_children` 上限的次數，來自 status 頁面與近 7 天的 PHP-FPM log。
+- **記憶體上限**：總記憶體扣除 MySQL／MariaDB、Varnish（`malloc` 大小）、Redis 與保留的 512MB 後，除以每個 PHP worker 的記憶體（取忙碌中的 worker 實測，樣本太少時以 100MB 計算）。
+
+建議值的算法：
+
+1. peak × 1.5，無條件進位到 5 的倍數，最少 10；曾經滿載時改用目前的值 × 1.5。
+2. 記憶體上限會壓低預留的空間，但不會低於實際出現過的 peak；這類網站會標示「（記憶體偏緊）」。
+3. 結論：**需要調高**（曾經滿載，或目前的值低於 peak × 1.2）、**可調低**（超過建議值的 2 倍，或超過記憶體上限），其餘為**正常**。
+4. PHP-FPM 啟動未滿 3 天時，統計時間太短，會標示出來，`-fix` 也會略過。
+
+> [!NOTE]
+> PHP-FPM 重載或重新啟動（包含 `-fix` 本身）會讓 status 頁面的統計重新計算，請至少 3 天後再用 `-status` 檢查。之後若再用固定值執行 `clp php-pm -all`，會覆蓋建議值。
 
 ---
 

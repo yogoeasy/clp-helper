@@ -7,8 +7,8 @@
 set -euo pipefail
 
 CLP_VERSION="1.0.0"
-CLP_BUILD_DATE="2026-10-18"
-CLP_BUILD_TIME="2026-10-18 14:11:27"
+CLP_BUILD_DATE="2026-10-19"
+CLP_BUILD_TIME="2026-10-19 17:43:35"
 CLP_TIMESTAMP="${CLP_BUILD_TIME}"
 export CLP_VERSION CLP_BUILD_DATE CLP_BUILD_TIME CLP_TIMESTAMP
 # 解析軟連結，取得腳本真實所在目錄
@@ -103,7 +103,9 @@ show_help() {
   echo ""
   echo -e "  ${C_GREEN}php-pm${C_NC}     $(_t "HELP_DESC_PHP_PM")"
   echo -e "               <domain>      $(_t "HELP_OPT_PHP_PM_DOMAIN")"
-  echo -e "               all           $(_t "HELP_OPT_PHP_PM_ALL")"
+  echo -e "               -all          $(_t "HELP_OPT_PHP_PM_ALL")"
+  echo -e "               -status       $(_t "HELP_OPT_PHP_PM_STATUS")"
+  echo -e "               -fix          $(_t "HELP_OPT_PHP_PM_FIX")"
   echo ""
   echo -e "  ${C_GREEN}server${C_NC}     $(_t "HELP_DESC_SERVER")"
   echo -e "               $(_t "HELP_OPT_SERVER_NONE_LABEL")      $(_t "HELP_OPT_SERVER_NONE")"

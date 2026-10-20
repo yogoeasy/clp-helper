@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.0.0 (build 2026-10-18 14:11:27)`
+Output example:`CLP Helper v1.0.0 (build 2026-10-19 17:43:35)`
 
 Display global help menu:
 
@@ -179,7 +179,7 @@ sudo clp <module> [target_domain] [options...]
 | **`backup`** | Site & Database Backup | `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
 | **`restore`** | Site & Database Restore | `[-file=<name>]`, `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}` |
 | **`httpauth`** | HTTP Authentication & Whitelisting | `-add`, `-delete`, `-list`, `-wp-admin`, `-path`, `-whitelist` |
-| **`php-pm`** | PHP-FPM Pool Optimization | `<domain>`, `all`, `-max-children=`, `-idle-timeout=`, `-max-requests=` |
+| **`php-pm`** | PHP-FPM Pool Optimization | `<domain>`, `-all`, `-status`, `-fix`, `-max-children=`, `-idle-timeout=`, `-max-requests=` |
 | **`config`** | Global Preferences & Credentials | `-set <key>=<val>`, `-get <key>`, `-list`, `-unset <key>` |
 
 ### Global Options
@@ -1174,15 +1174,17 @@ sudo clp php-pm example.com
 Optimize all sites on the server in batch:
 
 ```bash
-sudo clp php-pm all
+sudo clp php-pm -all
 ```
+
+The older form `sudo clp php-pm all` still works.
 
 - Automatic timestamped backup saved to `/root/php/` prior to any change.
 - Syntax testing via `php-fpm<version> -t` with instant automatic rollback upon syntax errors.
 
 #### Custom Pool Values
 
-All three values can be passed when tuning one site or `all`, or stored as defaults with `clp config`. Each run shows where every value came from.
+All three values can be passed when tuning one site or `-all`, or stored as defaults with `clp config`. Each run shows where every value came from.
 
 | Setting | Command option | `clp config` key | Default | Format |
 | :--- | :--- | :--- | :--- | :--- |
@@ -1201,7 +1203,7 @@ sudo clp php-pm example.com -max-children=80 -max-requests=500
 Use specific values for all sites this time:
 
 ```bash
-sudo clp php-pm all -max-children=50 -idle-timeout=60s
+sudo clp php-pm -all -max-children=50 -idle-timeout=60s
 ```
 
 Store defaults (used by later `clp php-pm` runs and by the automatic tuning after creating or restoring a site):
@@ -1219,7 +1221,57 @@ sudo clp config -set php-max-requests=500
 ```
 
 > [!NOTE]
-> Command options only apply to that run. A later `clp php-pm all` without options goes back to the `clp config` or default values; to keep different values for one site, pass the options for that site each time.
+> Command options only apply to that run. A later `clp php-pm -all` without options goes back to the `clp config` or default values; to keep different values for one site, pass the options for that site each time.
+
+#### Usage-based suggestions (`-status` / `-fix`)
+
+`-status` shows how busy each pool really is and suggests a `pm.max_children`; `-fix` applies the suggestion. Only `pm.max_children` of `pm = ondemand` pools is changed; `pm.process_idle_timeout` and `pm.max_requests` stay as they are.
+
+Show usage and suggestions for all sites, or for one site:
+
+```bash
+sudo clp php-pm -status
+```
+
+```bash
+sudo clp php-pm example.com -status
+```
+
+Apply the suggestion to one site (preview first with `-dry-run`):
+
+```bash
+sudo clp php-pm example.com -fix -dry-run
+```
+
+```bash
+sudo clp php-pm example.com -fix
+```
+
+All sites (`-exclude=` skips sites, `-y` skips the confirmation):
+
+```bash
+sudo clp php-pm -fix -all -dry-run
+```
+
+```bash
+sudo clp php-pm -fix -all -exclude="test.,dev."
+```
+
+Where the numbers come from:
+
+- **peak**: the most workers that ran at the same time since PHP-FPM started (`max active processes` on the pool's status page). **days** shows how long that period is.
+- **reached**: how often the pool hit `pm.max_children` — from the status page and from the PHP-FPM log of the last 7 days.
+- **Memory limit**: total memory minus MySQL/MariaDB, Varnish (its `malloc` size), Redis and 512MB reserve, divided by the memory of one PHP worker (measured from busy workers; 100MB when there are too few to measure).
+
+How the suggestion is calculated:
+
+1. peak × 1.5, rounded up to a multiple of 5, at least 10. After the limit was reached: the current value × 1.5.
+2. The memory limit lowers the headroom but never goes below the observed peak. Such sites are marked "(memory is tight)".
+3. Results: **Should be raised** (the limit was reached, or the current value is below peak × 1.2), **Can be lowered** (more than twice the suggestion, or above the memory limit), otherwise **OK**.
+4. When PHP-FPM started less than 3 days ago, the statistics are too short: the site is marked and `-fix` skips it.
+
+> [!NOTE]
+> Reloading or restarting PHP-FPM (including `-fix` itself) resets the status page statistics. Check again with `-status` after at least 3 days. A later `clp php-pm -all` with fixed values overwrites the suggested values.
 
 ---
 
