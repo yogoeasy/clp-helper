@@ -604,16 +604,16 @@ backup_site() {
   # Type B: Full Site (-type=full)
   # ----------------------------------------------------------------------------
   elif [[ "$b_type" == "full" ]]; then
-    # DB dump 寫在 root 專屬的工作目錄（不放在公開網站根目錄），打包時以 <domain>/.clp_db_export.sql 路徑加入，
-    # 與舊版備份的封裝結構相容
+    # DB dump 寫在 root 專屬的工作目錄（不放在公開網站根目錄），打包時以封裝最上層的 backup.sql 加入
+    # （與 <domain>/ 並排，不會和網站內的同名檔案衝突；舊版備份的 <domain>/.clp_db_export.sql 仍可還原）
     local db_stage_dir="${tmp_work_dir}/dbstage"
-    mkdir -p "${db_stage_dir}/${domain}"
-    local db_dump_file="${db_stage_dir}/${domain}/.clp_db_export.sql"
+    mkdir -p "$db_stage_dir"
+    local db_dump_file="${db_stage_dir}/backup.sql"
     local db_tar_args=()
     log_info "$(_t "BACKUP_SITE_5")"
 
     if backup_export_site_db "$siteroot" "$siteuser" "$db_dump_file"; then
-      db_tar_args=(-C "$db_stage_dir" "${domain}/.clp_db_export.sql")
+      db_tar_args=(-C "$db_stage_dir" "backup.sql")
     elif [[ -f "${siteroot}/wp-config.php" ]]; then
       log_error "$(_t "BACKUP_SITE_6")"
       rm -rf "$tmp_work_dir"
@@ -1344,7 +1344,11 @@ restore_site() {
 
     # Check for embedded SQL dump (only CLP's own dump at the archive root; never import
     # arbitrary .sql files that happen to be part of the site, e.g. old migration dumps)
+    # 新版：封裝最上層的 backup.sql（只在有 <domain>/ 目錄時採用，否則可能是網站自己的檔案）；舊版：<domain>/.clp_db_export.sql
     local embedded_sql="${extracted_root}/.clp_db_export.sql"
+    if [[ -d "${unpack_dir}/${domain}" && -f "${unpack_dir}/backup.sql" ]]; then
+      embedded_sql="${unpack_dir}/backup.sql"
+    fi
     if [[ -f "$embedded_sql" ]]; then
       log_step "$(_t "BACKUP_SITE_47")"
       local db_restore_ok=0

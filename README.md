@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.0.0 (build 2026-10-19 17:43:35)`
+Output example:`CLP Helper v1.0.1 (build 2026-10-20 15:30:20)`
 
 Display global help menu:
 
@@ -912,7 +912,7 @@ sudo clp backup <domain|all> [options...]
 
 | Option | Default | Description |
 | :--- | :--- | :--- |
-| `-type={db\|full\|compact\|archive}` | `full` | • `db`: Database only (`.sql.gz`)<br>• `full`: Complete archive of DB and all site files (`.tar.gz`)<br>• `compact`: Files without DB (current-year uploads only)<br>• `archive`: Past years' uploads (everything in uploads except the current year, plus `wp-content/shield` and `WPvivid_Uploads`); complements `compact` |
+| `-type={db\|full\|compact\|archive}` | `full` | • `db`: Database only (`.sql.gz`)<br>• `full`: Complete archive of DB and all site files (`.tar.gz`; the DB dump is `backup.sql` at the archive top level, beside the `<domain>/` directory)<br>• `compact`: Files without DB (current-year uploads only)<br>• `archive`: Past years' uploads (everything in uploads except the current year, plus `wp-content/shield` and `WPvivid_Uploads`); complements `compact` |
 | `-to={local\|<remote>}` | `local` | • `local`: Local server storage (`/root/clpBackup`)<br>• `<remote>`: Remote target defined in rclone config (`google`, `b2`, `r2`) |
 | `-path=<path>` | By destination | Custom local or remote folder path |
 | `-expire=<Nd>` | None | Automatically remove expired backups of the same type (`-expire=7d`, `-expire=30d`) |

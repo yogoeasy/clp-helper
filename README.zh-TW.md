@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.0.0 (建置時間 2026-10-19 17:43:35)`
+輸出範例：`CLP Helper v1.0.1 (建置時間 2026-10-20 15:30:20)`
 
 查看全域功能說明選單：
 
@@ -920,7 +920,7 @@ sudo clp backup <domain|all> [options...]
 
 | 參數 | 預設值 | 說明 |
 | :--- | :--- | :--- |
-| `-type={db\|full\|compact\|archive}` | `full` | • `db`: 僅備份資料庫 (`.sql.gz`)<br>• `full`: 完整打包資料庫與全站實體檔案 (`.tar.gz`)<br>• `compact`: 精簡備份（不含 DB，uploads 僅保留當年度）<br>• `archive`: 歷年封存（uploads 中今年以外的全部內容，加上 `wp-content/shield`、`WPvivid_Uploads`），與 `compact` 互補 |
+| `-type={db\|full\|compact\|archive}` | `full` | • `db`: 僅備份資料庫 (`.sql.gz`)<br>• `full`: 完整打包資料庫與全站實體檔案 (`.tar.gz`；資料庫傾印為封裝最上層的 `backup.sql`，與 `<domain>/` 目錄並排)<br>• `compact`: 精簡備份（不含 DB，uploads 僅保留當年度）<br>• `archive`: 歷年封存（uploads 中今年以外的全部內容，加上 `wp-content/shield`、`WPvivid_Uploads`），與 `compact` 互補 |
 | `-to={local\|<remote>}` | `local` | • `local`: 儲存於本機伺服器 (`/root/clpBackup`)<br>• `<remote>`: 指定 rclone 設定檔中之雲端名稱 (如 `google`, `b2`, `r2`) |
 | `-path=<path>` | 依目的地 | 自訂本機目錄或雲端資料夾路徑 |
 | `-expire=<Nd>` | 無 | 自動清除過期備份（如 `-expire=7d` 或 `-expire=30d`），只會清除同類型的備份 |
