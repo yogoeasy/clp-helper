@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.0.1 (建置時間 2026-10-20 15:30:20)`
+輸出範例：`CLP Helper v1.0.2 (建置時間 2026-10-21 11:46:33)`
 
 查看全域功能說明選單：
 
@@ -622,7 +622,9 @@ sudo clp site -cf-only=off -all
 - **同時修改 vhost 與 CloudPanel 資料庫**：只修改主要 server 區塊的兩處（`access_log` 改用 `cloudflare` 格式、加上 `include /etc/nginx/cloudflare/ips;`），格式與 CloudPanel 後台產生的相同；同時更新資料庫欄位，之後在後台重新產生 vhost 也會保留這個設定，後台的開關也會顯示正確。
 - **安全措施**：修改前備份 vhost、資料庫欄位的原值與資料庫（`/root/.clp/cf-only-backup/`，資料庫備份保留最近 3 份）；`nginx -t` 失敗會還原 vhost，資料庫寫入失敗也會還原；已是目標狀態時不變更。停用中的網站不處理。
 - **批次確認**：批次變更前會列出要處理與略過的網站，需輸入 `yes` 確認；使用 `-y` 時直接執行，非互動模式沒有 `-y` 會報錯。
-- **注意：`X-Real-IP` 繞過**：如果 `/etc/nginx/nginx.conf` 有 `set_real_ip_from 0.0.0.0/0;`（目前查過的 CloudPanel 主機都是這個設定），任何人直連主機並帶上 `X-Real-IP: <Cloudflare IP>` 標頭都能繞過這個設定。clp 會顯示警告，但不會修改 `nginx.conf`。
+- **封住 `X-Real-IP` 繞過**：CloudPanel 預設的 `/etc/nginx/nginx.conf` 有 `set_real_ip_from 0.0.0.0/0;`，任何人直連主機並帶上 `X-Real-IP: <Cloudflare IP>` 標頭都能繞過這個設定。開啟時，clp 會先詢問，再把這一行註解掉（保留原行，並加上 `# disabled by CLP Helper (cf-only)`；`-y` 時直接處理）。這會影響伺服器上所有網站；`127.0.0.1` 與私有網段仍受信任，所以 Varnish 不受影響。檔案會備份到同一個備份資料夾，`nginx -t` 失敗時自動還原。關閉最後一個網站時，clp 會詢問是否恢復這一行（預設不恢復；`-y` 時維持註解）。
+- **有 `real_ip_header` 時拒絕開啟**：如果 `nginx.conf` 有未註解、且不是 `X-Real-IP` 的 `real_ip_header`（例如為了顯示訪客真實 IP 而設的 `X-Forwarded-For`），nginx 會在檢查 Cloudflare 允許清單之前換掉來源位址，所有訪客都會被擋，所以 clp 不會開啟。
+- **防火牆檢查**：這個設定不涵蓋 8080（nginx 後端）與 6081（Varnish）埠。UFW 未啟用或開放了這兩個埠時，clp 會顯示警告。
 
 #### ⑨ Varnish 快取沒有作用？(`clp site <domain> -varnish=status|fix`)
 

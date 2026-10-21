@@ -3598,11 +3598,195 @@ cf_only_precheck() {
   fi
 }
 
-# nginx.conf 若信任所有來源的 X-Real-IP，任何人都能偽造 Cloudflare IP 繞過此設定（只警告，不修改）
-cf_only_warn_real_ip() {
-  if grep -Eq '^[[:space:]]*set_real_ip_from[[:space:]]+0\.0\.0\.0/0[[:space:]]*;' /etc/nginx/nginx.conf 2>/dev/null; then
+# ------------------------------------------------------------------------------
+# nginx.conf 的 set_real_ip_from 0.0.0.0/0（CloudPanel nginx 套件預設）
+#   nginx 會信任任何來源送來的 X-Real-IP 並換掉 $remote_addr，所以直連主機帶上
+#   X-Real-IP: <Cloudflare IP> 就能通過 cloudflare/ips 的 allow 清單。
+#   開啟 cf-only 時把這一行註解掉（不刪除，並加上標記）；私有網段與 127.0.0.1 保留，
+#   Varnish（6081）與 wp-admin 轉到 8080 都是從 127.0.0.1 連線，不受影響。
+# ------------------------------------------------------------------------------
+CF_ONLY_NGINX_CONF="/etc/nginx/nginx.conf"
+CF_ONLY_REALIP_MARK="# disabled by CLP Helper (cf-only)"
+CF_ONLY_REALIP_RE='^[[:space:]]*set_real_ip_from[[:space:]]+0\.0\.0\.0/0[[:space:]]*;'
+
+# cf_only_realip_state：輸出 active（生效中）| clp（已由 clp 註解）| none（不存在）
+cf_only_realip_state() {
+  if grep -Eq "$CF_ONLY_REALIP_RE" "$CF_ONLY_NGINX_CONF" 2>/dev/null; then
+    echo "active"
+  elif grep -Fq "$CF_ONLY_REALIP_MARK" "$CF_ONLY_NGINX_CONF" 2>/dev/null; then
+    echo "clp"
+  else
+    echo "none"
+  fi
+}
+
+# cf_only_realip_header：輸出未註解、且不是預設 X-Real-IP 的 real_ip_header 值（沒有則輸出空字串）
+#   改讀 X-Forwarded-For／CF-Connecting-IP 時，$remote_addr 會在 allow 檢查之前被換成訪客 IP，cf-only 會擋掉所有訪客
+cf_only_realip_header() {
+  awk '
+    /^[[:space:]]*real_ip_header[[:space:]]+/ {
+      v = $2; sub(/;.*/, "", v)
+      if (tolower(v) != "x-real-ip") { print v; exit }
+    }
+  ' "$CF_ONLY_NGINX_CONF" 2>/dev/null || true
+}
+
+# cf_only_realip_check_header：有衝突的 real_ip_header 時報錯（開啟前呼叫）
+cf_only_realip_check_header() {
+  local hdr
+  hdr=$(cf_only_realip_header)
+  if [[ -n "$hdr" ]]; then
+    log_error "$(_t "SITE_CF_ONLY_REALIP_ERR_HEADER" "$hdr" "$CF_ONLY_NGINX_CONF")"
+    return 1
+  fi
+}
+
+# cf_only_realip_need_confirm：該行生效中、非 TTY、又沒有 -y 時報錯（在修改任何東西之前呼叫）
+cf_only_realip_need_confirm() {
+  [[ "$(cf_only_realip_state)" == "active" ]] || return 0
+  if has_opt "y" || has_opt "yes" || [[ "${CLP_AUTO_YES:-false}" == "true" ]]; then
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    log_error "$(_t "SITE_CF_ONLY_REALIP_ERR_NON_TTY")"
+    return 1
+  fi
+}
+
+# cf_only_realip_write <disable|restore>：改寫 nginx.conf（先備份、原子置換、nginx -t 失敗則還原），成功後 reload
+cf_only_realip_write() {
+  local mode="$1"
+  cf_only_backup_init || return 1
+  local bak="${CF_ONLY_BACKUP_DIR}/nginx.conf"
+  cp -p "$CF_ONLY_NGINX_CONF" "$bak" || return 1
+  local tmp
+  tmp=$(mktemp "${CF_ONLY_BACKUP_DIR}/.nginx.XXXXXX") || return 1
+  if [[ "$mode" == "disable" ]]; then
+    # 保留原縮排，在行首加 # 並附上標記
+    awk -v mark="$CF_ONLY_REALIP_MARK" '
+      /^[[:space:]]*set_real_ip_from[[:space:]]+0\.0\.0\.0\/0[[:space:]]*;/ {
+        match($0, /^[[:space:]]*/)
+        ind = substr($0, 1, RLENGTH); rest = substr($0, RLENGTH + 1)
+        print ind "#" rest " " mark; next
+      }
+      { print }
+    ' "$CF_ONLY_NGINX_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    awk -v mark="$CF_ONLY_REALIP_MARK" '
+      index($0, mark) > 0 && /^[[:space:]]*#[[:space:]]*set_real_ip_from[[:space:]]+0\.0\.0\.0\/0/ {
+        line = substr($0, 1, index($0, mark) - 1)
+        sub(/[[:space:]]+$/, "", line)
+        sub(/#[[:space:]]*/, "", line)
+        print line; next
+      }
+      { print }
+    ' "$CF_ONLY_NGINX_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  if ! atomic_replace "$tmp" "$CF_ONLY_NGINX_CONF"; then
+    rm -f "$tmp"
+    log_error "$(_t "SITE_CF_ONLY_REALIP_ERR_WRITE" "$CF_ONLY_NGINX_CONF")"
+    return 1
+  fi
+  rm -f "$tmp"
+  if ! nginx -t >/dev/null 2>&1; then
+    atomic_replace "$bak" "$CF_ONLY_NGINX_CONF" || log_error "$(_t "SITE_CF_ONLY_ERR_RESTORE" "$bak" "$CF_ONLY_NGINX_CONF")"
+    log_error "$(_t "SITE_CF_ONLY_REALIP_ERR_TEST" "$CF_ONLY_NGINX_CONF")"
+    return 1
+  fi
+  systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
+}
+
+# cf_only_realip_disable <dry_run>：開啟 cf-only 後呼叫；互動模式先詢問（預設 yes），-y 直接處理
+#   失敗或使用者拒絕時只警告，不影響已完成的 cf-only 設定
+cf_only_realip_disable() {
+  local dry_run="$1"
+  [[ "$(cf_only_realip_state)" == "active" ]] || return 0
+  log_warn "$(_t "SITE_CF_ONLY_REALIP_EXPLAIN" "$CF_ONLY_NGINX_CONF")"
+  if [[ "$dry_run" -eq 1 ]]; then
+    log_info "$(_t "SITE_CF_ONLY_REALIP_DRY_RUN" "$CF_ONLY_NGINX_CONF")"
+    return 0
+  fi
+  if ! has_opt "y" && ! has_opt "yes" && [[ "${CLP_AUTO_YES:-false}" != "true" ]]; then
+    local ans=""
+    if ! read -r -p "$(_t "SITE_CF_ONLY_REALIP_PROMPT")" ans; then
+      ans="n"
+    fi
+    if [[ -n "$ans" && "$ans" != "y" && "$ans" != "Y" && "$ans" != "yes" ]]; then
+      log_warn "$(_t "SITE_CF_ONLY_WARN_REAL_IP")"
+      return 0
+    fi
+  fi
+  if cf_only_realip_write disable; then
+    log_success "$(_t "SITE_CF_ONLY_REALIP_DONE" "$CF_ONLY_NGINX_CONF" "${CF_ONLY_BACKUP_DIR}/nginx.conf")"
+  else
     log_warn "$(_t "SITE_CF_ONLY_WARN_REAL_IP")"
   fi
+  return 0
+}
+
+# cf_only_realip_maybe_restore：關閉 cf-only 後呼叫；已沒有任何網站開啟、且該行是 clp 註解的，才詢問是否恢復（預設不恢復）
+#   -y 或非 TTY 時不恢復，只說明手動恢復的方法
+cf_only_realip_maybe_restore() {
+  [[ "$(cf_only_realip_state)" == "clp" ]] || return 0
+  if cf_only_py db-get "$CF_ONLY_DB" 2>/dev/null | cut -f2 | grep -qx 1; then
+    return 0
+  fi
+  if has_opt "y" || has_opt "yes" || [[ "${CLP_AUTO_YES:-false}" == "true" ]] || [[ ! -t 0 ]]; then
+    log_info "$(_t "SITE_CF_ONLY_REALIP_RESTORE_INFO" "$CF_ONLY_NGINX_CONF")"
+    return 0
+  fi
+  local ans=""
+  read -r -p "$(_t "SITE_CF_ONLY_REALIP_RESTORE_PROMPT")" ans || ans=""
+  if [[ "$ans" == "y" || "$ans" == "Y" || "$ans" == "yes" ]]; then
+    cf_only_realip_write restore && log_success "$(_t "SITE_CF_ONLY_REALIP_RESTORED" "$CF_ONLY_NGINX_CONF")"
+  else
+    log_info "$(_t "SITE_CF_ONLY_REALIP_RESTORE_INFO" "$CF_ONLY_NGINX_CONF")"
+  fi
+  return 0
+}
+
+# cf_only_firewall_check：UFW 沒啟用，或明確開放 8080（nginx backend）／6081（Varnish）時警告——直連這些埠不受 cf-only 限制
+cf_only_firewall_check() {
+  if ! command -v ufw >/dev/null 2>&1 || ! ufw status 2>/dev/null | grep -q '^Status: active'; then
+    log_warn "$(_t "SITE_CF_ONLY_WARN_FIREWALL_OFF")"
+    return 0
+  fi
+  local port
+  for port in 8080 6081; do
+    if ufw status 2>/dev/null | awk -v p="$port" '
+      $0 ~ /ALLOW/ {
+        split($1, a, "/"); spec = a[1]
+        if (spec == p) { found = 1 }
+        else if (index(spec, ":") > 0) {
+          split(spec, r, ":"); if (p + 0 >= r[1] + 0 && p + 0 <= r[2] + 0) found = 1
+        }
+      }
+      END { exit found ? 0 : 1 }
+    '; then
+      log_warn "$(_t "SITE_CF_ONLY_WARN_FIREWALL_PORT" "$port")"
+    fi
+  done
+  return 0
+}
+
+# cf_only_realip_status：顯示該行狀態（-cf-only=status 用）
+cf_only_realip_status() {
+  local st key
+  st=$(cf_only_realip_state)
+  case "$st" in
+    active) key="SITE_CF_ONLY_REALIP_STATE_ACTIVE" ;;
+    clp) key="SITE_CF_ONLY_REALIP_STATE_CLP" ;;
+    *) key="SITE_CF_ONLY_REALIP_STATE_NONE" ;;
+  esac
+  if [[ "$st" == "active" ]]; then
+    log_warn "$(_t "SITE_CF_ONLY_REALIP_STATE" "$(_t "$key")")"
+  else
+    log_info "$(_t "SITE_CF_ONLY_REALIP_STATE" "$(_t "$key")")"
+  fi
+  local hdr
+  hdr=$(cf_only_realip_header)
+  [[ -n "$hdr" ]] && log_warn "$(_t "SITE_CF_ONLY_REALIP_ERR_HEADER" "$hdr" "$CF_ONLY_NGINX_CONF")"
+  return 0
 }
 
 # cf_only_backup_init：本次執行的備份目錄（vhost 副本、資料庫欄位原值、資料庫備份）；資料庫備份只保留最近 3 份
@@ -3785,7 +3969,8 @@ cf_only_status_line() {
 
 cf_only_status() {
   local domain="$1"
-  cf_only_warn_real_ip
+  cf_only_realip_status
+  cf_only_firewall_check
   local -a domains=()
   if [[ -n "$domain" ]]; then
     domains=("$domain")
@@ -3822,6 +4007,8 @@ cf_only_status() {
 }
 
 # cf_only_batch <on|off> <dry_run> <force>
+#   使用者在確認時取消會設定 CF_ONLY_BATCH_CANCELLED=1（之後不再處理 nginx.conf）
+CF_ONLY_BATCH_CANCELLED=0
 cf_only_batch() {
   local action="$1" dry_run="$2" force="$3"
   local -a todo=() skipped=() ex_patterns=()
@@ -3876,6 +4063,7 @@ cf_only_batch() {
     read -r -p "$(_t "SITE_CF_ONLY_BATCH_PROMPT" "${#todo[@]}")" confirm || confirm=""
     if [[ "$confirm" != "yes" && "$confirm" != "y" ]]; then
       log_info "$(_t "SITE_CF_ONLY_CANCELLED")"
+      CF_ONLY_BATCH_CANCELLED=1
       return 0
     fi
   fi
@@ -3940,9 +4128,22 @@ site_cf_only() {
       log_error "$(_t "SITE_CF_ONLY_ERR_ALL_WITH_DOMAIN")"
       return 1
     fi
-    cf_only_warn_real_ip
-    cf_only_batch "$action" "$dry_run" "$force"
-    return $?
+    local brc=0
+    if [[ "$action" == "on" ]]; then
+      cf_only_realip_check_header || return 1
+      [[ "$dry_run" -eq 1 ]] || cf_only_realip_need_confirm || return 1
+      cf_only_batch "$action" "$dry_run" "$force" || brc=$?
+      [[ "$CF_ONLY_BATCH_CANCELLED" -eq 1 ]] && return 0
+      # 整批只處理一次 nginx.conf；沒有任何網站是 on（全部失敗）時不修改
+      if cf_only_py db-get "$CF_ONLY_DB" 2>/dev/null | cut -f2 | grep -qx 1 || [[ "$dry_run" -eq 1 ]]; then
+        cf_only_realip_disable "$dry_run"
+      fi
+      cf_only_firewall_check
+    else
+      cf_only_batch "$action" "$dry_run" "$force" || brc=$?
+      [[ "$dry_run" -eq 1 || "$CF_ONLY_BATCH_CANCELLED" -eq 1 ]] || cf_only_realip_maybe_restore
+    fi
+    return "$brc"
   fi
 
   if [[ -z "$domain" ]]; then
@@ -3950,8 +4151,18 @@ site_cf_only() {
     return 1
   fi
   require_site_exists "$domain" "-cf-only" || return 1
-  [[ "$action" == "on" ]] && cf_only_warn_real_ip
-  cf_only_apply "$domain" "$action" "$force" "$dry_run"
+  if [[ "$action" == "on" ]]; then
+    cf_only_realip_check_header || return 1
+    [[ "$dry_run" -eq 1 ]] || cf_only_realip_need_confirm || return 1
+    cf_only_apply "$domain" "$action" "$force" "$dry_run" || return 1
+    # 網站已經是 on 時也處理（讓先前已開啟的主機補上）
+    cf_only_realip_disable "$dry_run"
+    cf_only_firewall_check
+    return 0
+  fi
+  cf_only_apply "$domain" "$action" "$force" "$dry_run" || return 1
+  [[ "$dry_run" -eq 1 ]] || cf_only_realip_maybe_restore
+  return 0
 }
 
 # ------------------------------------------------------------------------------

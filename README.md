@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.0.1 (build 2026-10-20 15:30:20)`
+Output example:`CLP Helper v1.0.2 (build 2026-10-21 11:46:33)`
 
 Display global help menu:
 
@@ -614,7 +614,9 @@ sudo clp site -cf-only=off -all
 - **Updates both the vhost and the CloudPanel database**: only two places in the main server block change (`access_log` switches to the `cloudflare` format and `include /etc/nginx/cloudflare/ips;` is added), in the same format CloudPanel generates. The database field is updated too, so the setting survives when CloudPanel regenerates the vhost and the toggle in the UI shows the right state.
 - **Safety**: the vhost, the previous database value and the database itself are backed up first (`/root/.clp/cf-only-backup/`, the last 3 database copies are kept); if `nginx -t` fails or the database write fails, the vhost is restored. Sites already in the requested state are left alone. Disabled sites are not processed.
 - **Batch confirmation**: before a batch change, the sites to change and to skip are listed and you must type `yes`; `-y` proceeds directly, and non-interactive mode without `-y` is refused.
-- **Warning: `X-Real-IP` bypass**: if `/etc/nginx/nginx.conf` contains `set_real_ip_from 0.0.0.0/0;` (as on every CloudPanel server we checked), anyone who connects directly with an `X-Real-IP: <Cloudflare IP>` header can bypass this setting. clp shows a warning but does not modify `nginx.conf`.
+- **`X-Real-IP` bypass is closed**: CloudPanel's default `/etc/nginx/nginx.conf` contains `set_real_ip_from 0.0.0.0/0;`, so anyone who connects directly with an `X-Real-IP: <Cloudflare IP>` header could bypass this setting. When you turn it on, clp comments out that line (it is kept, marked `# disabled by CLP Helper (cf-only)`) after asking (`-y` applies it directly). This applies to every site on the server; `127.0.0.1` and private ranges stay trusted, so Varnish is not affected. The file is backed up to the same backup folder and restored if `nginx -t` fails. When the last site is turned off, clp asks whether to restore the line (default: no; with `-y` it is left commented out).
+- **Refused with `real_ip_header`**: if `nginx.conf` has an active `real_ip_header` other than `X-Real-IP` (for example `X-Forwarded-For`, used to show visitors' real IPs), nginx replaces the client address before the Cloudflare allow list is checked and every visitor would be blocked, so clp refuses to turn it on.
+- **Firewall check**: ports 8080 (nginx backend) and 6081 (Varnish) are not covered by this setting. clp warns when UFW is not active or allows those ports.
 
 #### ⑨ Varnish Not Caching? (`clp site <domain> -varnish=status|fix`)
 
