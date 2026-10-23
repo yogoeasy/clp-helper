@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.1.0 (build 2026-10-23 11:38:59)`
+Output example:`CLP Helper v1.1.1 (build 2026-10-23 14:02:24)`
 
 Display global help menu:
 
@@ -652,20 +652,37 @@ sudo clp site -varnish=fix -all -dry-run
 sudo clp site -varnish=fix -all -exclude="test.,dev."
 ```
 
+For monitoring scripts, `-check` prints only `domain<TAB>result code` lines (no table, colors or translated text):
+
+```bash
+sudo clp site -varnish=status -check
+```
+
+- `-check=ok|off|problem` picks which sites to list; combine with commas (`-check=off,problem`). `-check` alone means `problem`. Works with one domain and with `-exclude`.
+  - `ok`: cached. `off`: `off`, `off-db`, `disabled-site`. `problem`: everything else (`fix-vhost`, `fix-wfwaf`, `fix-both`, `save-vhost`, `skip-front`, `skip-other`, `skip-vhost`, `unknown`, `error`).
+- Exit status: `0` OK, `1` the filter includes `problem` and at least one site matched, `2` the check could not run (invalid value, site not found, no CloudPanel database). Messages go to stderr.
+
+```bash
+rc=0; out=$(clp site -varnish=status -check) || rc=$?
+[ "$rc" -eq 1 ] && notify "Varnish problems: $out"
+[ "$rc" -eq 2 ] && notify "clp varnish check failed"
+```
+
 **Why caching does not happen**
 
 1. **Varnish only caches pages for which PHP sends `Cache-Control`**: `/home/<user>/.varnish-cache/controller.php` sends those headers and must be loaded through PHP's `auto_prepend_file`. The `Cache-Control: no-store` your browser sees is always added by Varnish and says nothing about caching; ignore it.
 2. **Toggle Varnish in the CloudPanel UI** (or press Save on the Vhost tab): the UI toggle is `enabled` in `/home/<user>/.varnish-cache/settings.json`, and switching it also makes CloudPanel regenerate the vhost and add `auto_prepend_file` to `PHP_VALUE`. The toggle of the "CLP Varnish Cache" WordPress plugin only changes `settings.json` and does not update the vhost. (`site.varnish_cache` in the CloudPanel database is a default set when a WordPress site is created, usually 1; it does not mean the UI toggle is on.)
 3. **When optimizing the Wordfence firewall, choose "Include", not "Override", and enable Varnish before the Wordfence optimization**: Wordfence writes a `.user.ini` that switches to its own `wordfence-waf.php`, which takes precedence over the vhost, so `wordfence-waf.php` must include `controller.php`. If the order was reversed or Override was chosen, run `clp site <domain> -varnish=fix`.
 4. **Changes to `.user.ini` take up to 5 minutes** (PHP's `user_ini.cache_ttl`). `-varnish=fix` never edits `.user.ini`; its changes to the vhost and `wordfence-waf.php` take effect immediately.
-5. **Wordfence warns that `.user.ini` may be publicly readable**: the Nginx security rules of `clp server -harden` already block `.user.ini` (in `/etc/nginx/clp-security.conf`, loaded from `/etc/nginx/global_settings`).
+5. **The front end must send requests to Varnish**: in the 80/443 server block, `location /` must be `proxy_pass http://127.0.0.1:6081;` (the `server` in `settings.json`). CloudPanel writes it only when the vhost is generated; if Varnish was switched on later (for example with the WordPress plugin), it stays at `8080`, requests go straight to PHP, and nothing is cached even though everything else looks right. The `front` column of `-varnish=status` shows the port. When it is not the Varnish port, the result asks you to open the site's Vhost tab in CloudPanel and press Save; `-varnish=fix` does not change it. (The `wp-admin` location always uses `8080`; that is normal.)
+6. **Wordfence warns that `.user.ini` may be publicly readable**: the Nginx security rules of `clp server -harden` already block `.user.ini` (in `/etc/nginx/clp-security.conf`, loaded from `/etc/nginx/global_settings`).
 
 **What `-varnish=fix` does**
 
 - vhost: adds `auto_prepend_file=/home/<user>/.varnish-cache/controller.php;` right after `upload_max_filesize=…;` in the `PHP_VALUE` of the 8080 block, at the same place and in the same form as CloudPanel; restored if `nginx -t` fails.
 - `wordfence-waf.php`: if `.user.ini` points to it and it does not include `controller.php`, adds a block in the same format as Wordfence's "Include" option, checked with `php -l`, keeping the file's owner and permissions.
 - Backups go to `/root/.clp/varnish-backup/<time>/<domain>/`; after the fix, caching is checked again.
-- **Left alone** (only reported): Varnish disabled (the UI toggle is off, i.e. `enabled` is false in `settings.json`), `varnish_cache` is 0 in the database (CloudPanel would drop the line again when it regenerates the vhost; shown separately), `.user.ini` pointing to another file, a vhost that already has another `auto_prepend_file`, and sites where the cause is unknown.
+- **Left alone** (only reported): a front end that bypasses Varnish (press Save on the Vhost tab, then run it again; when saving would not help, e.g. a vhost template without `{{varnish_proxy_pass}}`, the result says to check manually), Varnish disabled (the UI toggle is off, i.e. `enabled` is false in `settings.json`), `varnish_cache` is 0 in the database (CloudPanel would drop the line again when it regenerates the vhost; shown separately), `.user.ini` pointing to another file, a vhost that already has another `auto_prepend_file`, and sites where the cause is unknown.
 
 **Checking it yourself**:
 
@@ -673,7 +690,13 @@ sudo clp site -varnish=fix -all -exclude="test.,dev."
 curl -s -D- -o /dev/null -H "Host: example.com" -H "X-Forwarded-Proto: https" http://127.0.0.1:8080/ | grep -i x-cache-lifetime
 ```
 
-If `X-Cache-Lifetime` is present, Varnish will cache the page.
+If `X-Cache-Lifetime` is present, Varnish will cache the page. To check that the front end goes through Varnish:
+
+```bash
+curl -sk -D- -o /dev/null --resolve example.com:443:127.0.0.1 https://example.com/ | grep -i x-cache-age
+```
+
+Varnish adds `X-Cache-Age` to every response (`0` on a miss, the age in seconds on a hit); if it is missing, the request did not go through Varnish.
 
 **What to check after the fix**
 

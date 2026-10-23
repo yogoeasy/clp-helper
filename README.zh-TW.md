@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.1.0 (建置時間 2026-10-23 11:38:59)`
+輸出範例：`CLP Helper v1.1.1 (建置時間 2026-10-23 14:02:24)`
 
 查看全域功能說明選單：
 
@@ -660,20 +660,37 @@ sudo clp site -varnish=fix -all -dry-run
 sudo clp site -varnish=fix -all -exclude="test.,dev."
 ```
 
+給監控 script 使用時，加上 `-check` 只輸出「`網域<TAB>結論代碼`」，不印表格、顏色與翻譯文字：
+
+```bash
+sudo clp site -varnish=status -check
+```
+
+- `-check=ok|off|problem` 選擇要列出哪些網站，可用逗號組合（`-check=off,problem`）；只寫 `-check` 等於 `problem`。可以指定單一網域，也可以搭配 `-exclude`。
+  - `ok`：有快取。`off`：`off`、`off-db`、`disabled-site`。`problem`：其他所有結論（`fix-vhost`、`fix-wfwaf`、`fix-both`、`save-vhost`、`skip-front`、`skip-other`、`skip-vhost`、`unknown`、`error`）。
+- 結束碼：`0` 正常；`1` 條件包含 `problem` 而且有符合的網站；`2` 無法執行檢查（值無效、找不到網站、沒有 CloudPanel 資料庫）。訊息都寫到 stderr。
+
+```bash
+rc=0; out=$(clp site -varnish=status -check) || rc=$?
+[ "$rc" -eq 1 ] && notify "Varnish 有問題：$out"
+[ "$rc" -eq 2 ] && notify "clp varnish 檢查失敗"
+```
+
 **為什麼會沒有快取**
 
 1. **Varnish 只快取 PHP 送出 `Cache-Control` 的頁面**：這些標頭由 `/home/<user>/.varnish-cache/controller.php` 送出，它必須透過 PHP 的 `auto_prepend_file` 載入。瀏覽器看到的 `Cache-Control: no-store` 是 Varnish 固定加上的，與是否快取無關，判斷時不要看它。
 2. **開關要在 CloudPanel 後台切換**（或在 Vhost 分頁按 Save）：後台的 Varnish 開關對應 `/home/<user>/.varnish-cache/settings.json` 的 `enabled`，切換時 CloudPanel 也會重新產生 vhost，在 `PHP_VALUE` 加上 `auto_prepend_file`。WordPress 後台「CLP Varnish Cache」外掛的開關只改 `settings.json`，不會更新 vhost。（CloudPanel 資料庫的 `site.varnish_cache` 是建立 WordPress 網站時的預設值，通常都是 1，不代表後台開關是開的。）
 3. **Wordfence 防火牆最佳化時要選「Include」，不要選「Override」，而且要先開 Varnish、再做 Wordfence 最佳化**：Wordfence 會建立 `.user.ini` 改用自己的 `wordfence-waf.php`，它的優先順序比 vhost 高，所以 `wordfence-waf.php` 必須 include `controller.php`。順序相反或選了 Override 時，用 `clp site <domain> -varnish=fix` 補上。
 4. **`.user.ini` 修改後最多 5 分鐘才生效**（PHP 的 `user_ini.cache_ttl`）。`-varnish=fix` 不會修改 `.user.ini`，修改的 vhost 與 `wordfence-waf.php` 都會立即生效。
-5. **Wordfence 提醒 `.user.ini` 可能被公開讀取**：`clp server -harden` 的 Nginx 安全規則已經擋下 `.user.ini`（規則在 `/etc/nginx/clp-security.conf`，由 `/etc/nginx/global_settings` 載入）。
+5. **前端要把請求轉給 Varnish**：80／443 server block 的 `location /` 必須是 `proxy_pass http://127.0.0.1:6081;`（`settings.json` 的 `server`）。CloudPanel 只在產生 vhost 時寫入；如果 Varnish 是之後才開啟的（例如用 WordPress 外掛開啟），這一行會維持 `8080`，請求直接交給 PHP，其他項目看起來都正常卻完全沒有快取。`-varnish=status` 的 `front` 欄位會顯示埠號；不是 Varnish 的埠號時，結論會請你在 CloudPanel 後台開啟該網站的 Vhost 分頁並按儲存，`-varnish=fix` 不會修改這一行。（`wp-admin` 那一段固定是 `8080`，這是正常的。）
+6. **Wordfence 提醒 `.user.ini` 可能被公開讀取**：`clp server -harden` 的 Nginx 安全規則已經擋下 `.user.ini`（規則在 `/etc/nginx/clp-security.conf`，由 `/etc/nginx/global_settings` 載入）。
 
 **`-varnish=fix` 做什麼**
 
 - vhost：在 8080 區塊的 `PHP_VALUE` 中，於 `upload_max_filesize=…;` 之後加上 `auto_prepend_file=/home/<user>/.varnish-cache/controller.php;`，位置與內容和 CloudPanel 產生的相同；`nginx -t` 失敗會還原。
 - `wordfence-waf.php`：`.user.ini` 指向它、而它沒有 include `controller.php` 時，加上與 Wordfence「Include」相同格式的區塊；會先以 `php -l` 檢查，並保留檔案的擁有者與權限。
 - 修改前會備份到 `/root/.clp/varnish-backup/<時間>/<網域>/`；修改後重新檢查是否已有快取。
-- **不處理**：Varnish 未開啟（後台開關關閉，也就是 `settings.json` 的 `enabled` 為 false）、資料庫的 `varnish_cache` 為 0（CloudPanel 重新產生 vhost 時不會加上那一行，修了也會被蓋掉；檢查結果中另外標示）、`.user.ini` 指向其他檔案、vhost 已有其他 `auto_prepend_file`、原因不明的網站；這些只會在檢查結果中列出。
+- **不處理**：前端沒有經過 Varnish（請在後台 Vhost 分頁按儲存後再執行一次；後台儲存也無法修正時，例如 vhost 範本沒有 `{{varnish_proxy_pass}}`，結論會請你手動檢查）、Varnish 未開啟（後台開關關閉，也就是 `settings.json` 的 `enabled` 為 false）、資料庫的 `varnish_cache` 為 0（CloudPanel 重新產生 vhost 時不會加上那一行，修了也會被蓋掉；檢查結果中另外標示）、`.user.ini` 指向其他檔案、vhost 已有其他 `auto_prepend_file`、原因不明的網站；這些只會在檢查結果中列出。
 
 **自己檢查**：
 
@@ -681,7 +698,13 @@ sudo clp site -varnish=fix -all -exclude="test.,dev."
 curl -s -D- -o /dev/null -H "Host: example.com" -H "X-Forwarded-Proto: https" http://127.0.0.1:8080/ | grep -i x-cache-lifetime
 ```
 
-有 `X-Cache-Lifetime` 就表示 Varnish 會快取這個頁面。
+有 `X-Cache-Lifetime` 就表示 Varnish 會快取這個頁面。確認前端有經過 Varnish：
+
+```bash
+curl -sk -D- -o /dev/null --resolve example.com:443:127.0.0.1 https://example.com/ | grep -i x-cache-age
+```
+
+經過 Varnish 的回應一定有 `X-Cache-Age`（沒有命中快取時是 `0`，命中時是快取的秒數）；沒有這個標頭就表示沒有經過 Varnish。
 
 **修正後要確認的事**
 

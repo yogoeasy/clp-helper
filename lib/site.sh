@@ -4195,10 +4195,10 @@ varnish_diagnose() {
     return 1
   fi
   local k v
-  VD_TYPE="" VD_DB="" VD_SETTINGS="" VD_VHOST="" VD_USERINI="" VD_WFWAF="" VD_CACHED="" VD_CONCLUSION="" VD_USER="" VD_ROOT=""
+  VD_TYPE="" VD_DB="" VD_SETTINGS="" VD_FRONT="" VD_VHOST="" VD_USERINI="" VD_WFWAF="" VD_CACHED="" VD_CONCLUSION="" VD_USER="" VD_ROOT=""
   while IFS='=' read -r k v; do
     case "$k" in
-      type) VD_TYPE="$v" ;; varnish_db) VD_DB="$v" ;; settings) VD_SETTINGS="$v" ;;
+      type) VD_TYPE="$v" ;; varnish_db) VD_DB="$v" ;; settings) VD_SETTINGS="$v" ;; front) VD_FRONT="$v" ;;
       vhost) VD_VHOST="$v" ;; userini) VD_USERINI="$v" ;; wfwaf) VD_WFWAF="$v" ;;
       cached) VD_CACHED="$v" ;; conclusion) VD_CONCLUSION="$v" ;; user) VD_USER="$v" ;; root) VD_ROOT="$v" ;;
     esac
@@ -4217,6 +4217,8 @@ varnish_conclusion_text() {
     disabled-site) _t "SITE_VARNISH_C_DISABLED" ;;
     skip-other) _t "SITE_VARNISH_C_SKIP_OTHER" ;;
     skip-vhost) _t "SITE_VARNISH_C_SKIP_VHOST" ;;
+    save-vhost) _t "SITE_VARNISH_C_SAVE_VHOST" ;;
+    skip-front) _t "SITE_VARNISH_C_SKIP_FRONT" ;;
     unknown) _t "SITE_VARNISH_C_UNKNOWN" ;;
     *) _t "SITE_VARNISH_C_ERROR" ;;
   esac
@@ -4224,14 +4226,14 @@ varnish_conclusion_text() {
 
 varnish_print_row() {
   local domain="$1"
-  printf "%-32s %-9s %-8s %-10s %-9s %-6s %s\n" "$domain" "${VD_SETTINGS:--}" "${VD_VHOST:--}" \
+  printf "%-32s %-9s %-6s %-8s %-10s %-9s %-6s %s\n" "$domain" "${VD_SETTINGS:--}" "${VD_FRONT:--}" "${VD_VHOST:--}" \
     "${VD_USERINI%%:*}" "${VD_WFWAF:--}" "${VD_CACHED:--}" "$(varnish_conclusion_text "$VD_CONCLUSION")"
 }
 
 varnish_print_header() {
   echo ""
-  printf "%-32s %-9s %-8s %-10s %-9s %-6s %s\n" "Domain" "settings" "vhost" ".user.ini" "wf-waf" "cached" "$(_t "SITE_VARNISH_COL_RESULT")"
-  echo "--------------------------------------------------------------------------------------------------------"
+  printf "%-32s %-9s %-6s %-8s %-10s %-9s %-6s %s\n" "Domain" "settings" "front" "vhost" ".user.ini" "wf-waf" "cached" "$(_t "SITE_VARNISH_COL_RESULT")"
+  echo "---------------------------------------------------------------------------------------------------------------"
 }
 
 varnish_backup_init() {
@@ -4322,6 +4324,12 @@ varnish_fix_site() {
   return 1
 }
 
+# varnish_warn_save_vhost <domain>...：列出前端沒有經過 Varnish、要在 CloudPanel 後台儲存 vhost 的網站（clp 不修改前端）
+varnish_warn_save_vhost() {
+  [[ $# -eq 0 ]] && return 0
+  log_warn "$(_t "SITE_VARNISH_WARN_SAVE_VHOST" "$*")"
+}
+
 varnish_status() {
   local domain="$1"
   local -a domains=()
@@ -4332,11 +4340,14 @@ varnish_status() {
   fi
   varnish_print_header
   local d
+  local -a save=()
   for d in "${domains[@]}"; do
     varnish_diagnose "$d" || true
     varnish_print_row "$d"
+    [[ "$VD_CONCLUSION" == "save-vhost" ]] && save+=("$d")
   done
   echo ""
+  varnish_warn_save_vhost ${save[@]+"${save[@]}"}
   if [[ -n "$domain" && -n "$VD_ERROR" ]]; then
     log_error "$VD_ERROR"
     return 1
@@ -4344,11 +4355,84 @@ varnish_status() {
   return 0
 }
 
+# varnish_check_class <conclusion>：-check 的分類 ok | off | problem（not-php 不屬於任何一類，輸出空字串）
+varnish_check_class() {
+  case "$1" in
+    ok) echo "ok" ;;
+    off|off-db|disabled-site) echo "off" ;;
+    not-php) echo "" ;;
+    *) echo "problem" ;;
+  esac
+}
+
+# varnish_check <domain> <filter>：給其他 script 用；stdout 每行「網域<TAB>結論代碼」，不印表格、顏色與語系文字
+#   filter：ok | off | problem，可用逗號組合
+#   回傳 0＝正常、1＝filter 含 problem 且有符合的網站、2＝執行失敗
+varnish_check() {
+  local domain="$1" filter="$2" f pat d
+  local want_ok=0 want_off=0 want_problem=0
+  local -a parts=() domains=() ex_patterns=()
+  IFS=',' read -ra parts <<< "$filter"
+  for f in ${parts[@]+"${parts[@]}"}; do
+    f=$(echo "$f" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    case "$f" in
+      ok) want_ok=1 ;;
+      off) want_off=1 ;;
+      problem) want_problem=1 ;;
+      *) log_error "$(_t "SITE_VARNISH_ERR_CHECK_VALUE" "$f")"; return 2 ;;
+    esac
+  done
+  if [[ $((want_ok + want_off + want_problem)) -eq 0 ]]; then
+    log_error "$(_t "SITE_VARNISH_ERR_CHECK_VALUE" "$filter")"; return 2
+  fi
+
+  if [[ -n "$domain" ]]; then
+    domains=("$domain")
+  else
+    local list rc=0
+    list=$(varnish_py list "$VARNISH_DB") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      log_error "$list"; return 2
+    fi
+    local exclude
+    exclude=$(opt_get "exclude" "")
+    [[ -n "$exclude" ]] && IFS=',' read -ra ex_patterns <<< "$exclude"
+    while IFS= read -r d; do
+      [[ -z "$d" ]] && continue
+      local excluded=0
+      for pat in ${ex_patterns[@]+"${ex_patterns[@]}"}; do
+        if domain_matches_exclude "$d" "$pat"; then excluded=1; break; fi
+      done
+      [[ "$excluded" -eq 0 ]] && domains+=("$d")
+    done <<< "$list"
+  fi
+
+  local cls found=0
+  for d in ${domains[@]+"${domains[@]}"}; do
+    if ! varnish_diagnose "$d"; then
+      log_warn "${d}: ${VD_ERROR}"
+    fi
+    cls=$(varnish_check_class "$VD_CONCLUSION")
+    case "$cls" in
+      ok) [[ "$want_ok" -eq 1 ]] && printf '%s\t%s\n' "$d" "$VD_CONCLUSION" ;;
+      off) [[ "$want_off" -eq 1 ]] && printf '%s\t%s\n' "$d" "$VD_CONCLUSION" ;;
+      problem)
+        if [[ "$want_problem" -eq 1 ]]; then
+          printf '%s\t%s\n' "$d" "$VD_CONCLUSION"
+          found=1
+        fi
+        ;;
+    esac
+  done
+  [[ "$found" -eq 1 ]] && return 1
+  return 0
+}
+
 varnish_batch_fix() {
   local dry_run="$1"
   local exclude pat d
   exclude=$(opt_get "exclude" "")
-  local -a ex_patterns=() todo=()
+  local -a ex_patterns=() todo=() save=()
   [[ -n "$exclude" ]] && IFS=',' read -ra ex_patterns <<< "$exclude"
   varnish_print_header
   while IFS= read -r d; do
@@ -4360,9 +4444,10 @@ varnish_batch_fix() {
     [[ "$excluded" -eq 1 ]] && continue
     varnish_diagnose "$d" || true
     varnish_print_row "$d"
-    case "$VD_CONCLUSION" in fix-vhost|fix-wfwaf|fix-both) todo+=("$d") ;; esac
+    case "$VD_CONCLUSION" in fix-vhost|fix-wfwaf|fix-both) todo+=("$d") ;; save-vhost) save+=("$d") ;; esac
   done < <(varnish_py list "$VARNISH_DB")
   echo ""
+  varnish_warn_save_vhost ${save[@]+"${save[@]}"}
   log_info "$(_t "SITE_VARNISH_BATCH_TODO" "${#todo[@]}")"
   [[ ${#todo[@]} -eq 0 ]] && return 0
   log_warn "$(_t "SITE_VARNISH_WARN_CACHE_START")"
@@ -4400,19 +4485,38 @@ varnish_batch_fix() {
 #   clp site <domain> -varnish=status | -varnish=fix [-dry-run]
 #   clp site -varnish=status
 #   clp site -varnish=fix -all [-exclude=...] [-dry-run] [-y]
+#   clp site [<domain>] -varnish=status -check[=ok|off|problem[,...]] [-exclude=...]（見 varnish_check）
 site_varnish() {
   local domain
   domain=$(clean_domain "${1:-}")
   local val
   val=$(echo "$(opt_get "varnish" "")" | tr '[:upper:]' '[:lower:]')
-  local all=0 dry_run=0
+  local all=0 dry_run=0 check="" err_rc=1
   has_opt "all" && all=1
   { has_opt "dry-run" || has_opt "dry_run"; } && dry_run=1
+  if has_opt "check"; then
+    check=$(opt_get "check" "")
+    [[ -z "$check" || "$check" == "true" ]] && check="problem"
+    err_rc=2
+    if [[ "$val" != "status" ]]; then
+      log_error "$(_t "SITE_VARNISH_ERR_USAGE")"; return 2
+    fi
+  fi
   if ! command -v python3 >/dev/null 2>&1; then
-    log_error "$(_t "CORE_ERR_PYTHON3_REQUIRED")"; return 1
+    log_error "$(_t "CORE_ERR_PYTHON3_REQUIRED")"; return "$err_rc"
   fi
   if [[ ! -f "$VARNISH_DB" ]]; then
-    log_error "$(_t "SITE_CF_ONLY_ERR_NO_DB" "$VARNISH_DB")"; return 1
+    log_error "$(_t "SITE_CF_ONLY_ERR_NO_DB" "$VARNISH_DB")"; return "$err_rc"
+  fi
+  if [[ -n "$check" ]]; then
+    local rc=0
+    if [[ -n "$domain" && "$all" -eq 0 ]]; then
+      require_site_exists "$domain" "-varnish" >&2 || return 2
+      varnish_check "$domain" "$check" || rc=$?
+    else
+      varnish_check "" "$check" || rc=$?
+    fi
+    return "$rc"
   fi
   case "$val" in
     status)
@@ -4480,7 +4584,7 @@ site_handler() {
   local -a used_pos=("site")
   [[ -n "$action" ]] && used_pos+=("$action")
   [[ -n "$target_domain" ]] && used_pos+=("$target_domain")
-  reject_extra_positionals raw_args "on|off|new|list|delete|del|ssl|dns|http|cf-waf|cf_waf|cf-only|cf_only|varnish|fix|all|status|exclude|clone-from|clone_from|migrate|y|yes|force-replace|force_replace" "${used_pos[@]}" || return 1
+  reject_extra_positionals raw_args "on|off|new|list|delete|del|ssl|dns|http|cf-waf|cf_waf|cf-only|cf_only|varnish|fix|all|status|check|exclude|clone-from|clone_from|migrate|y|yes|force-replace|force_replace" "${used_pos[@]}" || return 1
 
   # 檢查 options
   if has_opt "list" || [[ "$action" == "list" ]]; then

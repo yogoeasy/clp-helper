@@ -8,7 +8,9 @@
 #                conf_install.sh check [-y]   nothing is written; exit 2 when a file needs a
 #                                             decision that cannot be asked (no TTY, no -y)
 #                conf_install.sh apply [-y]   apply (asks when needed; -y = recommended choice)
-#              Scenarios: docs/plans/48-reinstall-config-scenarios.md
+#              Scenario labels in the comments below (A1-A7, B1-B3, C*, L*) name the
+#              reinstall cases: A = default file, B = file from an older version,
+#              C = other install situations, L = the user's .local file.
 #
 #   <base>.conf             shipped defaults; line 1 = "# CLP-HELPER-MANAGED-DEFAULTS v1 sha256=<body>"
 #   <base>.local            the user's file; never rewritten except when merging old settings into it
@@ -181,17 +183,6 @@ _ci_kv_count() {
   echo "${#_c[@]}"
 }
 
-_ci_local_header() {
-  cat << 'EOF'
-# ==============================================================================
-# CLP Helper user settings (chmod 600)
-# Written by "clp config -set" / "clp config -unset"; your own file, never
-# overwritten by install or update. Only the keys you change are listed here;
-# every other key uses the shipped default in /etc/clp/clp.conf.
-# ==============================================================================
-EOF
-}
-
 # _ci_local_put <local_file> <assoc_name> <order_array_name>: sets these keys in the user file
 # (existing lines for the same key and its aliases are removed first; the token removes its source too)
 _ci_local_put() {
@@ -199,7 +190,7 @@ _ci_local_put() {
   local -n _put="$2"
   local -n _porder="$3"
   tmp="$(_ci_tmp)"; out="$(_ci_tmp)"
-  if [[ -f "$lf" ]]; then cat "$lf" > "$tmp"; else _ci_local_header > "$tmp"; fi
+  if [[ -f "$lf" ]]; then cat "$lf" > "$tmp"; else config_local_header > "$tmp"; fi
   for k in "${_porder[@]}"; do
     [[ -n "${_put[$k]+x}" ]] || continue
     pat="$(_config_del_pattern "$k")"
@@ -254,7 +245,7 @@ _ci_ask() {
 }
 
 # ------------------------------------------------------------------------------
-# Classification (48: A1-A7, B1-B3)
+# Classification (A1-A7, B1-B3)
 # ------------------------------------------------------------------------------
 # _ci_state <base> <kind>: prints one of
 #   missing | same | update | edited | edited_nochange | legacy_empty | legacy_user | legacy_both | unsafe
@@ -454,7 +445,7 @@ _ci_handle_legacy_user() {
   done
   case "$CI_ANS" in
     1)
-      # 48 C6: write the user file first, then the new default (a rerun gives the same result)
+      # C6: write the user file first, then the new default (a rerun gives the same result)
       if [[ "$kind" == "kv" ]]; then
         local t; t="$(_ci_tmp)" || return 1
         _ci_legacy_to_local "$d" > "$t" && _ci_write "$l" "$t" || { rm -f "$t"; return 1; }
@@ -510,7 +501,7 @@ _ci_handle_legacy_both() {
     return 0
   fi
 
-  # key=value: per-key merge (45 3.2; 48 B2)
+  # key=value: per-key merge (B2)
   local -A old=() loc=()
   local -a oorder=() lorder=()
   _ci_kv_load "$d" old oorder
@@ -582,7 +573,7 @@ _ci_handle_legacy_both() {
       put[CF_API_TOKEN_SOURCE]="${old[CF_API_TOKEN_SOURCE]}"; porder+=("CF_API_TOKEN_SOURCE")
     fi
   done
-  # 48 C6: user file first, then the backup of the old file, then the new default
+  # C6: user file first, then the backup of the old file, then the new default
   if [[ ${#porder[@]} -gt 0 ]]; then _ci_local_put "$l" put porder || return 1; fi
   b="$(_ci_backup "$d")" || return 1
   _ci_install_default "$base" || return 1
@@ -650,7 +641,7 @@ ci_apply() {
         log_info "$(_t "CONF_INST_UNCHANGED" "$d")"
         ;;
       update)
-        # 48 L7: the user's whole-file .local hides the updated shipped content
+        # L7: the user's whole-file .local hides the updated shipped content
         local hint=0
         [[ "$kind" == "ml" && -e "$l" ]] && hint=1
         _ci_install_default "$base" || return 1
@@ -675,14 +666,14 @@ ci_apply() {
       legacy_user) _ci_handle_legacy_user "$base" "$kind" || return 1 ;;
       legacy_both) _ci_handle_legacy_both "$base" "$kind" || return 1 ;;
     esac
-    # 48 L3: the user's file is always 600 root:root
+    # L3: the user's file is always 600 root:root
     if [[ -f "$l" && ! -L "$l" ]]; then
       chmod 600 "$l" || return 1
       if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then chown root:root "$l" || return 1; fi
     fi
   done
 
-  # 48 L4 / G2-A: invalid values in clp.local only produce a warning here
+  # L4: invalid values in clp.local only produce a warning here
   local -A uv=()
   local -a uo=()
   local k
