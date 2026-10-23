@@ -2,7 +2,9 @@
 # ==============================================================================
 # CLP Helper - Configuration Management Module
 # File: lib/config.sh
-# Description: Global preferences and credential storage (/etc/clp/clp.conf).
+# Description: Global preferences and credential storage.
+#              /etc/clp/clp.conf = shipped defaults (overwritten on install),
+#              /etc/clp/clp.local = the user's own settings (written by `clp config -set`).
 #              Strict permission enforcement (chmod 600, root-only access).
 # ==============================================================================
 
@@ -25,8 +27,24 @@ if ! command -v log_info >/dev/null 2>&1; then
   source "${CLP_ROOT_DIR}/lib/core.sh"
 fi
 
-CLP_CONFIG_DIR="${CLP_CONFIG_DIR:-/etc/clp}"
-CLP_CONFIG_FILE="${CLP_CONFIG_FILE:-${CLP_CONFIG_DIR}/clp.conf}"
+# 分層設定讀取器（clp.local > clp.conf > templates/clp.conf），同時定義 CLP_CONFIG_* 路徑變數
+if ! command -v clp_conf_read >/dev/null 2>&1; then
+  # shellcheck source=/dev/null
+  source "${CLP_ROOT_DIR}/lib/conf_read.sh"
+fi
+
+# ensure_config_file：只建立使用者檔 clp.local；預設檔 clp.conf 由安裝程式管理，這裡不建立也不改寫
+# Header of a new clp.local (also used when the installer moves an older clp.conf there)
+config_local_header() {
+  cat << 'EOF'
+# ==============================================================================
+# CLP Helper user settings (chmod 600)
+# Written by "clp config -set" / "clp config -unset"; your own file, never
+# overwritten by install or update. Only the keys you change are listed here;
+# every other key uses the shipped default in /etc/clp/clp.conf.
+# ==============================================================================
+EOF
+}
 
 ensure_config_file() {
   if [[ ! -d "$CLP_CONFIG_DIR" ]]; then
@@ -35,20 +53,16 @@ ensure_config_file() {
     chown root:root "$CLP_CONFIG_DIR" 2>/dev/null || true
   fi
 
-  if [[ ! -f "$CLP_CONFIG_FILE" ]]; then
-    touch "$CLP_CONFIG_FILE"
-    chmod 600 "$CLP_CONFIG_FILE"
-    chown root:root "$CLP_CONFIG_FILE" 2>/dev/null || true
-    cat << 'EOF' > "$CLP_CONFIG_FILE"
-# ==============================================================================
-# CLP Helper Global Configuration File
-# Location: /etc/clp/clp.conf (chmod 600)
-# ==============================================================================
-EOF
+  if [[ ! -f "$CLP_CONFIG_LOCAL_FILE" ]]; then
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+    config_local_header > "$CLP_CONFIG_LOCAL_FILE"
+    umask "$old_umask"
   fi
 
-  chmod 600 "$CLP_CONFIG_FILE" 2>/dev/null || true
-  chown root:root "$CLP_CONFIG_FILE" 2>/dev/null || true
+  chmod 600 "$CLP_CONFIG_LOCAL_FILE" 2>/dev/null || true
+  chown root:root "$CLP_CONFIG_LOCAL_FILE" 2>/dev/null || true
 }
 
 # Helper: Extract token from ini/credentials file
@@ -148,37 +162,109 @@ canonical_config_key() {
     php-max-requests|php_max_requests|PHP_FPM_MAX_REQUESTS)
       echo "PHP_FPM_MAX_REQUESTS"
       ;;
+    backup-dir|backup_dir|BACKUP_DIR)
+      echo "BACKUP_DIR"
+      ;;
+    backup-remote-dir|backup_remote_dir|BACKUP_REMOTE_DIR)
+      echo "BACKUP_REMOTE_DIR"
+      ;;
+    backup-type|backup_type|BACKUP_TYPE)
+      echo "BACKUP_TYPE"
+      ;;
+    backup-to|backup_to|BACKUP_TO)
+      echo "BACKUP_TO"
+      ;;
+    backup-expire|backup_expire|BACKUP_EXPIRE)
+      echo "BACKUP_EXPIRE"
+      ;;
     *)
       echo "$k"
       ;;
   esac
 }
 
-# Helper: Get raw configuration value by key (supports canonical normalization and default value)
+# Helper: Get raw configuration value by key（clp.local > clp.conf > templates/clp.conf；
+# 找不到時輸出第二個參數。各模組的數值預設值已移到 templates/clp.conf，呼叫端不要再傳寫死的預設值）
 get_config_value() {
-  local target_key="$1"
-  local default_val="${2:-}"
-  local conf_file="${CLP_CONFIG_FILE:-/etc/clp/clp.conf}"
-
-  [[ -f "$conf_file" ]] || { echo "$default_val"; return 0; }
-
   local canon_key
-  canon_key="$(canonical_config_key "$target_key")"
+  canon_key="$(canonical_config_key "$1")"
+  local default_val="${2:-}"
   local found_val=""
 
-  if [[ "$canon_key" == "CLP_LANG" ]]; then
-    found_val="$(grep -E '^(CLP_LANG|lang)=' "$conf_file" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || true)"
-  elif [[ "$canon_key" == "CF_API_TOKEN" ]]; then
-    found_val="$(grep -E '^(CF_API_TOKEN|cf-token|cf_token|cloudflare_api_token)=' "$conf_file" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || true)"
-  else
-    found_val="$(grep -E "^${canon_key}=" "$conf_file" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || true)"
-  fi
+  found_val="$(clp_conf_read "$canon_key" || true)"
 
   if [[ -n "$found_val" ]]; then
     echo "$found_val"
   else
     echo "$default_val"
   fi
+}
+
+# _config_valid_backup_dir：絕對路徑、不可是 /、不可含 ..、不可在 /home 底下（避免把備份寫進網站使用者可存取的位置）
+_config_valid_backup_dir() {
+  local v="$1"
+  [[ "$v" =~ ^/[A-Za-z0-9._/+-]+$ ]] || return 1
+  [[ -n "${v//\//}" ]] || return 1
+  [[ "/${v}/" != *"/../"* ]] || return 1
+  [[ "$v" != "/home" && "$v" != /home/* ]] || return 1
+}
+
+# _config_valid_remote_dir：rclone 遠端上的相對路徑
+_config_valid_remote_dir() {
+  local v="$1"
+  [[ "$v" =~ ^[A-Za-z0-9._-][A-Za-z0-9._/-]*$ ]] || return 1
+  [[ "/${v}/" != *"/../"* ]] || return 1
+}
+
+# config_validate_value <正規化鍵名> <值>：clp config -set 與各模組使用處共用的檢查（不輸出訊息）。
+# 使用者可以手動編輯 clp.local 而繞過 -set，所以使用處也要再檢查一次；沒有檢查規則的鍵回傳 0。
+config_validate_value() {
+  local key="$1" v="$2"
+  case "$key" in
+    CLP_LANG)             [[ "$v" == "auto" || "$v" == "zh_TW" || "$v" == "en_US" ]] ;;
+    PHP_FPM_MAX_CHILDREN) [[ "$v" =~ ^[1-9][0-9]{0,5}$ ]] ;;
+    PHP_FPM_MAX_REQUESTS) [[ "$v" =~ ^(0|[1-9][0-9]{0,8})$ ]] ;;   # 0 = 不回收行程
+    PHP_FPM_IDLE_TIMEOUT) [[ "$v" =~ ^[1-9][0-9]{0,5}[smhd]?$ ]] ;;
+    CF_DEFAULT_MODE)      [[ "$v" =~ ^(off|flexible|full|strict)$ ]] ;;
+    CF_ALWAYS_HTTPS)      [[ "$v" =~ ^(on|off)$ ]] ;;
+    CF_MIN_TLS)           [[ "$v" =~ ^1\.[0-3]$ ]] ;;
+    BACKUP_DIR)           _config_valid_backup_dir "$v" ;;
+    BACKUP_REMOTE_DIR)    _config_valid_remote_dir "$v" ;;
+    BACKUP_TYPE)          [[ "$v" =~ ^(db|full|compact|archive)$ ]] ;;
+    BACKUP_TO)            [[ "$v" =~ ^(local|[A-Za-z0-9_][A-Za-z0-9_.-]*:?)$ ]] ;;
+    BACKUP_EXPIRE)        [[ "$v" == "off" ]] || { [[ "$v" =~ ^([1-9][0-9]{0,3})d$ ]] && (( BASH_REMATCH[1] <= 3650 )); } ;;
+    *)                    return 0 ;;
+  esac
+}
+
+# config_report_invalid <正規化鍵名> <值>：輸出「值不合法」的錯誤訊息（stderr）
+config_report_invalid() {
+  local key="$1" v="$2" disp
+  disp="$(display_config_key "$key")"
+  case "$key" in
+    CLP_LANG)
+      log_error "$(_t "CONFIG_WARN_INVALID_LANG" "$v")" ;;
+    PHP_FPM_MAX_CHILDREN|PHP_FPM_IDLE_TIMEOUT|PHP_FPM_MAX_REQUESTS)
+      log_error "$(_t "CONFIG_ERR_INVALID_PHP_FPM" "$disp" "$v")" ;;
+    *)
+      log_error "$(_t "CONFIG_ERR_INVALID_VALUE" "$disp" "$v" "$(_t "CONFIG_HINT_${key}")")" ;;
+  esac
+}
+
+# config_get_valid <正規化鍵名>：取得設定值並驗證，值輸出到 stdout。
+# 缺值（clp.local、clp.conf、templates/clp.conf 都沒有）或值不合法時，錯誤訊息輸出到 stderr 並回傳 1，
+# 不使用任何寫死的備援值（程式碼中不留預設數值）。
+config_get_valid() {
+  local key="$1" val
+  if ! val="$(clp_conf_read "$key")"; then
+    log_error "$(_t "CONFIG_ERR_MISSING_DEFAULT" "$(display_config_key "$key")")"
+    return 1
+  fi
+  if ! config_validate_value "$key" "$val"; then
+    config_report_invalid "$key" "$val"
+    return 1
+  fi
+  printf '%s\n' "$val"
 }
 
 display_config_key() {
@@ -207,6 +293,21 @@ display_config_key() {
       ;;
     PHP_FPM_MAX_REQUESTS)
       echo "php-max-requests"
+      ;;
+    BACKUP_DIR)
+      echo "backup-dir"
+      ;;
+    BACKUP_REMOTE_DIR)
+      echo "backup-remote-dir"
+      ;;
+    BACKUP_TYPE)
+      echo "backup-type"
+      ;;
+    BACKUP_TO)
+      echo "backup-to"
+      ;;
+    BACKUP_EXPIRE)
+      echo "backup-expire"
       ;;
     *)
       echo "$k"
@@ -252,6 +353,7 @@ show_config_help() {
   echo "======================================================================"
   echo -e "${C_NC}"
   echo -e "${C_DIM}$(_t "CONFIG_HELP_DESC")${C_NC}"
+  echo -e "${C_DIM}$(_t "CONFIG_HELP_FILES")${C_NC}"
   echo ""
   echo -e "${C_BOLD}$(_t "HELP_USAGE_TITLE"):${C_NC}"
   echo "  sudo clp config [options]"
@@ -270,6 +372,8 @@ show_config_help() {
   echo "  sudo clp config -set php-max-children=50"
   echo "  sudo clp config -set php-idle-timeout=60s"
   echo "  sudo clp config -set php-max-requests=500"
+  echo "  sudo clp config -set backup-dir=/root/clpBackup"
+  echo "  sudo clp config -set backup-to=google"
   echo "  sudo clp config -get lang"
   echo "  sudo clp config -get cf-token"
   echo "  sudo clp config -list"
@@ -394,26 +498,15 @@ config_handler() {
       fi
 
       local cf_token_source=""
-      # Validate & normalize language
       if [[ "$canon_key" == "CLP_LANG" ]]; then
-        local norm_l
-        norm_l="$(normalize_lang "$target_val")"
-        if [[ "$norm_l" != "zh_TW" && "$norm_l" != "en_US" ]]; then
-          log_error "$(_t "CONFIG_WARN_INVALID_LANG" "$target_val")"
-          return 1
+        # Normalize language（auto = 依系統 locale 判斷）
+        if [[ "$(echo "$target_val" | tr '[:upper:]' '[:lower:]')" == "auto" ]]; then
+          target_val="auto"
+        else
+          target_val="$(normalize_lang "$target_val")"
         fi
-        target_val="$norm_l"
-      elif [[ "$canon_key" =~ ^PHP_FPM_(MAX_CHILDREN|IDLE_TIMEOUT|MAX_REQUESTS)$ ]]; then
-        # 與 clp php-pm 調校前的檢查相同（php_fpm.sh 的 php_fpm_validate_value）
-        local php_ok=1 php_kind
-        php_kind=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
-        case "$php_kind" in
-          max_children) [[ "$target_val" =~ ^[1-9][0-9]{0,5}$ ]] || php_ok=0 ;;
-          max_requests) [[ "$target_val" =~ ^(0|[1-9][0-9]{0,8})$ ]] || php_ok=0 ;;
-          idle_timeout) [[ "$target_val" =~ ^[1-9][0-9]{0,5}[smhd]?$ ]] || php_ok=0 ;;
-        esac
-        if [[ "$php_ok" -eq 0 ]]; then
-          log_error "$(_t "CONFIG_ERR_INVALID_PHP_FPM" "$target_key" "$target_val")"
+        if ! config_validate_value "$canon_key" "$target_val"; then
+          config_report_invalid "$canon_key" "$target_val"
           return 1
         fi
       elif [[ "$canon_key" == "CF_API_TOKEN" ]]; then
@@ -437,24 +530,30 @@ config_handler() {
           log_error "$(_t "CONFIG_ERR_FILE_NOT_FOUND" "$target_val")"
           return 1
         fi
+      else
+        # 與各模組使用處相同的檢查（config_validate_value）；沒有檢查規則的鍵直接通過
+        if ! config_validate_value "$canon_key" "$target_val"; then
+          config_report_invalid "$canon_key" "$target_val"
+          return 1
+        fi
       fi
 
       # Remove existing keys (including legacy aliases)
       local del_pattern
       del_pattern="$(_config_del_pattern "$canon_key")"
 
-      mkdir -p "$(dirname "$CLP_CONFIG_FILE")"
+      mkdir -p "$(dirname "$CLP_CONFIG_LOCAL_FILE")"
       local tmp_file
       local old_umask
       old_umask=$(umask)
       umask 077
-      tmp_file="$(mktemp "${CLP_CONFIG_FILE}.tmp.XXXXXX")"
+      tmp_file="$(mktemp "${CLP_CONFIG_LOCAL_FILE}.tmp.XXXXXX")"
       umask "$old_umask"
 
       [[ -n "$del_pattern" ]] || { log_error "$(_t "CONFIG_ERR_EMPTY_PATTERN")"; rm -f "$tmp_file"; return 1; }
-      if [[ -f "$CLP_CONFIG_FILE" ]]; then
+      if [[ -f "$CLP_CONFIG_LOCAL_FILE" ]]; then
         local rc=0
-        grep -v -E "$del_pattern" "$CLP_CONFIG_FILE" > "$tmp_file" 2>/dev/null || rc=$?
+        grep -v -E "$del_pattern" "$CLP_CONFIG_LOCAL_FILE" > "$tmp_file" 2>/dev/null || rc=$?
         if [[ "$rc" -gt 1 ]]; then
           log_error "grep error ($rc) while filtering config; aborting to prevent data loss"
           rm -f "$tmp_file"
@@ -469,9 +568,13 @@ config_handler() {
       fi
 
       chmod 600 "$tmp_file"
-      atomic_replace "$tmp_file" "$CLP_CONFIG_FILE"
+      if ! atomic_replace "$tmp_file" "$CLP_CONFIG_LOCAL_FILE"; then
+        rm -f "$tmp_file"
+        log_error "$(_t "CONFIG_ERR_WRITE_FAILED" "$CLP_CONFIG_LOCAL_FILE")"
+        return 1
+      fi
       rm -f "$tmp_file"
-      chmod 600 "$CLP_CONFIG_FILE" 2>/dev/null || true
+      chmod 600 "$CLP_CONFIG_LOCAL_FILE" 2>/dev/null || true
 
       local disp_key
       disp_key="$(display_config_key "$canon_key")"
@@ -521,7 +624,7 @@ config_handler() {
         disp_key="$(display_config_key "$canon_key")"
         if [[ "$canon_key" == "CF_API_TOKEN" ]]; then
           local token_source
-          token_source="$(grep -E '^CF_API_TOKEN_SOURCE=' "$CLP_CONFIG_FILE" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || true)"
+          token_source="$(get_config_value CF_API_TOKEN_SOURCE)"
           if [[ -n "$token_source" ]]; then
             echo "${disp_key} = ${disp_val} ($(_t "CONFIG_LABEL_SOURCE"): ${token_source})"
             return 0
@@ -548,18 +651,18 @@ config_handler() {
       local del_pattern
       del_pattern="$(_config_del_pattern "$canon_key")"
 
-      mkdir -p "$(dirname "$CLP_CONFIG_FILE")"
+      mkdir -p "$(dirname "$CLP_CONFIG_LOCAL_FILE")"
       local tmp_file
       local old_umask
       old_umask=$(umask)
       umask 077
-      tmp_file="$(mktemp "${CLP_CONFIG_FILE}.tmp.XXXXXX")"
+      tmp_file="$(mktemp "${CLP_CONFIG_LOCAL_FILE}.tmp.XXXXXX")"
       umask "$old_umask"
 
       [[ -n "$del_pattern" ]] || { log_error "$(_t "CONFIG_ERR_EMPTY_PATTERN")"; rm -f "$tmp_file"; return 1; }
-      if [[ -f "$CLP_CONFIG_FILE" ]]; then
+      if [[ -f "$CLP_CONFIG_LOCAL_FILE" ]]; then
         local rc=0
-        grep -v -E "$del_pattern" "$CLP_CONFIG_FILE" > "$tmp_file" 2>/dev/null || rc=$?
+        grep -v -E "$del_pattern" "$CLP_CONFIG_LOCAL_FILE" > "$tmp_file" 2>/dev/null || rc=$?
         if [[ "$rc" -gt 1 ]]; then
           log_error "grep error ($rc) while filtering config; aborting to prevent data loss"
           rm -f "$tmp_file"
@@ -568,48 +671,77 @@ config_handler() {
       fi
 
       chmod 600 "$tmp_file"
-      atomic_replace "$tmp_file" "$CLP_CONFIG_FILE"
+      if ! atomic_replace "$tmp_file" "$CLP_CONFIG_LOCAL_FILE"; then
+        rm -f "$tmp_file"
+        log_error "$(_t "CONFIG_ERR_WRITE_FAILED" "$CLP_CONFIG_LOCAL_FILE")"
+        return 1
+      fi
       rm -f "$tmp_file"
-      chmod 600 "$CLP_CONFIG_FILE" 2>/dev/null || true
+      chmod 600 "$CLP_CONFIG_LOCAL_FILE" 2>/dev/null || true
 
       local disp_key
       disp_key="$(display_config_key "$canon_key")"
       log_success "$(_t "CONFIG_SUCCESS_UNSET" "$disp_key")"
+
+      # 恢復為預設值：顯示目前實際生效的值與來源（token 遮蔽）
+      local eff_row eff_val eff_layer
+      if eff_row="$(clp_conf_read_src "$canon_key")"; then
+        eff_val="${eff_row%%$'\t'*}"
+        eff_layer="${eff_row##*$'\t'}"
+        [[ "$eff_layer" == "custom" ]] && eff_layer="$(_t "CONFIG_LABEL_CUSTOM")" || eff_layer="$(_t "CONFIG_LABEL_DEFAULT")"
+        log_info "$(_t "CONFIG_INFO_UNSET_EFFECTIVE" "$disp_key" "$(mask_secret_value "$canon_key" "$eff_val")" "$eff_layer")"
+      fi
       ;;
 
     "list")
       log_info "$(_t "CONFIG_INFO_LIST_HEADER")"
       local count=0
       local cf_source=""
-      cf_source="$(grep -E '^CF_API_TOKEN_SOURCE=' "$CLP_CONFIG_FILE" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || true)"
+      cf_source="$(get_config_value CF_API_TOKEN_SOURCE)"
 
-      while IFS= read -r line || [[ -n "$line" ]]; do
-        # Skip comments and empty lines
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+      # 收集所有出現過的鍵（template、clp.conf、clp.local，依序，去除重複）
+      local -a list_keys=()
+      local seen=" " shipped=" " lf lline lk tplf
+      tplf="$(_clp_conf_template_file)"
+      for lf in "$tplf" "$CLP_CONFIG_FILE" "$CLP_CONFIG_LOCAL_FILE"; do
+        [[ -f "$lf" ]] || continue
+        while IFS= read -r lline || [[ -n "$lline" ]]; do
+          [[ "$lline" =~ ^[[:space:]]*# ]] && continue
+          [[ "$lline" == *=* ]] || continue
+          lk="$(canonical_config_key "$(echo "${lline%%=*}" | tr -d '[:space:]')")"
+          [[ -n "$lk" && "$lk" != "CF_API_TOKEN_SOURCE" ]] || continue
+          [[ "$lf" == "$tplf" ]] && shipped+="${lk} "
+          if [[ "$seen" != *" ${lk} "* ]]; then
+            list_keys+=("$lk")
+            seen+="${lk} "
+          fi
+        done < "$lf"
+      done
 
-        if [[ "$line" == *=* ]]; then
-          local raw_k="${line%%=*}"
-          local raw_v="${line#*=}"
-          raw_k="$(echo "$raw_k" | tr -d '[:space:]')"
-          raw_v="$(echo "$raw_v" | tr -d '"'"'"'[:space:]')"
+      local raw_k row raw_v layer disp_k disp_v
+      if [[ ${#list_keys[@]} -gt 0 ]]; then
+        for raw_k in "${list_keys[@]}"; do
+          # 機密只會出現在使用者層；找不到值的鍵（例如預設檔中的 token）不顯示
+          row="$(clp_conf_read_src "$raw_k")" || continue
+          raw_v="${row%%$'\t'*}"
+          layer="${row##*$'\t'}"
+          if [[ "$layer" == "custom" ]]; then layer="$(_t "CONFIG_LABEL_CUSTOM")"; else layer="$(_t "CONFIG_LABEL_DEFAULT")"; fi
+          # 48 L6：clp.local 中有、但出廠預設已不使用的鍵（token 例外，它本來就不在預設檔中）
+          if [[ "$shipped" != *" ${raw_k} "* && "$raw_k" != "CF_API_TOKEN" ]]; then
+            layer="${layer}, $(_t "CONFIG_LABEL_UNUSED")"
+          fi
 
-          local disp_k
           disp_k="$(display_config_key "$raw_k")"
-          local disp_v
           disp_v="$(mask_secret_value "$raw_k" "$raw_v")"
 
-          # Skip internal metadata key
-          [[ "$raw_k" == "CF_API_TOKEN_SOURCE" ]] && continue
-
           if [[ "$raw_k" == "CF_API_TOKEN" && -n "$cf_source" ]]; then
-            echo -e "  • ${C_CYAN}${disp_k}${C_NC} = ${disp_v} ($(_t "CONFIG_LABEL_SOURCE"): ${cf_source})"
+            echo -e "  • ${C_CYAN}${disp_k}${C_NC} = ${disp_v} (${layer}; $(_t "CONFIG_LABEL_SOURCE"): ${cf_source})"
           else
-            echo -e "  • ${C_CYAN}${disp_k}${C_NC} = ${disp_v}"
+            echo -e "  • ${C_CYAN}${disp_k}${C_NC} = ${disp_v} (${layer})"
           fi
-          ((count++)) || true
-        fi
-      done < "$CLP_CONFIG_FILE"
+          count=$((count + 1))
+        done
+      fi
 
       if [[ $count -eq 0 ]]; then
         echo "  $(_t "CONFIG_INFO_NO_CONFIG")"

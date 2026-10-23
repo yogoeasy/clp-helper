@@ -2537,6 +2537,9 @@ site_clone() {
 
   log_step "$(_t "SITE_CLONE_4" "${source_domain}" "${target_domain}")"
   require_clp_db_server_ready || return 1
+  # 留存的資料庫備份寫入 clp config 的 backup-dir；先讀取，設定不合法時在建立任何東西之前停止
+  local backup_dir
+  backup_dir="$(config_get_valid BACKUP_DIR)" || return 1
 
   # 1. 檢查來源站是否存在
   require_site_exists "$source_domain" "$(_t "SITE_CLONE_5")" || return 1
@@ -2641,7 +2644,6 @@ site_clone() {
 
   # 8. 資料庫複製與留存備份
   log_step "$(_t "SITE_CLONE_18")"
-  local backup_dir="/root/clpBackup"
   mkdir -p "$backup_dir" && chmod 700 "$backup_dir" 2>/dev/null || true
   local timestamp
   timestamp=$(date +"%Y%m%d_%H%M%S")
@@ -3189,6 +3191,10 @@ _migrate_single_site() {
     return 1
   fi
 
+  # 留存的資料庫備份寫入 clp config 的 backup-dir；先讀取，設定不合法時在刪除或建立任何東西之前停止
+  local backup_dir
+  backup_dir="$(config_get_valid BACKUP_DIR)" || return 1
+
   # 探測遠端網站 (比對 CloudPanel 網站清單與 Nginx)
   local remote_info
   remote_info=$(probe_remote_site "$remote_host" "$source_domain") || return 1
@@ -3285,7 +3291,6 @@ _migrate_single_site() {
 
   # 遠端資料庫串流搬移
   log_step "$(_t "SITE__MIGRATE_SINGLE_SITE_10")"
-  local backup_dir="/root/clpBackup"
   mkdir -p "$backup_dir" && chmod 700 "$backup_dir" 2>/dev/null || true
   local timestamp
   timestamp=$(date +"%Y%m%d_%H%M%S")

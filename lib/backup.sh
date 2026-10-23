@@ -17,6 +17,11 @@ if [[ -f "${CLP_ROOT_DIR:-}/lib/php_fpm.sh" ]]; then
   source "${CLP_ROOT_DIR}/lib/php_fpm.sh"
 fi
 
+# 備份預設值（BACKUP_DIR / BACKUP_REMOTE_DIR / BACKUP_TYPE / BACKUP_TO）由 config.sh 讀取
+if ! command -v config_get_valid >/dev/null 2>&1 && [[ -f "${CLP_ROOT_DIR:-}/lib/config.sh" ]]; then
+  source "${CLP_ROOT_DIR}/lib/config.sh"
+fi
+
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
@@ -311,11 +316,18 @@ restore_import_sql() {
 # ------------------------------------------------------------------------------
 # Restore Rollback Helpers
 #   restore_take_snapshot <domain> <siteroot> <db_creds_str>
-#     → 建立快照至 /root/clpBackup/rollback/<domain>-<ts>/
+#     → 建立快照至 <backup-dir>/rollback/<domain>-<ts>/
 #     → 回傳快照目錄路徑（供後續 rollback 使用）
 #   restore_rollback <domain> <siteroot> <siteuser> <snapshot_dir>
 #     → 從快照目錄還原 DB 與檔案
 # ------------------------------------------------------------------------------
+# backup_rollback_base：還原前快照的上層目錄（clp config 的 backup-dir 底下的 rollback/）；設定不合法時回傳 1
+backup_rollback_base() {
+  local b
+  b="$(config_get_valid BACKUP_DIR)" || return 1
+  printf '%s\n' "${b%/}/rollback"
+}
+
 restore_take_snapshot() {
   local domain="$1"
   local siteroot="$2"
@@ -328,18 +340,19 @@ restore_take_snapshot() {
   build_mysql_conn_args "$db_host" >/dev/null
   local mysql_conn_args=("${MYSQL_CONN_ARGS[@]}")
 
-  local rollback_base="/root/clpBackup/rollback"
-  # 自動相容：若歷史版本產生的隱藏目錄 .rollback 存在，自動改名為 rollback
-  if [[ -d "/root/clpBackup/.rollback" && ! -d "$rollback_base" ]]; then
-    mv "/root/clpBackup/.rollback" "$rollback_base" 2>/dev/null || true
+  local rollback_base
+  rollback_base="$(backup_rollback_base)" || return 1
+  # 自動相容：歷史版本在 /root/clpBackup 產生的隱藏目錄 .rollback，改名為 rollback
+  if [[ -d "/root/clpBackup/.rollback" && ! -d "/root/clpBackup/rollback" ]]; then
+    mv "/root/clpBackup/.rollback" "/root/clpBackup/rollback" 2>/dev/null || true
   fi
 
   local timestamp
   timestamp=$(date +"%Y%m%d_%H%M%S")
   local snap_dir="${rollback_base}/${domain}-${timestamp}"
   [[ "$mode" == "none" ]] && snap_dir="${snap_dir}-nosnap"
-  mkdir -p "$snap_dir" || return 1
-  chmod 700 "/root/clpBackup" "$snap_dir" 2>/dev/null || true
+  (umask 077; mkdir -p "$snap_dir") || return 1
+  chmod 700 "$(dirname "$rollback_base")" "$rollback_base" "$snap_dir" 2>/dev/null || true
 
   # 保存快照當下的 DB 憑證；還原失敗時 wp-config.php 可能已被覆寫，rollback 須沿用原憑證
   ( umask 077; printf '%s\n' "$db_creds" > "${snap_dir}/db_creds" ) || { rm -rf "$snap_dir"; return 1; }
@@ -395,7 +408,7 @@ restore_take_snapshot() {
 
 # restore_snapshot_space_check <siteroot> <db_creds>
 #   估算快照需要的空間（網站目錄扣除 CLP_BACKUP_EXCLUDES，加上資料庫大小，再加 10% 餘裕），
-#   與 /root/clpBackup 所在磁碟的剩餘空間比較。設定 SNAP_NEED_BYTES、SNAP_AVAIL_BYTES；空間不足時回傳 1。
+#   與 backup-dir 所在磁碟的剩餘空間比較。設定 SNAP_NEED_BYTES、SNAP_AVAIL_BYTES；空間不足時回傳 1。
 restore_snapshot_space_check() {
   local siteroot="$1" db_creds="$2"
   local need=0 p m sz
@@ -423,9 +436,12 @@ restore_snapshot_space_check() {
   fi
   [[ "$need" -lt 0 ]] && need=0
   need=$((need + need / 10))
-  mkdir -p /root/clpBackup
+  local snap_base
+  snap_base="$(backup_rollback_base)" || return 1
+  snap_base="$(dirname "$snap_base")"
+  (umask 077; mkdir -p "$snap_base") 2>/dev/null || true
   SNAP_NEED_BYTES="$need"
-  SNAP_AVAIL_BYTES=$(df -P -B1 /root/clpBackup 2>/dev/null | awk 'NR==2 {print $4}')
+  SNAP_AVAIL_BYTES=$(df -P -B1 "$snap_base" 2>/dev/null | awk 'NR==2 {print $4}')
   [[ "$SNAP_AVAIL_BYTES" =~ ^[0-9]+$ ]] || return 0
   [[ "$SNAP_AVAIL_BYTES" -ge "$SNAP_NEED_BYTES" ]]
 }
@@ -552,6 +568,16 @@ backup_site() {
   local b_expire="${5:-}"   # e.g. 7d, 30d
 
   domain=$(clean_domain "$domain")
+
+  # 未指定 -path 時的預設位置（clp config: backup-dir / backup-remote-dir），缺值或不合法時在動工前就停止
+  local cfg_local_dir="" cfg_remote_dir=""
+  if [[ -z "$b_path" ]]; then
+    if [[ "$b_to" == "local" ]]; then
+      cfg_local_dir="$(config_get_valid BACKUP_DIR)" || return 1
+    else
+      cfg_remote_dir="$(config_get_valid BACKUP_REMOTE_DIR)" || return 1
+    fi
+  fi
 
   local siteroot
   siteroot=$(find_site_root "$domain" 2>/dev/null || true)
@@ -747,7 +773,7 @@ backup_site() {
   # Transfer Target (Local or Remote)
   # ----------------------------------------------------------------------------
   if [[ "$b_to" == "local" ]]; then
-    local dest_dir="${b_path:-/root/clpBackup}"
+    local dest_dir="${b_path:-${cfg_local_dir}}"
     mkdir -p "$dest_dir"
     chmod 700 "$dest_dir" 2>/dev/null || true
     mv "$target_file" "${dest_dir}/${file_basename}"
@@ -778,8 +804,10 @@ backup_site() {
         esac
 
         # 清理本機超過 N 天之 rollback 快照目錄
-        if [[ -d "/root/clpBackup/rollback" ]]; then
-          find "/root/clpBackup/rollback" -mindepth 1 -maxdepth 1 -type d -name "${domain}-*" -mtime "+${days}" -exec rm -rf {} + 2>/dev/null || true
+        local rb_base
+        rb_base="$(backup_rollback_base 2>/dev/null)" || rb_base=""
+        if [[ -n "$rb_base" && -d "$rb_base" ]]; then
+          find "$rb_base" -mindepth 1 -maxdepth 1 -type d -name "${domain}-*" -mtime "+${days}" -exec rm -rf {} + 2>/dev/null || true
         fi
       fi
     fi
@@ -792,7 +820,7 @@ backup_site() {
       return 1
     }
 
-    local remote_dest_path="${b_path:-clpBackup/${domain}}"
+    local remote_dest_path="${b_path:-${cfg_remote_dir}/${domain}}"
     remote_dest_path=$(echo "$remote_dest_path" | sed 's~^/~~; s~/$~~')
 
     log_step "$(_t "BACKUP_SITE_15" "${remote}" "${remote_dest_path}" "${file_basename}")"
@@ -872,15 +900,35 @@ backup_handler() {
 
   reject_extra_positionals raw_args "to|type|path|expire|exclude|skip-disabled|y|yes" "$domain" "backup" || return 1
 
+  # -type / -to 未指定時使用 clp config 的 backup-type / backup-to
   local b_type
-  b_type=$(opt_get "type" "full")
+  b_type=$(opt_get "type" "")
+  if [[ -z "$b_type" ]]; then
+    b_type="$(config_get_valid BACKUP_TYPE)" || return 1
+  fi
   local b_to
-  b_to=$(opt_get "to" "local")
+  b_to=$(opt_get "to" "")
+  if [[ -z "$b_to" ]]; then
+    b_to="$(config_get_valid BACKUP_TO)" || return 1
+  fi
   b_to="${b_to%:}"
   local b_path
   b_path=$(opt_get "path" "")
+  # 批次備份（all）先檢查一次預設目錄，避免每個網站各報一次錯
+  if [[ -z "$b_path" ]]; then
+    if [[ "$b_to" == "local" ]]; then
+      config_get_valid BACKUP_DIR >/dev/null || return 1
+    else
+      config_get_valid BACKUP_REMOTE_DIR >/dev/null || return 1
+    fi
+  fi
+  # -expire 未指定時使用 clp config 的 backup-expire（出廠值 off = 不清理）；-expire=off 可在單次執行停用
   local b_expire
   b_expire=$(opt_get "expire" "")
+  if [[ -z "$b_expire" ]]; then
+    b_expire="$(config_get_valid BACKUP_EXPIRE)" || return 1
+    [[ "$b_expire" == "off" ]] && b_expire=""
+  fi
   local b_exclude
   b_exclude=$(opt_get "exclude" "")
 
@@ -1002,6 +1050,19 @@ restore_build_rsync_rules() {
 # ------------------------------------------------------------------------------
 # 2. Restore Core Function
 # ------------------------------------------------------------------------------
+# backup-dir 改過之後，舊的備份（含 clone／migrate 之前留存的資料庫）還在原本的預設位置；
+# 該處有這個網站的檔案時提示可用 -path 指定
+CLP_LEGACY_BACKUP_DIR="/root/clpBackup"
+_restore_hint_old_dir() {
+  local domain="$1" search_dir="$2"
+  [[ "${search_dir%/}" == "$CLP_LEGACY_BACKUP_DIR" ]] && return 0
+  [[ -d "$CLP_LEGACY_BACKUP_DIR" ]] || return 0
+  if find "$CLP_LEGACY_BACKUP_DIR" -maxdepth 1 -type f \( -name "${domain}-*.tar.gz" -o -name "${domain}-*.sql.gz" -o -name "${domain}-*.sql" \) -print -quit 2>/dev/null | grep -q .; then
+    log_info "$(_t "BACKUP_RESTORE_HINT_OLD_DIR" "$domain" "$CLP_LEGACY_BACKUP_DIR" "$domain" "$CLP_LEGACY_BACKUP_DIR")"
+  fi
+  return 0
+}
+
 restore_site() {
   local domain="$1"
   local r_file="${2:-}"     # specific backup filename
@@ -1032,6 +1093,18 @@ restore_site() {
   local source_is_remote=0
   [[ "$r_to" != "local" ]] && source_is_remote=1
 
+  # 未指定 -path 時的預設搜尋位置（clp config: backup-dir / backup-remote-dir）
+  local cfg_local_dir="" cfg_remote_dir=""
+  if [[ -z "$r_path" ]]; then
+    if [[ "$source_is_remote" -eq 0 ]]; then
+      cfg_local_dir="$(config_get_valid BACKUP_DIR)" || return 1
+    else
+      cfg_remote_dir="$(config_get_valid BACKUP_REMOTE_DIR)" || return 1
+    fi
+  fi
+  # 還原前快照寫在 backup-dir 底下的 rollback/；先檢查設定，不合法時在確認與下載之前停止
+  backup_rollback_base >/dev/null || return 1
+
   if [[ -z "$selected_file" ]]; then
     log_step "$(_t "BACKUP_SITE_20" "${domain}" "${r_to}")"
 
@@ -1041,7 +1114,8 @@ restore_site() {
     local available_types=()
 
     if [[ "$source_is_remote" -eq 0 ]]; then
-      local search_dir="${r_path:-/root/clpBackup}"
+      local search_dir="${r_path:-${cfg_local_dir}}"
+      [[ -z "$r_path" ]] && _restore_hint_old_dir "$domain" "$search_dir"
       if [[ ! -d "$search_dir" ]]; then
         log_error "$(_t "BACKUP_SITE_21" "${search_dir}")"
         return 1
@@ -1076,7 +1150,7 @@ restore_site() {
     else
       local remote="${r_to%:}"
       backup_validate_remote "$remote" || return 1
-      local remote_dir="${r_path:-clpBackup/${domain}}"
+      local remote_dir="${r_path:-${cfg_remote_dir}/${domain}}"
       remote_dir=$(echo "$remote_dir" | sed 's~^/~~; s~/$~~')
 
       # Query rclone lsl (依日期時間由新到舊排序)
@@ -1172,7 +1246,7 @@ restore_site() {
   if [[ "$source_is_remote" -eq 1 ]]; then
     restore_cache=$(mktemp -d "/tmp/clpRestore.XXXXXX")
     local remote="${r_to%:}"
-    local remote_dir="${r_path:-clpBackup/${domain}}"
+    local remote_dir="${r_path:-${cfg_remote_dir}/${domain}}"
     remote_dir=$(echo "$remote_dir" | sed 's~^/~~; s~/$~~')
 
     log_step "$(_t "BACKUP_SITE_35" "${remote}" "${selected_file}")"
@@ -1185,7 +1259,7 @@ restore_site() {
     }
     local_restore_file="${restore_cache}/${selected_file}"
   else
-    local search_dir="${r_path:-/root/clpBackup}"
+    local search_dir="${r_path:-${cfg_local_dir}}"
     if [[ -f "${search_dir}/${selected_file}" ]]; then
       local_restore_file="${search_dir}/${selected_file}"
     elif [[ -f "$selected_file" ]]; then
@@ -1227,7 +1301,7 @@ restore_site() {
 
   if [[ -n "$snap_problem" ]]; then
     log_error "$snap_problem"
-    log_info "$(_t "BACKUP_SNAPSHOT_HINT_CLEANUP")"
+    log_info "$(_t "BACKUP_SNAPSHOT_HINT_CLEANUP" "$(backup_rollback_base 2>/dev/null)")"
     if [[ "$force_mode" -eq 1 ]]; then
       log_error "$(_t "BACKUP_SNAPSHOT_ERR_AUTO_ABORT")"
       return 1
@@ -1460,8 +1534,12 @@ restore_handler() {
   r_file=$(opt_get "file" "")
   local r_type
   r_type=$(opt_get "type" "")
+  # -to 未指定時使用 clp config 的 backup-to（備份到遠端的主機，還原也預設從同一個遠端找）
   local r_to
-  r_to=$(opt_get "to" "local")
+  r_to=$(opt_get "to" "")
+  if [[ -z "$r_to" ]]; then
+    r_to="$(config_get_valid BACKUP_TO)" || return 1
+  fi
   r_to="${r_to%:}"
   local r_path
   r_path=$(opt_get "path" "")

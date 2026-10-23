@@ -16,6 +16,10 @@ if [[ -z "${CLP_ROOT_DIR:-}" ]]; then
   export CLP_ROOT_DIR
 fi
 
+# 分層設定讀取器（無外部相依，不使用 _t／log_*），供下方語系判斷讀取 clp.local／clp.conf
+# shellcheck source=/dev/null
+source "${CLP_ROOT_DIR}/lib/conf_read.sh"
+
 CLP_CURRENT_LANG="${CLP_CURRENT_LANG:-en_US}"
 export CLP_CURRENT_LANG
 
@@ -53,19 +57,19 @@ _load_locale() {
 init_i18n() {
   local cli_lang="${1:-}"
   local chosen_lang=""
+  local conf_lang=""
 
   # Priority 1: CLI parameter (--lang=... / -lang=...)
   if [[ -n "$cli_lang" ]]; then
     chosen_lang="$cli_lang"
-  # Priority 2: Environment variable CLP_LANG
-  elif [[ -n "${CLP_LANG:-}" ]]; then
+  # Priority 2: Environment variable CLP_LANG（auto 表示沿用下方判斷）
+  elif [[ -n "${CLP_LANG:-}" && "${CLP_LANG}" != "auto" ]]; then
     chosen_lang="${CLP_LANG}"
-  # Priority 3: Global configuration file /etc/clp/clp.conf
+  # Priority 3: clp.local > clp.conf > templates/clp.conf（auto 表示沿用下方的系統 locale 判斷）
   # 註：i18n.sh 為最早被載入以提供 _t 翻譯函式的模組，此時 config.sh 尚未載入（config.sh
-  # 本身亦依賴 _t 函式，若互相 source 會產生循環依賴），故此處保留直接 grep 解析 clp.conf。
-  elif [[ -f "${CLP_CONFIG_FILE:-/etc/clp/clp.conf}" ]] && grep -qE '^(CLP_LANG|lang)=' "${CLP_CONFIG_FILE:-/etc/clp/clp.conf}" 2>/dev/null; then
-    # 與 clp config -get 相同：取最後一筆 (tail -n1)，值取 = 之後全部 (cut -f2-)
-    chosen_lang="$(grep -E '^(CLP_LANG|lang)=' "${CLP_CONFIG_FILE:-/etc/clp/clp.conf}" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]')"
+  # 本身亦依賴 _t 函式，若互相 source 會產生循環依賴），故改用無相依的 conf_read.sh。
+  elif conf_lang="$(clp_conf_read CLP_LANG)" && [[ -n "$conf_lang" && "$conf_lang" != "auto" ]]; then
+    chosen_lang="$conf_lang"
   # Priority 4: System environment variables (LC_ALL, LC_MESSAGES, LANG)
   else
     local sys_locale="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
@@ -138,7 +142,7 @@ _t() {
     printf '%s [%s]' "$key" "$*"
   elif [[ $# -gt 0 ]]; then
     # shellcheck disable=SC2059
-    printf "$pattern" "$@"
+    printf -- "$pattern" "$@"   # "--": some strings start with "-" (e.g. "-y: ...")
   else
     printf '%s' "$pattern"
   fi

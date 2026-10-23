@@ -11,25 +11,25 @@ if [[ -z "${CLP_ROOT_DIR:-}" ]]; then
   exit 1
 fi
 
-PHP_BACKUP_DIR="/root/php"
+# pool 設定的改寫前備份：clp config 的 backup-dir 底下的 php/（由 init_php_backup_dir 設定；舊版固定為 /root/php）
+PHP_BACKUP_DIR=""
 # 全域關聯陣列，記錄批次調校中待重載之 PHP 版本（保留 -g 以確保在 main() 內 source 時提升為全域）
 declare -gA PHP_FPM_RELOAD_VERSIONS=()
 
 # ==============================================================================
 # PHP-FPM Pool 調校參數
 #   優先順序：指令參數 (-max-children= / -idle-timeout= / -max-requests=)
-#             > 環境變數 (PHP_FPM_MAX_CHILDREN 等) > clp config (php-max-children 等) > 預設值
+#             > 環境變數 (PHP_FPM_MAX_CHILDREN 等)
+#             > clp.local (clp config -set php-max-children 等) > clp.conf > templates/clp.conf
+#   預設值（15 / 30s / 300）寫在 templates/clp.conf，程式碼中不留數值。
 # ==============================================================================
-PHP_FPM_DEFAULT_MAX_CHILDREN="35"
-PHP_FPM_DEFAULT_IDLE_TIMEOUT="30s"
-PHP_FPM_DEFAULT_MAX_REQUESTS="300"
 # 載入時保存環境變數覆寫值（之後每次調校前由 php_fpm_resolve_settings 重新決定實際使用的值）
 PHP_FPM_ENV_MAX_CHILDREN="${PHP_FPM_MAX_CHILDREN:-}"
 PHP_FPM_ENV_IDLE_TIMEOUT="${PHP_FPM_IDLE_TIMEOUT:-}"
 PHP_FPM_ENV_MAX_REQUESTS="${PHP_FPM_MAX_REQUESTS:-}"
-PHP_FPM_MAX_CHILDREN="$PHP_FPM_DEFAULT_MAX_CHILDREN"
-PHP_FPM_IDLE_TIMEOUT="$PHP_FPM_DEFAULT_IDLE_TIMEOUT"
-PHP_FPM_MAX_REQUESTS="$PHP_FPM_DEFAULT_MAX_REQUESTS"
+PHP_FPM_MAX_CHILDREN=""
+PHP_FPM_IDLE_TIMEOUT=""
+PHP_FPM_MAX_REQUESTS=""
 PHP_FPM_SETTINGS_SOURCE=""
 
 if ! command -v get_config_value >/dev/null 2>&1 && [[ -f "${CLP_ROOT_DIR}/lib/config.sh" ]]; then
@@ -37,22 +37,27 @@ if ! command -v get_config_value >/dev/null 2>&1 && [[ -f "${CLP_ROOT_DIR}/lib/c
   source "${CLP_ROOT_DIR}/lib/config.sh"
 fi
 
-# _php_fpm_pick <cli_value> <env_value> <config_key> <default>：輸出 "<value>\t<source>"
+# _php_fpm_pick <cli_value> <env_value> <config_key>：輸出 "<value>\t<source>"
+# source：cli／env／config（來自使用者的 clp.local）／default（來自 clp.conf 或 templates/clp.conf）。
+# 找不到任何值時回傳 1（錯誤訊息輸出到 stderr）。
 _php_fpm_pick() {
-  local cli="$1" env="$2" key="$3" def="$4" conf=""
+  local cli="$1" env="$2" key="$3" row="" layer=""
   if [[ -n "$cli" && "$cli" != "true" ]]; then
     printf '%s\tcli\n' "$cli"; return 0
   fi
   if [[ -n "$env" ]]; then
     printf '%s\tenv\n' "$env"; return 0
   fi
-  if command -v get_config_value >/dev/null 2>&1; then
-    conf=$(get_config_value "$key" "")
+  if ! row="$(clp_conf_read_src "$key")"; then
+    log_error "$(_t "CONFIG_ERR_MISSING_DEFAULT" "$(display_config_key "$key")")"
+    return 1
   fi
-  if [[ -n "$conf" ]]; then
-    printf '%s\tconfig\n' "$conf"; return 0
+  layer="${row##*$'\t'}"
+  if [[ "$layer" == "custom" ]]; then
+    printf '%s\tconfig\n' "${row%%$'\t'*}"
+  else
+    printf '%s\tdefault\n' "${row%%$'\t'*}"
   fi
-  printf '%s\tdefault\n' "$def"
 }
 
 _php_fpm_src_label() {
@@ -67,11 +72,11 @@ _php_fpm_src_label() {
 # php_fpm_resolve_settings：決定 PHP_FPM_MAX_CHILDREN / IDLE_TIMEOUT / MAX_REQUESTS 與各自的來源
 php_fpm_resolve_settings() {
   local line v1 s1 v2 s2 v3 s3
-  line=$(_php_fpm_pick "$(opt_get "max-children" "$(opt_get "max_children" "")")" "$PHP_FPM_ENV_MAX_CHILDREN" "PHP_FPM_MAX_CHILDREN" "$PHP_FPM_DEFAULT_MAX_CHILDREN")
+  line=$(_php_fpm_pick "$(opt_get "max-children" "$(opt_get "max_children" "")")" "$PHP_FPM_ENV_MAX_CHILDREN" "PHP_FPM_MAX_CHILDREN") || return 1
   IFS=$'\t' read -r v1 s1 <<< "$line"
-  line=$(_php_fpm_pick "$(opt_get "idle-timeout" "$(opt_get "idle_timeout" "")")" "$PHP_FPM_ENV_IDLE_TIMEOUT" "PHP_FPM_IDLE_TIMEOUT" "$PHP_FPM_DEFAULT_IDLE_TIMEOUT")
+  line=$(_php_fpm_pick "$(opt_get "idle-timeout" "$(opt_get "idle_timeout" "")")" "$PHP_FPM_ENV_IDLE_TIMEOUT" "PHP_FPM_IDLE_TIMEOUT") || return 1
   IFS=$'\t' read -r v2 s2 <<< "$line"
-  line=$(_php_fpm_pick "$(opt_get "max-requests" "$(opt_get "max_requests" "")")" "$PHP_FPM_ENV_MAX_REQUESTS" "PHP_FPM_MAX_REQUESTS" "$PHP_FPM_DEFAULT_MAX_REQUESTS")
+  line=$(_php_fpm_pick "$(opt_get "max-requests" "$(opt_get "max_requests" "")")" "$PHP_FPM_ENV_MAX_REQUESTS" "PHP_FPM_MAX_REQUESTS") || return 1
   IFS=$'\t' read -r v3 s3 <<< "$line"
   PHP_FPM_MAX_CHILDREN="$v1"
   PHP_FPM_IDLE_TIMEOUT="$v2"
@@ -80,18 +85,23 @@ php_fpm_resolve_settings() {
 }
 
 # php_fpm_validate_value <max_children|idle_timeout|max_requests> <value>：clp config -set 與調校前共用的檢查
+# （規則定義在 config.sh 的 config_validate_value，只有一份）
 php_fpm_validate_value() {
   case "$1" in
-    max_children) [[ "$2" =~ ^[1-9][0-9]{0,5}$ ]] ;;
-    max_requests) [[ "$2" =~ ^(0|[1-9][0-9]{0,8})$ ]] ;;   # 0 = 不回收行程
-    idle_timeout) [[ "$2" =~ ^[1-9][0-9]{0,5}[smhd]?$ ]] ;;
+    max_children) config_validate_value PHP_FPM_MAX_CHILDREN "$2" ;;
+    max_requests) config_validate_value PHP_FPM_MAX_REQUESTS "$2" ;;   # 0 = 不回收行程
+    idle_timeout) config_validate_value PHP_FPM_IDLE_TIMEOUT "$2" ;;
     *) return 1 ;;
   esac
 }
 
+# backup-dir 不合法時回傳 1（呼叫端在改寫任何 pool 之前停止）
 init_php_backup_dir() {
+  local base
+  base="$(config_get_valid BACKUP_DIR)" || return 1
+  PHP_BACKUP_DIR="${base%/}/php"
   if [[ ! -d "$PHP_BACKUP_DIR" ]]; then
-    mkdir -p "$PHP_BACKUP_DIR" 2>/dev/null || true
+    (umask 077; mkdir -p "$PHP_BACKUP_DIR") 2>/dev/null || true
   fi
 }
 
@@ -135,7 +145,7 @@ optimize_site_php_fpm() {
   fi
 
   # 參數值驗證（指令參數、環境變數、clp config 的值都會直接寫入 pool 設定）
-  php_fpm_resolve_settings
+  php_fpm_resolve_settings || return 1
   if ! php_fpm_validate_value max_children "$PHP_FPM_MAX_CHILDREN" || \
      ! php_fpm_validate_value max_requests "$PHP_FPM_MAX_REQUESTS" || \
      ! php_fpm_validate_value idle_timeout "$PHP_FPM_IDLE_TIMEOUT"; then
@@ -168,18 +178,18 @@ optimize_site_php_fpm() {
 }
 
 # _php_fpm_write_pool <domain> <php_ver> <pool_file> <key=value>...
-#   改寫 pool 設定：先備份到 /root/php，寫入後以 php-fpm<ver> -t 檢查，失敗時還原。
+#   改寫 pool 設定：先備份到 <backup-dir>/php，寫入後以 php-fpm<ver> -t 檢查，失敗時還原。
 #   回傳 0 = 已變更、3 = 設定已相同（未變更）、1 = 失敗。不重載 PHP-FPM。
 _php_fpm_write_pool() {
   local domain="$1" php_ver="$2" pool_file="$3"
   shift 3
 
-  init_php_backup_dir
+  init_php_backup_dir || return 1
   local timestamp
   timestamp=$(date +"%Y%m%d_%H%M%S")
   local backup_file="${PHP_BACKUP_DIR}/${domain}.conf.backup.${timestamp}"
 
-  # 1. 在暫存目錄產生新的設定，原檔另存一份供還原（不依賴 /root/php 備份是否成功）
+  # 1. 在暫存目錄產生新的設定，原檔另存一份供還原（不依賴 <backup-dir>/php 備份是否成功）
   local work_dir
   work_dir=$(mktemp -d)
   local orig_copy="${work_dir}/orig.conf"
@@ -275,7 +285,7 @@ _php_fpm_reload() {
 # Optimize all sites PHP-FPM pools
 # ------------------------------------------------------------------------------
 optimize_all_php_fpm() {
-  init_php_backup_dir
+  init_php_backup_dir || return 1
 
   log_step "$(_t "PHP_FPM_STEP_BATCH_START")"
 
@@ -594,7 +604,7 @@ php_fpm_handler() {
         log_error "$(_t "PHP_FPM_ERR_TARGET_REQUIRED")"
         return 1
       fi
-      php_fpm_resolve_settings
+      php_fpm_resolve_settings || return 1
       log_info "$(_t "PHP_FPM_INFO_SETTINGS" "$PHP_FPM_SETTINGS_SOURCE")"
       if [[ "$all" -eq 0 ]]; then
         require_site_exists "$domain" "$(_t "PHP_FPM_STEP_OPTIMIZE_SINGLE" "$domain")" || return 1

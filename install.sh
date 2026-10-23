@@ -6,8 +6,8 @@
 
 set -euo pipefail
 
-CLP_VERSION="1.0.2"
-CLP_BUILD_TIME="2026-10-21 11:46:33"
+CLP_VERSION="1.1.0"
+CLP_BUILD_TIME="2026-10-23 11:38:59"
 
 # Colors
 C_RED=$'\033[0;31m'
@@ -26,6 +26,7 @@ LEGACY_TARGET_DIR="/home/clp/clp"
 # ------------------------------------------------------------------------------
 cli_lang=""
 action="install"
+auto_yes=0
 show_help=false
 show_version=false
 
@@ -55,6 +56,10 @@ while [[ $# -gt 0 ]]; do
       show_version=true
       shift
       ;;
+    -y|--yes|-yes)
+      auto_yes=1
+      shift
+      ;;
     *)
       shift
       ;;
@@ -82,18 +87,34 @@ normalize_lang() {
   esac
 }
 
+# read_conf_lang：clp.local > clp.conf > 安裝來源的 templates/clp.conf（與 lib/conf_read.sh 相同的順序）
+# 安裝程式在複製檔案之前就需要判斷語言，不能依賴 lib，所以在這裡內嵌同樣的邏輯。
+read_conf_lang() {
+  local f v
+  for f in /etc/clp/clp.local /etc/clp/clp.conf "${CURRENT_DIR}/templates/clp.conf"; do
+    [[ -f "$f" ]] || continue
+    v="$(grep -E '^(CLP_LANG|lang)=' "$f" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || true)"
+    if [[ -n "$v" ]]; then
+      echo "$v"
+      return 0
+    fi
+  done
+  return 1
+}
+
 detect_language() {
   local chosen_lang=""
+  local conf_lang=""
 
   # Priority 1: CLI parameter (--lang=... / -lang=...)
   if [[ -n "$cli_lang" ]]; then
     chosen_lang="$cli_lang"
-  # Priority 2: Environment variable CLP_LANG
-  elif [[ -n "${CLP_LANG:-}" ]]; then
+  # Priority 2: Environment variable CLP_LANG (auto = follow the system locale)
+  elif [[ -n "${CLP_LANG:-}" && "${CLP_LANG}" != "auto" ]]; then
     chosen_lang="${CLP_LANG}"
-  # Priority 3: Global configuration file (same as clp: clp config -set lang=...)
-  elif [[ -f /etc/clp/clp.conf ]] && grep -qE '^(CLP_LANG|lang)=' /etc/clp/clp.conf 2>/dev/null; then
-    chosen_lang="$(grep -E '^(CLP_LANG|lang)=' /etc/clp/clp.conf 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]')"
+  # Priority 3: Global configuration (same as clp: clp config -set lang=...; auto = follow the system locale)
+  elif conf_lang="$(read_conf_lang)" && [[ -n "$conf_lang" && "$conf_lang" != "auto" ]]; then
+    chosen_lang="$conf_lang"
   # Priority 4: System environment variables (LC_ALL, LC_MESSAGES, LANG)
   else
     local sys_locale="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
@@ -132,6 +153,8 @@ if [[ "$LANG_CODE" == "zh_TW" ]]; then
   MSG_HELP_OPT_UNINSTALL="  --uninstall       從系統中解除安裝 CLP Helper"
   MSG_HELP_OPT_VERSION="  -v, --version     顯示版本資訊"
   MSG_HELP_OPT_HELP="  -h, --help        顯示此說明訊息"
+  MSG_HELP_OPT_YES="  -y, --yes         設定檔需要決定處理方式時，採用建議的選項（不詢問）"
+  MSG_CONF_FAILED="[ERROR] 程式檔已安裝，但 /etc/clp 的設定檔處理失敗（見上方訊息）。修正後請重新執行安裝程式。"
 
   MSG_ROOT_REQ="[ERROR] 請使用 root 權限執行此安裝程式: sudo bash $0"
   MSG_UNINSTALLING="正在解除安裝 CLP Helper..."
@@ -165,6 +188,8 @@ else
   MSG_HELP_OPT_UNINSTALL="  --uninstall       Uninstall CLP Helper from system"
   MSG_HELP_OPT_VERSION="  -v, --version     Show version information"
   MSG_HELP_OPT_HELP="  -h, --help        Show this help message"
+  MSG_HELP_OPT_YES="  -y, --yes         Use the recommended choice when a settings file needs a decision (no prompts)"
+  MSG_CONF_FAILED="[ERROR] The program files were installed, but handling the settings files in /etc/clp failed (see above). Fix it and run the installer again."
 
   MSG_ROOT_REQ="[ERROR] Please run this installer with root privileges: sudo bash $0"
   MSG_UNINSTALLING="Uninstalling CLP Helper..."
@@ -212,6 +237,7 @@ if [[ "$show_help" == "true" ]]; then
   echo -e "${C_BOLD}${MSG_HELP_OPTIONS}${C_NC}"
   echo -e "${MSG_HELP_OPT_LANG}"
   echo -e "${MSG_HELP_OPT_UNINSTALL}"
+  echo -e "${MSG_HELP_OPT_YES}"
   echo -e "${MSG_HELP_OPT_VERSION}"
   echo -e "${MSG_HELP_OPT_HELP}"
   echo ""
@@ -277,6 +303,17 @@ printf "${MSG_TARGET_DIR}" "${TARGET_DIR}"
 echo ""
 
 # ------------------------------------------------------------------------------
+# 8.1 Settings Files Pre-check (/etc/clp; nothing is written)
+#     A file that needs a decision cannot be asked about without a terminal: stop here,
+#     before any program file is replaced, unless -y was given.
+# ------------------------------------------------------------------------------
+conf_args=()
+[[ "$auto_yes" -eq 1 ]] && conf_args+=("-y")
+if ! CLP_ROOT_DIR="$CURRENT_DIR" bash "${CURRENT_DIR}/lib/conf_install.sh" check "${conf_args[@]}"; then
+  exit 1
+fi
+
+# ------------------------------------------------------------------------------
 # 9. Create Target Directories
 # ------------------------------------------------------------------------------
 mkdir -p "$TARGET_DIR"
@@ -323,6 +360,15 @@ if [[ -d "$LEGACY_TARGET_DIR" && "$LEGACY_TARGET_DIR" != "$TARGET_DIR" ]]; then
   printf "${C_YELLOW}${MSG_MIGRATE_LEGACY}${C_NC}" "$LEGACY_TARGET_DIR" "$TARGET_DIR"
   rm -rf "$LEGACY_TARGET_DIR"
   printf "${C_GREEN}${MSG_MIGRATE_LEGACY_DONE}${C_NC}" "$LEGACY_TARGET_DIR"
+fi
+
+# ------------------------------------------------------------------------------
+# 12.2 Settings Files (/etc/clp/clp.conf, cf-rules.conf; migrate files from older versions)
+#      The user's files (*.local) are never overwritten. See lib/conf_install.sh.
+# ------------------------------------------------------------------------------
+if ! CLP_ROOT_DIR="$TARGET_DIR" bash "${TARGET_DIR}/lib/conf_install.sh" apply "${conf_args[@]}"; then
+  echo -e "${C_RED}${MSG_CONF_FAILED}${C_NC}" >&2
+  exit 1
 fi
 
 # ------------------------------------------------------------------------------

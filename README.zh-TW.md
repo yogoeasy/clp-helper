@@ -127,7 +127,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 - 建立指令連結 `/usr/local/bin/clp`，之後在任何目錄都可以直接執行 `clp`。
 - 設定檔案的擁有者與權限，並建立 `/var/log/clp` 日誌目錄。
 
-**更新到最新版**：重新執行上面任一種安裝方式即可。設定檔（`/etc/clp/`）、備份（`/root/clpBackup/`）與網站資料都不會受到影響。
+**更新到最新版**：重新執行上面任一種安裝方式即可。你的設定（`/etc/clp/*.local`）、備份（`/root/clpBackup/`）與網站資料都不會受到影響；舊版留下的設定會自動遷移（見[全域設定管理模組](#7-全域設定管理模組-clp-config)）。
 
 ### 2. 驗證安裝
 
@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.0.2 (建置時間 2026-10-21 11:46:33)`
+輸出範例：`CLP Helper v1.1.0 (建置時間 2026-10-23 11:38:59)`
 
 查看全域功能說明選單：
 
@@ -209,7 +209,7 @@ CLP Helper 內建多語系（i18n）功能，語系代碼遵循 **WordPress 與 
 系統依照以下順序動態判定並載入介面語言：
 1. **命令列參數** (`--lang=...` 或 `-lang=...`)：優先順序最高，直接影響當次指令執行（支援 `--lang=en_US` 或 `--lang=zh_TW`；傳統 `--lang=en` 自動相容對應至 `en_US`）。
 2. **環境變數** (`CLP_LANG`)：可在目前終端機工作階段或全域環境設定中覆寫。
-3. **全域設定檔** (`/etc/clp/clp.conf` 透過 `clp config` 管理)：跨工作階段與使用者的系統全域永久設定。
+3. **全域設定** (`clp config -set lang=...`，存放於 `/etc/clp/clp.local`)：跨工作階段與使用者的系統全域永久設定。出廠預設為 `lang=auto`，表示「依系統 locale 判斷」（第 4 項）。
 4. **系統環境語系** (`LC_ALL`、`LC_MESSAGES`、`LANG`)：
    - 自動辨識 `zh_TW`、`zh_HK`、`zh_MO`、`zh_Hant` 等語系並載入台灣繁體中文 (`zh_TW`)。
    - 其餘國際化語系（如 `en_US`、`en_GB`、`C`、`POSIX` 等）一律預設為英文 (`en_US`)。
@@ -572,7 +572,7 @@ sudo clp site example.com -cf-waf=off
 ```
 
 - **安全設計**：
-  - **Token 四級解析**：自動支援 CLI `--token`、既有 Certbot `/root/.secrets/*.ini` 憑證檔、全域 `/etc/clp/clp.conf` 或環境變數。
+  - **Token 四級解析**：自動支援 CLI `--token`、既有 Certbot `/root/.secrets/*.ini` 憑證檔、全域 `clp config` 設定（`/etc/clp/clp.local`）或環境變數。
   - **自訂規則隔離保護**：僅變更標註 `[CLP]` 前綴之規則，使用者原有業務規則絕不覆蓋。
   - **配額上限檢查**：部署前依 zone 方案檢查自訂規則數量上限（Free 5／Pro 20／Business 100／Enterprise 1000），超過時停止並列出現有規則，避免 API 400 錯誤。
 
@@ -923,7 +923,7 @@ sudo clp backup <domain|all> [options...]
 | 參數 | 預設值 | 說明 |
 | :--- | :--- | :--- |
 | `-type={db\|full\|compact\|archive}` | `full` | • `db`: 僅備份資料庫 (`.sql.gz`)<br>• `full`: 完整打包資料庫與全站實體檔案 (`.tar.gz`；資料庫傾印為封裝最上層的 `backup.sql`，與 `<domain>/` 目錄並排)<br>• `compact`: 精簡備份（不含 DB，uploads 僅保留當年度）<br>• `archive`: 歷年封存（uploads 中今年以外的全部內容，加上 `wp-content/shield`、`WPvivid_Uploads`），與 `compact` 互補 |
-| `-to={local\|<remote>}` | `local` | • `local`: 儲存於本機伺服器 (`/root/clpBackup`)<br>• `<remote>`: 指定 rclone 設定檔中之雲端名稱 (如 `google`, `b2`, `r2`) |
+| `-to={local\|<remote>}` | `local` | • `local`: 儲存於本機伺服器（`backup-dir`，預設 `/root/clpBackup`）<br>• `<remote>`: 指定 rclone 設定檔中之雲端名稱 (如 `google`, `b2`, `r2`) |
 | `-path=<path>` | 依目的地 | 自訂本機目錄或雲端資料夾路徑 |
 | `-expire=<Nd>` | 無 | 自動清除過期備份（如 `-expire=7d` 或 `-expire=30d`），只會清除同類型的備份 |
 | `-exclude=<pattern>` | 無 | 排除特定網站（適用於 `backup all`，支援逗號分隔） |
@@ -1037,7 +1037,7 @@ sudo clp restore example.com -file=example.com-full-20261005_153000.tar.gz -to=b
 - **一律保護**：目前的 `wp-config.php`（備份中的版本另存到快照目錄）、上方列出的快取與備份外掛目錄。
 - **確認提示**：互動模式下會先列出將刪除的項目數量與前 20 筆，輸入 `yes` 才會繼續；使用 `-y` 或 `--force` 時直接執行。
 - **保留舊行為**：加上 `-keep-extra` 只覆蓋、不刪除。
-- **可以復原**：還原前會先建立快照（`/root/clpBackup/rollback/`），涵蓋所有可能被刪除的檔案；還原失敗會自動回復。
+- **可以復原**：還原前會先建立快照（`<backup-dir>/rollback/`，預設 `/root/clpBackup/rollback/`），涵蓋所有可能被刪除的檔案；還原失敗會自動回復。
 
 #### ④ 還原前快照
 
@@ -1173,7 +1173,7 @@ sudo clp httpauth example.com -list=protected
 
 ### 6. PHP-FPM 行程池調校模組 (`clp php-pm`)
 
-針對高負載環境調校 PHP-FPM 行程池參數（`pm.max_children = 35`, `pm.process_idle_timeout = 30s`, `pm.max_requests = 300`）：
+調校 PHP-FPM 行程池參數（預設 `pm.max_children = 15`, `pm.process_idle_timeout = 30s`, `pm.max_requests = 300`）。忙碌中的 PHP worker 每個約使用 100～140 MB 記憶體，15 可以避免單一網站用光一般 2～4 GB 主機的記憶體；較忙的網站可用 `-status` / `-fix` 依實際用量調高（見下方）。1.1.0 之前的版本預設為 35：
 
 調校單一網站 (自動對應網站實際使用的 PHP 版本)：
 
@@ -1189,7 +1189,7 @@ sudo clp php-pm -all
 
 舊寫法 `sudo clp php-pm all` 仍可使用。
 
-- 調校前自動在 `/root/php/` 留下帶有時間戳記之設定檔備份。
+- 調校前自動在 `<backup-dir>/php/`（預設 `/root/clpBackup/php/`；舊版為 `/root/php/`）留下帶有時間戳記之設定檔備份。
 - 調校後自動以 `php-fpm<version> -t` 檢查語法，檢查失敗時立即還原。
 
 #### 自訂調校參數
@@ -1198,7 +1198,7 @@ sudo clp php-pm -all
 
 | 參數 | 指令參數 | `clp config` 設定鍵 | 預設值 | 格式 |
 | :--- | :--- | :--- | :--- | :--- |
-| `pm.max_children` | `-max-children=N` | `php-max-children` | `35` | 1～999999 |
+| `pm.max_children` | `-max-children=N` | `php-max-children` | `15` | 1～999999 |
 | `pm.process_idle_timeout` | `-idle-timeout=T` | `php-idle-timeout` | `30s` | 數字，可加 `s`／`m`／`h`／`d`，例如 `60s`、`5m` |
 | `pm.max_requests` | `-max-requests=N` | `php-max-requests` | `300` | 0～999999999（`0` 表示不回收行程） |
 
@@ -1287,17 +1287,41 @@ sudo clp php-pm -fix -all -exclude="test.,dev."
 
 ### 7. 全域設定管理模組 (`clp config`)
 
-CLP Helper 提供專屬的全域設定管理模組 (`clp config`)，把偏好設定與金鑰儲存在 `/etc/clp/clp.conf`（權限為 600，只有 root 可以讀取）。
+CLP Helper 提供專屬的全域設定管理模組 (`clp config`)，用來保存偏好設定與金鑰。你的設定存放在 `/etc/clp/clp.local`（權限為 600，只有 root 可以讀取）。
+
+#### 設定存放的位置
+
+| 檔案 | 用途 |
+| :--- | :--- |
+| `/etc/clp/clp.conf` | 隨程式安裝的預設值。每次安裝或更新都會覆寫，**請不要編輯**。 |
+| `/etc/clp/clp.local` | **你的**設定。由 `clp config -set` 寫入，安裝或更新都不會覆寫。也可以手動編輯，只需要寫你要修改的項目。 |
+
+每個項目依序讀取，第一個有值的檔案為準：`clp.local`、`clp.conf`、安裝目錄中的 `templates/clp.conf`。`clp config -unset <項目>` 會移除你的值，恢復為預設值。`-set` 會拒絕不合法的值，指令實際使用該值時也會再檢查一次（手動編輯而寫入不合法的值，指令會報錯並停止）。不支援降版：舊版只會讀取 `/etc/clp/clp.conf`。
+
+**安裝與更新時**，`/etc/clp/clp.conf` 與 `/etc/clp/cf-rules.conf` 會依隨程式安裝的範本重新寫入；你的 `*.local` 檔永遠不會被覆寫。可能含有你的設定時，安裝程式會先詢問：
+
+- 舊版留下的 `clp.conf` 或 `cf-rules.conf`（可搬到 `clp.local`／`cf-rules.local`；`clp.local` 已存在時可逐項合併，預設保留 `clp.local` 的值）；
+- 你直接修改過的預設檔（可把你的修改搬到 `.local` 檔）。
+
+第一個選項是建議值；`sudo bash install.sh -y` 會直接採用建議值、不詢問。沒有終端機又沒有 `-y` 時，安裝程式會在修改任何檔案之前停止。被取代的檔案都會保留為 `<檔名>.bak-<時間>`；token 不會顯示在畫面上。`/etc/clp/.shipped/` 存放上次安裝的預設檔副本（只用來判斷你改了哪些值），clp 不會從這裡讀取設定。
 
 #### 支援之設定項目 (Configuration Keys)
 
 | 設定鍵 (Key) | 說明 | 格式與範例 |
 | :--- | :--- | :--- |
-| `lang` | CLP Helper 預設命令列介面語言 | `en_US`, `zh_TW` |
+| `lang` | CLP Helper 預設命令列介面語言 | `auto`（依系統 locale 判斷）、`en_US`、`zh_TW`；預設 `auto` |
 | `cf-token` | Cloudflare API 權杖 (用於邊緣 WAF 與 SSL DNS-01 自動化) | Token 字串或憑證檔路徑 (如 `/root/.secrets/example.ini`) |
-| `php-max-children` | `clp php-pm` 的 `pm.max_children` 預設值 | 1～999999，預設 `35` |
+| `php-max-children` | `clp php-pm` 的 `pm.max_children` 預設值 | 1～999999，預設 `15` |
 | `php-idle-timeout` | `clp php-pm` 的 `pm.process_idle_timeout` 預設值 | 例如 `30s`、`5m`，預設 `30s` |
 | `php-max-requests` | `clp php-pm` 的 `pm.max_requests` 預設值 | 0～999999999，預設 `300` |
+| `cf-default-mode` | `-cf-waf=on` 套用的 Cloudflare SSL 模式 | `off`、`flexible`、`full`、`strict`；預設 `strict` |
+| `cf-always-https` | `-cf-waf=on` 套用的 Cloudflare「Always Use HTTPS」 | `on`、`off`；預設 `on` |
+| `cf-min-tls` | `-cf-waf=on` 套用的 Cloudflare 最低 TLS 版本 | `1.0`～`1.3`；預設 `1.2` |
+| `backup-dir` | 未指定 `-path` 時，`clp backup` / `clp restore` 使用的本機目錄；`clp site -clone` / `-migrate` 留存的資料庫也寫在這裡。改過之後，舊的備份仍在原處，`clp restore` 會提示用 `-path` 指定 | `/home` 以外的絕對路徑；預設 `/root/clpBackup` |
+| `backup-remote-dir` | 未指定 `-path` 時，rclone 遠端上的目錄（實際為 `<值>/<網域>`） | 相對路徑；預設 `clpBackup` |
+| `backup-type` | 未指定 `-type` 時的備份類型 | `db`、`full`、`compact`、`archive`；預設 `full` |
+| `backup-to` | 未指定 `-to` 時的儲存目標（`clp restore` 的來源也相同） | `local` 或 rclone 遠端名稱；預設 `local` |
+| `backup-expire` | 未指定 `-expire` 時，每次 `clp backup` 後刪除超過 N 天的備份。⚠️ 設定後，**每一次**備份（包括排程）都會刪除該網站較舊的備份；本機備份還會一併刪除該網站超過 N 天的還原快照（rollback）。單次執行可用 `-expire=off` 停用 | `off`、`1d`～`3650d`；預設 `off` |
 
 #### 指令語法與範例
 
@@ -1347,7 +1371,7 @@ sudo clp config -get cf-token --raw
 sudo clp config -list
 ```
 
-清除指定設定鍵（恢復為系統預設值）：
+移除你設定的值（恢復為預設值）：
 
 ```bash
 sudo clp config -unset lang
@@ -1416,6 +1440,7 @@ clp-helper/
 │   ├── backup.sh            # 備份與還原模組 (整合 rclone 多雲端與過期清除)
 │   ├── cloudflare.sh        # Cloudflare 整合模組 (DNS-01 憑證與邊緣 WAF 規則部署)
 │   ├── clp_fileops.py       # 安全檔案操作輔助模組 (fd 與 O_NOFOLLOW 防止符號連結攻擊)
+│   ├── conf_read.sh         # 分層設定讀取器 (clp.local > clp.conf > templates)
 │   ├── config.sh            # 全域設定管理模組 (偏好設定與金鑰持久化)
 │   ├── core.sh              # 核心共用庫 (日誌、權限檢查、網域拼字建議、DB 存取)
 │   ├── httpauth.sh          # HTTP Basic 認證防護與 IP 白名單
@@ -1430,6 +1455,7 @@ clp-helper/
 │   └── zh_TW.sh             # 台灣繁體中文語系字典 (zh_TW)
 └── templates/               # 設定檔範本庫
     ├── cf-rules.conf        # Cloudflare 自訂 WAF 規則範本
+    ├── clp.conf             # 隨程式安裝的預設設定 (安裝到 /etc/clp/clp.conf)
     └── nginx-httpauth.conf  # HTTP 認證與 IP 白名單整合範本
 ```
 

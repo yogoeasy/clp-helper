@@ -130,9 +130,12 @@ cf_resolve_credentials() {
     fi
   fi
 
-  # Priority 3: Global config /etc/clp/clp.conf
+  # Priority 3: Global config（token 只讀使用者檔 /etc/clp/clp.local；尚未遷移的舊版 clp.conf 也視為使用者檔）
   if [[ -z "$token" && -z "$credentials_file" ]]; then
-    local conf_file="${CLP_CONFIG_FILE:-/etc/clp/clp.conf}"
+    local conf_file="${CLP_CONFIG_LOCAL_FILE:-/etc/clp/clp.local}"
+    if ! grep -qE '^(CF_API_TOKEN|cf-token|cf_token|cloudflare_api_token)=' "$conf_file" 2>/dev/null; then
+      conf_file="${CLP_CONFIG_FILE:-/etc/clp/clp.conf}"
+    fi
     local conf_val
     conf_val="$(get_config_value CF_API_TOKEN)"
     if [[ -n "$conf_val" ]]; then
@@ -302,14 +305,12 @@ cf_configure_zone_settings() {
   local token="$2"
   local dry_run="${3:-false}"
 
-  # 讀取 clp config 設定（cf-default-mode / cf-always-https / cf-min-tls），未設定時沿用預設值
+  # 讀取設定（cf-default-mode / cf-always-https / cf-min-tls）：clp.local > clp.conf > templates/clp.conf。
+  # 預設值寫在 templates/clp.conf，程式碼中不留備援值；缺值或不合法時報錯並停止（不套用任何 zone 設定）。
   local ssl_mode https_mode min_tls
-  ssl_mode="$(get_config_value CF_DEFAULT_MODE strict)"
-  https_mode="$(get_config_value CF_ALWAYS_HTTPS on)"
-  min_tls="$(get_config_value CF_MIN_TLS 1.2)"
-  [[ "$ssl_mode" =~ ^(off|flexible|full|strict)$ ]] || { log_warn "$(_t "CF_WARN_INVALID_SETTING" "cf-default-mode" "$ssl_mode")"; ssl_mode="strict"; }
-  [[ "$https_mode" =~ ^(on|off)$ ]] || { log_warn "$(_t "CF_WARN_INVALID_SETTING" "cf-always-https" "$https_mode")"; https_mode="on"; }
-  [[ "$min_tls" =~ ^1\.[0-3]$ ]] || { log_warn "$(_t "CF_WARN_INVALID_SETTING" "cf-min-tls" "$min_tls")"; min_tls="1.2"; }
+  ssl_mode="$(config_get_valid CF_DEFAULT_MODE)" || return 1
+  https_mode="$(config_get_valid CF_ALWAYS_HTTPS)" || return 1
+  min_tls="$(config_get_valid CF_MIN_TLS)" || return 1
 
   log_step "$(_t "CF_STEP_CONFIG_SETTINGS")"
 
@@ -358,12 +359,13 @@ cf_load_waf_rules_json() {
     log_error "$(_t "CF_ERR_RULES_FILE_NOT_FOUND" "$custom_conf")"
     return 1
   fi
+  # -rules=<檔案> > /etc/clp/cf-rules.local > /etc/clp/cf-rules.conf > templates/cf-rules.conf
+  # （舊版手動複製、從未修改過的 cf-rules.conf 會略過，改讀 template；修改過的照舊使用）
   if [[ -n "$custom_conf" ]]; then
     conf_file="$custom_conf"
-  elif [[ -f "/etc/clp/cf-rules.conf" ]]; then
-    conf_file="/etc/clp/cf-rules.conf"
-  else
-    conf_file="${CLP_ROOT_DIR}/templates/cf-rules.conf"
+  elif ! conf_file="$(clp_conf_pick_file "${CLP_CONFIG_DIR:-/etc/clp}" cf-rules)"; then
+    log_error "$(_t "CF_ERR_RULES_FILE_NOT_FOUND" "${CLP_ROOT_DIR}/templates/cf-rules.conf")"
+    return 1
   fi
 
   # 只有規則內容用到 ${SERVER_IP} 時才查詢伺服器 IP（使用 core 的 get_server_ip，含 IPv4 格式驗證）

@@ -129,7 +129,7 @@ The installer will automatically:
 - Create the command link `/usr/local/bin/clp`, so `clp` can be run from any directory.
 - Set file ownership and permissions, and create the `/var/log/clp` log directory.
 
-**Updating**: run any of the installation methods again. Your settings (`/etc/clp/`), backups (`/root/clpBackup/`) and site data are not affected.
+**Updating**: run any of the installation methods again. Your settings (`/etc/clp/*.local`), backups (`/root/clpBackup/`) and site data are not affected; settings left by an older version are migrated (see [Global Configuration Management](#7-global-configuration-management-clp-config)).
 
 ### 2. Verify Installation
 
@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.0.2 (build 2026-10-21 11:46:33)`
+Output example:`CLP Helper v1.1.0 (build 2026-10-23 11:38:59)`
 
 Display global help menu:
 
@@ -201,7 +201,7 @@ CLP Helper features a built-in internationalization (i18n) engine adhering to th
 The interface language is dynamically resolved in the following priority order:
 1. **Command-Line Flag** (`--lang=...` or `-lang=...`): Highest priority, applies to the current command invocation (e.g. `--lang=en_US` or `--lang=zh_TW`; legacy `--lang=en` automatically maps to `en_US`).
 2. **Environment Variable** (`CLP_LANG`): Session-wide or persistent override in shell profiles.
-3. **Global Configuration File** (`/etc/clp/clp.conf` via `clp config`): Persistent system-wide setting across all users and sessions.
+3. **Global Configuration** (`clp config -set lang=...`, stored in `/etc/clp/clp.local`): Persistent system-wide setting across all users and sessions. The shipped default is `lang=auto`, which means "follow the system locale" (step 4).
 4. **System Environment Locale** (`LC_ALL`, `LC_MESSAGES`, `LANG`):
    - Locales such as `zh_TW`, `zh_HK`, `zh_MO`, and `zh_Hant` automatically map to Taiwan Traditional Chinese (`zh_TW`).
    - All other system locales (e.g. `en_US`, `en_GB`, `C`, `POSIX`) default to English (`en_US`).
@@ -564,7 +564,7 @@ sudo clp site example.com -cf-waf=off
 ```
 
 - **Key Security Highlights**:
-  - **4-Level Token Cascade**: Supports CLI `--token`, existing Certbot `/root/.secrets/*.ini` files, global `/etc/clp/clp.conf`, or environment variables.
+  - **4-Level Token Cascade**: Supports CLI `--token`, existing Certbot `/root/.secrets/*.ini` files, global `clp config` token (`/etc/clp/clp.local`), or environment variables.
   - **Namespace Isolation**: Only rules prefixed with `[CLP]` are managed; existing user rules are never overwritten or removed.
   - **Quota Guard**: Checks custom rules limit against zone plan (Free 5 / Pro 20 / Business 100 / Enterprise 1000) before deploying, aborting and listing existing rules if exceeded to prevent API 400 errors.
 
@@ -915,7 +915,7 @@ sudo clp backup <domain|all> [options...]
 | Option | Default | Description |
 | :--- | :--- | :--- |
 | `-type={db\|full\|compact\|archive}` | `full` | • `db`: Database only (`.sql.gz`)<br>• `full`: Complete archive of DB and all site files (`.tar.gz`; the DB dump is `backup.sql` at the archive top level, beside the `<domain>/` directory)<br>• `compact`: Files without DB (current-year uploads only)<br>• `archive`: Past years' uploads (everything in uploads except the current year, plus `wp-content/shield` and `WPvivid_Uploads`); complements `compact` |
-| `-to={local\|<remote>}` | `local` | • `local`: Local server storage (`/root/clpBackup`)<br>• `<remote>`: Remote target defined in rclone config (`google`, `b2`, `r2`) |
+| `-to={local\|<remote>}` | `local` | • `local`: Local server storage (`backup-dir`, default `/root/clpBackup`)<br>• `<remote>`: Remote target defined in rclone config (`google`, `b2`, `r2`) |
 | `-path=<path>` | By destination | Custom local or remote folder path |
 | `-expire=<Nd>` | None | Automatically remove expired backups of the same type (`-expire=7d`, `-expire=30d`) |
 | `-exclude=<pattern>` | None | Exclude specific sites (for `backup all`, comma-separated) |
@@ -1029,7 +1029,7 @@ By default, a file restore deletes files on the site that are not in the backup 
 - **Always protected**: the current `wp-config.php` (the backup's copy is saved in the snapshot folder) and the cache and backup-plugin folders listed above.
 - **Confirmation**: in interactive mode, the number of items to be deleted and the first 20 are shown, and you must type `yes` to continue; with `-y` or `--force` it proceeds directly.
 - **Previous behavior**: add `-keep-extra` to overwrite without deleting.
-- **Recoverable**: a snapshot is taken before every restore (`/root/clpBackup/rollback/`) and covers every file that can be deleted; a failed restore is rolled back automatically.
+- **Recoverable**: a snapshot is taken before every restore (`<backup-dir>/rollback/`, default `/root/clpBackup/rollback/`) and covers every file that can be deleted; a failed restore is rolled back automatically.
 
 #### ④ Pre-Restore Snapshot
 
@@ -1165,7 +1165,7 @@ sudo clp httpauth example.com -list=protected
 
 ### 6. PHP-FPM Pool Tuning (`clp php-pm`)
 
-Tuning PHP-FPM pool parameters for high-traffic workloads (`pm.max_children = 35`, `pm.process_idle_timeout = 30s`, `pm.max_requests = 300`):
+Tuning PHP-FPM pool parameters (defaults `pm.max_children = 15`, `pm.process_idle_timeout = 30s`, `pm.max_requests = 300`). A busy PHP worker uses about 100–140 MB, so 15 keeps one site from using up the memory of a typical 2–4 GB server; for busy sites, `-status` / `-fix` raise it from their actual usage (see below). Versions before 1.1.0 used 35:
 
 Optimize single site (auto-detects active PHP version):
 
@@ -1181,7 +1181,7 @@ sudo clp php-pm -all
 
 The older form `sudo clp php-pm all` still works.
 
-- Automatic timestamped backup saved to `/root/php/` prior to any change.
+- Automatic timestamped backup saved to `<backup-dir>/php/` (default `/root/clpBackup/php/`; older versions used `/root/php/`) prior to any change.
 - Syntax testing via `php-fpm<version> -t` with instant automatic rollback upon syntax errors.
 
 #### Custom Pool Values
@@ -1190,7 +1190,7 @@ All three values can be passed when tuning one site or `-all`, or stored as defa
 
 | Setting | Command option | `clp config` key | Default | Format |
 | :--- | :--- | :--- | :--- | :--- |
-| `pm.max_children` | `-max-children=N` | `php-max-children` | `35` | 1–999999 |
+| `pm.max_children` | `-max-children=N` | `php-max-children` | `15` | 1–999999 |
 | `pm.process_idle_timeout` | `-idle-timeout=T` | `php-idle-timeout` | `30s` | number, optionally with `s`/`m`/`h`/`d`, e.g. `60s`, `5m` |
 | `pm.max_requests` | `-max-requests=N` | `php-max-requests` | `300` | 0–999999999 (`0` = never recycle workers) |
 
@@ -1279,17 +1279,41 @@ How the suggestion is calculated:
 
 ### 7. Global Configuration Management (`clp config`)
 
-CLP Helper provides a dedicated configuration management module (`clp config`) to safely persist system preferences and API credentials in `/etc/clp/clp.conf` (strictly secured with `chmod 600`, accessible only by `root`).
+CLP Helper provides a dedicated configuration management module (`clp config`) to safely persist system preferences and API credentials. Your settings are stored in `/etc/clp/clp.local` (strictly secured with `chmod 600`, accessible only by `root`).
+
+#### Where Settings Are Stored
+
+| File | Purpose |
+| :--- | :--- |
+| `/etc/clp/clp.conf` | Shipped default values. Overwritten on every install or update: **do not edit it**. |
+| `/etc/clp/clp.local` | **Your** settings. Written by `clp config -set`, never overwritten by an install or update. You may also edit it by hand; list only the keys you want to change. |
+
+For each key the first file that has a value wins: `clp.local`, then `clp.conf`, then `templates/clp.conf` in the installation directory. `clp config -unset <key>` removes your value, so the default applies again. Invalid values are rejected by `-set`, and are checked again when a command uses them (an invalid hand-edited value stops the command with an error). Downgrading to an older version is not supported: older versions only read `/etc/clp/clp.conf`.
+
+**On install and update**, `/etc/clp/clp.conf` and `/etc/clp/cf-rules.conf` are (re)written from the shipped templates; your `*.local` files are never overwritten. The installer asks before it changes anything that could hold your settings:
+
+- a `clp.conf` or `cf-rules.conf` from an older version (it offers to move it to `clp.local` / `cf-rules.local`; when `clp.local` already exists it offers a per-key merge, keeping `clp.local`'s values by default);
+- a default file you edited by hand (it offers to move your changes to the `.local` file).
+
+The first choice shown is the recommended one; `sudo bash install.sh -y` uses it without asking. Without a terminal and without `-y`, the installer stops before changing anything. Every replaced file is kept as `<file>.bak-<time>`; tokens are never printed. `/etc/clp/.shipped/` holds a copy of the last installed defaults (used only to tell which values you changed); clp does not read settings from it.
 
 #### Supported Configuration Keys
 
 | Key | Description | Allowed Values / Format |
 | :--- | :--- | :--- |
-| `lang` | Default CLI interface language | `en_US`, `zh_TW` |
+| `lang` | Default CLI interface language | `auto` (follow the system locale), `en_US`, `zh_TW`; default `auto` |
 | `cf-token` | Cloudflare API Token for edge WAF & SSL DNS-01 automation | Token string or credentials file path (e.g. `/root/.secrets/example.ini`) |
-| `php-max-children` | Default `pm.max_children` for `clp php-pm` | 1–999999, default `35` |
+| `php-max-children` | Default `pm.max_children` for `clp php-pm` | 1–999999, default `15` |
 | `php-idle-timeout` | Default `pm.process_idle_timeout` for `clp php-pm` | e.g. `30s`, `5m`, default `30s` |
 | `php-max-requests` | Default `pm.max_requests` for `clp php-pm` | 0–999999999, default `300` |
+| `cf-default-mode` | Cloudflare SSL mode applied by `-cf-waf=on` | `off`, `flexible`, `full`, `strict`; default `strict` |
+| `cf-always-https` | Cloudflare "Always Use HTTPS" applied by `-cf-waf=on` | `on`, `off`; default `on` |
+| `cf-min-tls` | Cloudflare minimum TLS version applied by `-cf-waf=on` | `1.0`–`1.3`; default `1.2` |
+| `backup-dir` | Local directory used by `clp backup` / `clp restore` when `-path` is not given, and for the database copy kept by `clp site -clone` / `-migrate`. After changing it, older backups stay where they were; `clp restore` points them out (use `-path`) | Absolute path outside `/home`; default `/root/clpBackup` |
+| `backup-remote-dir` | Directory on the rclone remote when `-path` is not given (`<value>/<domain>`) | Relative path; default `clpBackup` |
+| `backup-type` | Backup type when `-type` is not given | `db`, `full`, `compact`, `archive`; default `full` |
+| `backup-to` | Destination (and `clp restore` source) when `-to` is not given | `local` or an rclone remote name; default `local` |
+| `backup-expire` | Delete backups older than N days after each `clp backup` when `-expire` is not given. ⚠️ When set, **every** backup run (including cron) deletes that site's older backups, and for local backups also its restore rollback snapshots older than N days. `-expire=off` disables it for one run | `off`, `1d`–`3650d`; default `off` |
 
 #### Available Commands & Examples
 
@@ -1339,7 +1363,7 @@ List all current global configuration parameters:
 sudo clp config -list
 ```
 
-Remove a configured key (reverts to system default):
+Remove your value for a key (the shipped default applies again):
 
 ```bash
 sudo clp config -unset lang
@@ -1404,6 +1428,7 @@ clp-helper/
 │   ├── backup.sh            # Backup & restore (rclone multi-cloud integration)
 │   ├── cloudflare.sh        # Cloudflare integration (DNS-01 SSL, edge WAF)
 │   ├── clp_fileops.py       # Secure file operations helper (O_NOFOLLOW / fd)
+│   ├── conf_read.sh         # Layered settings reader (clp.local > clp.conf > templates)
 │   ├── config.sh            # Global configuration management (clp config)
 │   ├── core.sh              # Core utilities (logging, checks, DB access, typos)
 │   ├── httpauth.sh          # HTTP Basic auth & IP whitelisting
@@ -1418,6 +1443,7 @@ clp-helper/
 │   └── zh_TW.sh             # Taiwan Traditional Chinese locale strings (zh_TW)
 └── templates/               # Configuration templates
     ├── cf-rules.conf        # Cloudflare custom WAF rules template
+    ├── clp.conf             # Shipped default settings (installed to /etc/clp/clp.conf)
     └── nginx-httpauth.conf  # HTTP authentication template
 ```
 
