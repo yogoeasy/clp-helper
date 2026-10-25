@@ -6,8 +6,8 @@
 
 set -euo pipefail
 
-CLP_VERSION="1.2.0"
-CLP_BUILD_TIME="2026-10-25 16:05:18"
+CLP_VERSION="1.3.0"
+CLP_BUILD_TIME="2026-10-25 18:15:01"
 
 # Colors
 C_RED=$'\033[0;31m'
@@ -29,6 +29,7 @@ action="install"
 auto_yes=0
 show_help=false
 show_version=false
+unknown_args=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,6 +62,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     *)
+      # 不認得的參數（例如打錯的 --unistall）不可變成一般安裝；語系決定後再報錯
+      unknown_args+=("$1")
       shift
       ;;
   esac
@@ -146,6 +149,7 @@ export CLP_LANG="$LANG_CODE"
 # ------------------------------------------------------------------------------
 if [[ "$LANG_CODE" == "zh_TW" ]]; then
   MSG_HELP_BANNER="CLP Helper (clp) 安裝程式"
+  MSG_ERR_UNKNOWN_ARG="[ERROR] 不認得的參數：%s（可用的選項見 --help）。沒有做任何變更。\n"
   MSG_HELP_USAGE="使用方式:"
   MSG_HELP_USAGE_CMD="  sudo bash install.sh [選項]"
   MSG_HELP_OPTIONS="選項:"
@@ -181,6 +185,7 @@ if [[ "$LANG_CODE" == "zh_TW" ]]; then
   MSG_MIGRATE_LEGACY_DONE="[✔] 舊版安裝目錄已成功遷移並移除 (%s)。\n"
 else
   MSG_HELP_BANNER="CLP Helper (clp) Installer"
+  MSG_ERR_UNKNOWN_ARG="[ERROR] Unknown argument: %s (see --help for the options). Nothing was changed.\n"
   MSG_HELP_USAGE="Usage:"
   MSG_HELP_USAGE_CMD="  sudo bash install.sh [options]"
   MSG_HELP_OPTIONS="Options:"
@@ -219,6 +224,12 @@ fi
 # ------------------------------------------------------------------------------
 # 4. Handle Help & Version Options
 # ------------------------------------------------------------------------------
+if [[ ${#unknown_args[@]} -gt 0 ]]; then
+  # shellcheck disable=SC2059
+  printf "$MSG_ERR_UNKNOWN_ARG" "${unknown_args[*]}" >&2
+  exit 1
+fi
+
 if [[ "$show_version" == "true" ]]; then
   if [[ "$LANG_CODE" == "zh_TW" ]]; then
     echo "CLP Helper v${CLP_VERSION} (建置時間 ${CLP_BUILD_TIME})"

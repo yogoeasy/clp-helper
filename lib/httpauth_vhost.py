@@ -89,7 +89,8 @@ def block_end(text, open_idx):
                 quote = None
         elif c in ('"', "'"):
             quote = c
-        elif c == '#':
+        elif c == '#' and (i == 0 or text[i - 1] in ' \t\r\n;{}'):
+            # nginx 只在 token 開頭把 # 當成註解（location ~ ^/a#b 的 # 是 regex 的一部分）
             nl = text.find('\n', i)
             i = n if nl == -1 else nl
             continue
@@ -121,7 +122,7 @@ def code_chars(text, start, end):
             quote = c
             i += 1
             continue
-        if c == '#':
+        if c == '#' and (i == 0 or text[i - 1] in ' \t\r\n;{}'):
             nl = text.find('\n', i, end)
             if nl == -1:
                 return

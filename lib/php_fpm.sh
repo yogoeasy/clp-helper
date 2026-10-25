@@ -49,7 +49,7 @@ _php_fpm_pick() {
     printf '%s\tenv\n' "$env"; return 0
   fi
   if ! row="$(clp_conf_read_src "$key")"; then
-    log_error "$(_t "CONFIG_ERR_MISSING_DEFAULT" "$(display_config_key "$key")")"
+    log_error "$(_t "CONFIG_ERR_MISSING_DEFAULT" "$(display_config_key "$key")" "$(display_config_key "$key")")"
     return 1
   fi
   layer="${row##*$'\t'}"
@@ -109,6 +109,8 @@ init_php_backup_dir() {
 # Optimize a single site's PHP-FPM pool configuration
 # ------------------------------------------------------------------------------
 optimize_site_php_fpm() {
+  # 批次統計用：updated／unchanged（已是這些值）／skipped（非 ondemand）；失敗時維持空字串並回傳 1
+  PHP_FPM_LAST_RESULT=""
   local domain
   domain=$(clean_domain "$1")
   local php_ver="${2:-}"
@@ -159,12 +161,22 @@ optimize_site_php_fpm() {
   pm_mode=$(awk -F'=' '/^[[:space:]]*pm[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); v=$2} END{print v}' "$pool_file")
   if [[ "$pm_mode" != "ondemand" ]]; then
     log_warn "$(_t "PHP_FPM_WARN_NOT_ONDEMAND" "$domain" "${pm_mode:-unknown}")"
+    PHP_FPM_LAST_RESULT="skipped"
     return 0
   fi
 
   # -dry-run：只顯示將套用的值，不寫入、不重載
   if [[ "${PHP_FPM_DRY_RUN:-0}" -eq 1 ]]; then
     log_info "$(_t "PHP_FPM_INFO_DRY_RUN_SITE" "$domain" "$php_ver" "$PHP_FPM_MAX_CHILDREN" "$PHP_FPM_IDLE_TIMEOUT" "$PHP_FPM_MAX_REQUESTS")"
+    # 三個值都已相同時算「原本就是這些值」（與實際執行時的統計一致）
+    if awk -F'=' -v mc="$PHP_FPM_MAX_CHILDREN" -v it="$PHP_FPM_IDLE_TIMEOUT" -v mr="$PHP_FPM_MAX_REQUESTS" '
+        { k = $1; v = $2; gsub(/[[:space:]]/, "", k); gsub(/[[:space:]]/, "", v) }
+        k == "pm.max_children" { c = v } k == "pm.process_idle_timeout" { t = v } k == "pm.max_requests" { r = v }
+        END { exit (c == mc && t == it && r == mr) ? 0 : 1 }' "$pool_file"; then
+      PHP_FPM_LAST_RESULT="unchanged"
+    else
+      PHP_FPM_LAST_RESULT="updated"
+    fi
     return 0
   fi
 
@@ -175,10 +187,12 @@ optimize_site_php_fpm() {
     "pm.max_requests=${PHP_FPM_MAX_REQUESTS}" || rc=$?
   if [[ "$rc" -eq 3 ]]; then
     log_info "$(_t "PHP_FPM_INFO_ALREADY_OPTIMIZED" "$domain" "$php_ver" "$PHP_FPM_MAX_CHILDREN" "$PHP_FPM_IDLE_TIMEOUT" "$PHP_FPM_MAX_REQUESTS")"
+    PHP_FPM_LAST_RESULT="unchanged"
     return 0
   fi
   [[ "$rc" -ne 0 ]] && return 1
   log_success "$(_t "PHP_FPM_SUCCESS_UPDATED" "$domain" "$php_ver" "$PHP_FPM_MAX_CHILDREN" "$PHP_FPM_IDLE_TIMEOUT" "$PHP_FPM_MAX_REQUESTS")"
+  PHP_FPM_LAST_RESULT="updated"
   _php_fpm_reload_or_defer "$php_ver"
   return 0
 }
@@ -243,14 +257,20 @@ _php_fpm_write_pool() {
     fpm_bin="/usr/sbin/php-fpm${php_ver}"
   fi
   if [[ -n "$fpm_bin" ]]; then
-    if "$fpm_bin" -t >/dev/null 2>&1; then
+    local fpm_test_out=""
+    if fpm_test_out=$("$fpm_bin" -t 2>&1); then
       log_info "$(_t "PHP_FPM_INFO_SYNTAX_OK" "$php_ver")"
     else
       log_error "$(_t "PHP_FPM_ERR_SYNTAX_FAILED" "$php_ver")"
+      # -t 會檢查該版本所有 pool：顯示 php-fpm 的錯誤行，才知道是哪個 pool 有問題（可能不是這個網站）
+      printf '%s\n' "$fpm_test_out" | grep -E 'ERROR|ALERT' | head -n 5 >&2 || true
       atomic_replace "$orig_copy" "$pool_file"
       rm -rf "$work_dir"
       return 1
     fi
+  else
+    # 找不到 php-fpm<版本>：無法檢查語法，照樣寫入但要提醒
+    log_warn "$(_t "PHP_FPM_WARN_NO_SYNTAX_CHECK" "$php_ver")"
   fi
   rm -rf "$work_dir"
   return 0
@@ -354,7 +374,7 @@ optimize_all_php_fpm() {
     return 0
   fi
 
-  local updated_count=0
+  local updated_count=0 unchanged_count=0 skipped_count=0
   local failed_count=0
   # 全部 pool 改完後，每個有變更的 PHP 版本只重載一次
   PHP_FPM_RELOAD_VERSIONS=()
@@ -380,7 +400,11 @@ optimize_all_php_fpm() {
 
     log_info "$(_t "PHP_FPM_INFO_PROCESSING_SITE" "$site_name" "$s_ver")"
     if optimize_site_php_fpm "$site_name" "$s_ver"; then
-      updated_count=$((updated_count + 1))
+      case "$PHP_FPM_LAST_RESULT" in
+        unchanged) unchanged_count=$((unchanged_count + 1)) ;;
+        skipped) skipped_count=$((skipped_count + 1)) ;;
+        *) updated_count=$((updated_count + 1)) ;;
+      esac
     else
       failed_count=$((failed_count + 1))
     fi
@@ -392,7 +416,7 @@ optimize_all_php_fpm() {
   done
 
   echo ""
-  log_info "$(_t "PHP_FPM_INFO_BATCH_COMPLETE" "$updated_count" "$failed_count")"
+  log_info "$(_t "PHP_FPM_INFO_BATCH_COMPLETE" "$updated_count" "$unchanged_count" "$skipped_count" "$failed_count")"
 }
 
 # ------------------------------------------------------------------------------
@@ -412,7 +436,12 @@ php_pm_load() {
   local out rc=0 line kind
   out=$(php_pm_py status "$@" 2>&1) || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    log_error "$(_t "PHP_PM_ERR_ANALYZE" "$out")"
+    # php_pm.py 以 clp-error:<代碼>:<網域> 回報可預期的錯誤，這裡翻譯；其他（系統錯誤）照原文顯示
+    case "$out" in
+      clp-error:no-pool:*) log_error "$(_t "PHP_PM_ERR_NO_POOL" "${out#clp-error:no-pool:}")" ;;
+      clp-error:invalid-domain:*) log_error "$(_t "PHP_PM_ERR_INVALID_DOMAIN" "${out#clp-error:invalid-domain:}")" ;;
+      *) log_error "$(_t "PHP_PM_ERR_ANALYZE" "$out")" ;;
+    esac
     return 1
   fi
   PHP_PM_ROWS=()
@@ -596,7 +625,7 @@ php_fpm_handler() {
   local mode=""
   has_opt "status" && mode="status"
   if has_opt "fix"; then
-    [[ -n "$mode" ]] && { log_error "$(_t "PHP_FPM_ERR_TARGET_REQUIRED")"; return 1; }
+    [[ -n "$mode" ]] && { log_error "$(_t "PHP_PM_ERR_STATUS_WITH_FIX")"; return 1; }
     mode="fix"
   fi
   if [[ -n "$mode" ]]; then
@@ -612,6 +641,10 @@ php_fpm_handler() {
 
   case "$mode" in
     status)
+      # 網域與 -all 同時指定時報錯（與 -fix 相同），不可默默忽略網域
+      if [[ "$all" -eq 1 && -n "$domain" ]]; then
+        log_error "$(_t "SITE_CF_ONLY_ERR_ALL_WITH_DOMAIN")"; return 1
+      fi
       if [[ "$all" -eq 1 || -z "$domain" ]]; then
         php_pm_status
       else

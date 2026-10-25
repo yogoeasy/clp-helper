@@ -138,7 +138,7 @@ backup_validate_remote() {
     return 1
   fi
 
-  if ! echo "$remotes" | grep -E -q "^${remote}:"; then
+  if ! echo "$remotes" | grep -Fxq "${remote}:"; then
     log_error "$(_t "BACKUP_VALIDATE_REMOTE_3" "${remote}")"
     echo -e "$(_t "BACKUP_VALIDATE_REMOTE_4")"
     echo "$remotes" | while read -r r; do
@@ -162,9 +162,44 @@ backup_get_site_db_credentials() {
     return 0
   fi
 
-  python3 -I - "$wpconfig" << 'PYEOF'
-import re, sys
-src = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+  # 以 clp_fileops 讀取（不跟隨 symlink）；讀不到時與沒有 wp-config.php 相同（欄位留空）
+  if [[ -L "$wpconfig" ]]; then
+    log_warn "$(_t "BACKUP_WARN_WPCONFIG_SYMLINK" "$wpconfig")" >&2
+  fi
+  CLP_LIB_DIR="${CLP_LIB_DIR}" python3 -I - "$wpconfig" << 'PYEOF'
+import os, re, sys
+sys.path.insert(0, os.environ.get("CLP_LIB_DIR", "/usr/local/lib/clp-helper/lib"))
+import clp_fileops
+try:
+    raw = clp_fileops.read_text_nofollow(sys.argv[1])
+except Exception:
+    raw = ""
+
+def strip_php_comments(s):
+    # 移除字串外的 //、#、/* */ 註解，被註解掉的 define() 不採用；字串內的 // 與 # 保留
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in "\x27\"":
+            j = i + 1
+            while j < n and s[j] != c:
+                j += 2 if s[j] == "\\" else 1
+            out.append(s[i:j + 1])
+            i = j + 1
+        elif s.startswith("/*", i):
+            j = s.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+        elif c == "#" or s.startswith("//", i):
+            j = s.find("\n", i)
+            i = n if j < 0 else j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+src = strip_php_comments(raw)
 def decode_php_str(val, quote_char):
     if quote_char == "\x27":
         return re.sub(r"\\([\\'\x27])", r"\1", val)
@@ -310,11 +345,17 @@ backup_db_check() {
   return 1
 }
 
+# backup_tar_create <tar 參數...>：封裝含 DB dump 與 wp-config，先 umask 077 再建立（不先寫再 chmod）
+backup_tar_create() {
+  ( umask 077; tar "$@" )
+}
+
 # backup_db_dump <db_creds> <outfile> <gzip:0|1> [mysqldump 選項...]
 #   以 mysqldump 匯出（網站帳號，-db-root 時再試 root）；gzip=1 時邊匯出邊壓縮，不需要額外空間
 backup_db_dump() {
   local db_creds="$1" outfile="$2" gz="$3" who
   shift 3
+  ( umask 077; : > "$outfile" ) || return 1
   for who in site root; do
     [[ "$who" == "root" ]] && ! backup_db_root_allowed && break
     backup_db_conn "$db_creds" "$who" || continue
@@ -504,7 +545,7 @@ restore_take_snapshot() {
   if [[ -d "$siteroot" ]]; then
     backup_tar_exclude_args "$(basename "$siteroot")"
     local tar_rc=0
-    tar --warning=no-file-changed -czf "$snap_files" \
+    backup_tar_create --warning=no-file-changed -czf "$snap_files" \
       "${BACKUP_TAR_EXCLUDES[@]}" \
       -C "$(dirname "$siteroot")" "$(basename "$siteroot")" 2>/dev/null || tar_rc=$?
     if [[ "$tar_rc" -le 1 ]]; then
@@ -763,8 +804,8 @@ backup_site() {
 
   local timestamp
   timestamp=$(date +"%Y%m%d_%H%M%S")
-  local current_year
-  current_year=$(date +"%Y")
+  # 年份取自同一個時間戳記（跨年那一秒分開呼叫 date 會不一致，還原時以檔名的年份為準）
+  local current_year="${timestamp:0:4}"
 
   # Local working temp directory
   local tmp_work_dir
@@ -827,7 +868,7 @@ backup_site() {
 
     backup_tar_exclude_args "$domain"
     local tar_rc=0
-    tar --warning=no-file-changed \
+    backup_tar_create --warning=no-file-changed \
       --ignore-failed-read \
       -czf "$tar_file" \
       -C "$(dirname "$siteroot")" \
@@ -874,7 +915,7 @@ backup_site() {
     fi
 
     local tar_rc=0
-    tar --warning=no-file-changed \
+    backup_tar_create --warning=no-file-changed \
       --ignore-failed-read \
       -czf "$tar_file" \
       -C "$(dirname "$siteroot")" \
@@ -928,7 +969,7 @@ backup_site() {
 
     backup_tar_exclude_args "$domain"
     local tar_rc=0
-    tar --warning=no-file-changed \
+    backup_tar_create --warning=no-file-changed \
       --ignore-failed-read \
       -czf "$tar_file" \
       -C "$(dirname "$siteroot")" \
@@ -1354,7 +1395,7 @@ restore_site() {
         local fsize
         fsize=$(backup_format_size "$fbytes")
         local fdate
-        fdate=$(date -r "$f" +"%Y-%m-%d %H:%M" 2>/dev/null || date -d "@$(stat -c '%Y' "$f" 2>/dev/null)" +"%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
+        fdate=$(date -r "$f" +"%Y-%m-%d %H:%M" 2>/dev/null || date -d "@$(stat -c '%Y' "$f" 2>/dev/null)" +"%Y-%m-%d %H:%M" 2>/dev/null || _t "BACKUP_DATE_UNKNOWN")
 
         local ftype
         ftype=$(backup_file_type "$fname" "$domain")
@@ -1660,14 +1701,15 @@ restore_site() {
       embedded_sql="${unpack_dir}/backup.sql"
     elif [[ -f "${extracted_root}/.clp_db_export.sql" && ! -L "${extracted_root}/.clp_db_export.sql" ]]; then
       embedded_sql="${unpack_dir}/.clp_db_export.sql"
-      mv "${extracted_root}/.clp_db_export.sql" "$embedded_sql"
+      # 失敗時照下方的解開失敗處理（直接讓 set -e 中止會跳過 RETURN trap，暫存目錄留在磁碟上）
+      mv "${extracted_root}/.clp_db_export.sql" "$embedded_sql" || { log_error "$(_t "BACKUP_SITE_46")"; rm -rf "$snap_dir"; return 1; }
     fi
     local backup_has_wpconfig=0 backup_wpconfig=""
     if [[ -f "${extracted_root}/wp-config.php" && ! -L "${extracted_root}/wp-config.php" ]]; then
       backup_has_wpconfig=1
       if [[ -f "${siteroot}/wp-config.php" ]]; then
         backup_wpconfig="${snap_dir}/wp-config.from-backup.php"
-        install -m 600 "${extracted_root}/wp-config.php" "$backup_wpconfig"
+        install -m 600 "${extracted_root}/wp-config.php" "$backup_wpconfig" || { log_error "$(_t "BACKUP_SITE_46")"; rm -rf "$snap_dir"; return 1; }
         log_info "$(_t "BACKUP_SITE_49" "${snap_dir}")"
       fi
     fi

@@ -273,7 +273,7 @@ config_report_invalid() {
 config_get_valid() {
   local key="$1" val
   if ! val="$(clp_conf_read "$key")"; then
-    log_error "$(_t "CONFIG_ERR_MISSING_DEFAULT" "$(display_config_key "$key")")"
+    log_error "$(_t "CONFIG_ERR_MISSING_DEFAULT" "$(display_config_key "$key")" "$(display_config_key "$key")")"
     return 1
   fi
   if ! config_validate_value "$key" "$val"; then
@@ -571,7 +571,7 @@ config_handler() {
         local rc=0
         grep -v -E "$del_pattern" "$CLP_CONFIG_LOCAL_FILE" > "$tmp_file" 2>/dev/null || rc=$?
         if [[ "$rc" -gt 1 ]]; then
-          log_error "grep error ($rc) while filtering config; aborting to prevent data loss"
+          log_error "$(_t "CONFIG_ERR_GREP_FILTER" "$rc")"
           rm -f "$tmp_file"
           return 1
         fi
@@ -680,7 +680,7 @@ config_handler() {
         local rc=0
         grep -v -E "$del_pattern" "$CLP_CONFIG_LOCAL_FILE" > "$tmp_file" 2>/dev/null || rc=$?
         if [[ "$rc" -gt 1 ]]; then
-          log_error "grep error ($rc) while filtering config; aborting to prevent data loss"
+          log_error "$(_t "CONFIG_ERR_GREP_FILTER" "$rc")"
           rm -f "$tmp_file"
           return 1
         fi

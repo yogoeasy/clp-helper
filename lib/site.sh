@@ -28,8 +28,9 @@ _site_list_match_filter() {
     "") return 0 ;;
     enabled|main|wordpress|php|html) [[ "$status" == "Enabled" ]] ;;
     disabled) [[ "$status" == "Disabled" ]] ;;
-    ssl) [[ "$ssl" != "No" ]] ;;
-    nossl) [[ "$ssl" == "No" ]] ;;
+    # CloudPanel 每個網站都有自簽憑證：只有受信任的憑證（Yes）才算有 SSL
+    ssl) [[ "$ssl" == "Yes" ]] ;;
+    nossl) [[ "$ssl" != "Yes" ]] ;;
     *) return 0 ;;
   esac
 }
@@ -111,7 +112,7 @@ site_list() {
     [[ "$conf_name" == "default.conf" || "$conf_name" == "custom-domain.conf" ]] && continue
 
     local dom="${conf_name%.conf}"
-    [[ "$dom" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || continue
+    [[ "$dom" =~ ^[a-zA-Z0-9.-]+\.([a-zA-Z]{2,}|[xX][nN]--[a-zA-Z0-9-]{1,59})$ ]] || continue  # 與 is_valid_domain 相同，含 punycode TLD
 
     if [[ -f "$enabled_dir/${dom}.conf" ]]; then
       site_map["$dom"]="Enabled"
@@ -366,7 +367,10 @@ site_delete() {
     echo ""
     echo -e "${C_RED}${C_BOLD}$(_t "SITE_DELETE_WARN_PROMPT_1" "$domain")${C_NC}"
     echo -e "${C_RED}$(_t "SITE_DELETE_WARN_PROMPT_2")${C_NC}"
-    read -p "$(_t "SITE_DELETE_PROMPT_CONFIRM")" confirm_del
+    # 非 TTY 且沒有 -y 時明確報錯；讀到 EOF（Ctrl-D）視為取消
+    require_tty_or_yes || return 1
+    local confirm_del=""
+    read -r -p "$(_t "SITE_DELETE_PROMPT_CONFIRM")" confirm_del || confirm_del=""
     if [[ "$confirm_del" != "yes" && "$confirm_del" != "YES" ]]; then
       log_warn "$(_t "SITE_DELETE_WARN_CANCELLED")"
       return 0
@@ -420,10 +424,12 @@ site_delete() {
   rm -f "/etc/nginx/ssl-certificates/${domain}.crt" "/etc/nginx/ssl-certificates/${domain}.key" 2>/dev/null || true
 
   # 清理網站 Nginx 日誌目錄與 httpauth 安全設定
+  # 不用 ${domain}-* 萬用字元：會吃到 example.com-shop.net 等其他網站的檔案
   rm -f "/var/log/nginx/${domain}.access.log" \
-        "/var/log/nginx/${domain}.error.log" \
-        "/var/log/nginx/${domain}-"* 2>/dev/null || true
-  if [[ -n "$site_user" ]]; then
+        "/var/log/nginx/${domain}.error.log" 2>/dev/null || true
+  # 網站使用者目錄中的路徑可能被換成 symlink：任何一層是 symlink 就不刪
+  if [[ -n "$site_user" && -d "/home/${site_user}/logs/${domain}" && \
+        ! -L "/home/${site_user}" && ! -L "/home/${site_user}/logs" && ! -L "/home/${site_user}/logs/${domain}" ]]; then
     rm -rf "/home/${site_user}/logs/${domain}" 2>/dev/null || true
   fi
   # 清理 httpauth 相關設定
@@ -510,6 +516,12 @@ site_ssl() {
     else
       ssl_mode="dns"
     fi
+    # 與 site -new 一致：-ssl=no 是移除；-ssl=http／-ssl=dns 直接指定簽發方式
+    case "$(printf '%s' "$ssl_action" | tr '[:upper:]' '[:lower:]')" in
+      off|false|no) ssl_action="off" ;;
+      http) ssl_action="on"; ssl_mode="http" ;;
+      dns) ssl_action="on"; ssl_mode="dns" ;;
+    esac
   fi
 
   if [[ "$ssl_action" == "off" || "$ssl_action" == "false" ]]; then
@@ -700,11 +712,34 @@ PYEOF
       --certificate="$ssl_cert_le" 2>/dev/null || true
   fi
 
-  # 建立符號連結
-  ln -sf "$ssl_key_le" "$clp_key_path"
-  ln -sf "$ssl_cert_le" "$clp_crt_path"
+  # 建立符號連結；nginx -t 失敗時放回原本的檔案（與 -ssl=off 相同），不顯示成功
+  local orig_dir
+  orig_dir=$(mktemp -d) || return 1
+  if { [[ -e "$clp_crt_path" || -L "$clp_crt_path" ]] && ! cp -pP "$clp_crt_path" "${orig_dir}/orig.crt"; } || \
+     { [[ -e "$clp_key_path" || -L "$clp_key_path" ]] && ! cp -pP "$clp_key_path" "${orig_dir}/orig.key"; }; then
+    rm -rf "$orig_dir"
+    log_error "$(_t "SITE_SSL_ERR_CERT_LINK" "${domain}")"
+    return 1
+  fi
+  if ! ln -sf "$ssl_key_le" "$clp_key_path" || ! ln -sf "$ssl_cert_le" "$clp_crt_path"; then
+    rm -f "$clp_crt_path" "$clp_key_path"
+    [[ -e "${orig_dir}/orig.crt" || -L "${orig_dir}/orig.crt" ]] && cp -pP "${orig_dir}/orig.crt" "$clp_crt_path"
+    [[ -e "${orig_dir}/orig.key" || -L "${orig_dir}/orig.key" ]] && cp -pP "${orig_dir}/orig.key" "$clp_key_path"
+    rm -rf "$orig_dir"
+    log_error "$(_t "SITE_SSL_ERR_CERT_LINK" "${domain}")"
+    return 1
+  fi
 
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+  if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    rm -f "$clp_crt_path" "$clp_key_path"
+    [[ -e "${orig_dir}/orig.crt" || -L "${orig_dir}/orig.crt" ]] && cp -pP "${orig_dir}/orig.crt" "$clp_crt_path"
+    [[ -e "${orig_dir}/orig.key" || -L "${orig_dir}/orig.key" ]] && cp -pP "${orig_dir}/orig.key" "$clp_key_path"
+    rm -rf "$orig_dir"
+    log_error "$(_t "SITE_SSL_ERR_NGINX_TEST_RESTORED" "${domain}")"
+    return 1
+  fi
+  rm -rf "$orig_dir"
+  systemctl reload nginx 2>/dev/null || true
   log_success "$(_t "SITE_SSL_SUCCESS_CONFIGURED" "${domain}")"
 
   # 獨立呼叫 site_ssl 時，若使用 Cloudflare DNS 憑證，立即進行 DNS 設定檢查引導
@@ -728,9 +763,18 @@ cf_parse_auth() {
   fi
 
   local token="" email="" key=""
-  while IFS='=' read -r k v; do
+  # 最後一行沒有換行也要讀；值的處理與 _extract_token_from_file 相同（有引號取引號內，沒有引號去掉行內 # 註解）
+  while IFS='=' read -r k v || [[ -n "$k" ]]; do
     k=$(echo "$k" | tr -d '[:space:]')
-    v=$(echo "$v" | tr -d '[:space:]"'\''')
+    v="${v#"${v%%[![:space:]]*}"}"
+    if [[ "$v" == \"* ]]; then
+      v="${v#\"}"; v="${v%%\"*}"
+    elif [[ "$v" == \'* ]]; then
+      v="${v#\'}"; v="${v%%\'*}"
+    else
+      v="${v%%#*}"
+    fi
+    v=$(echo "$v" | tr -d '[:space:]')
     case "$k" in
       "dns_cloudflare_api_token") token="$v" ;;
       "dns_cloudflare_email")     email="$v" ;;
@@ -1051,6 +1095,7 @@ _cf_check_and_prompt_single_target() {
       log_success "$(_t "SITE__CF_CHECK_AND_PROMPT_SINGLE_TARGET_20" "${target}" "${rec_val}" "${rec_type}" "${proxy_badge}")"
     else
       log_error "$(_t "SITE__CF_CHECK_AND_PROMPT_SINGLE_TARGET_21" "${create_res}")"
+      return 1
     fi
 
   else
@@ -1217,6 +1262,7 @@ _cf_check_and_prompt_single_target() {
       log_success "$(_t "SITE__CF_CHECK_AND_PROMPT_SINGLE_TARGET_36" "${target}" "${new_val}" "${new_type}" "${proxy_badge}")"
     else
       log_error "$(_t "SITE__CF_CHECK_AND_PROMPT_SINGLE_TARGET_37" "${update_res}")"
+      return 1
     fi
   fi
 }
@@ -1284,7 +1330,7 @@ prompt_cloudflare_dns() {
   fi
 
   local total_targets=${#targets[@]}
-  local idx=1
+  local idx=1 any_failed=0
 
   for target in "${targets[@]}"; do
     echo ""
@@ -1299,12 +1345,15 @@ prompt_cloudflare_dns() {
       return 0
     elif [[ "$target_rc" -ne 0 ]]; then
       log_warn "$(_t "SITE_CF_DNS_WARN_TARGET_FAILED" "$target")"
+      any_failed=1
     fi
     idx=$((idx + 1))
   done
 
+  # 有目標失敗時不顯示「完成」（各目標已顯示警告）；呼叫端直接呼叫，維持回傳 0
   echo ""
-  log_success "$(_t "SITE_CF_DNS_SUCCESS_COMPLETE")"
+  [[ "$any_failed" -eq 0 ]] && log_success "$(_t "SITE_CF_DNS_SUCCESS_COMPLETE")"
+  return 0
 }
 
 # ------------------------------------------------------------------------------
@@ -1560,6 +1609,7 @@ site_new() {
           sleep 1.2
           ;;
         *)
+          [[ "$choice" =~ ^[0-9]{1,6}$ ]] && choice=$((10#$choice))  # 010 不可被當成八進位的 8
           if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 3 && choice <= ${#SITE_NEW_MODULES[@]} )); then
             local target_smod="${SITE_NEW_MODULES[$((choice-1))]}"
             if is_site_mod_enabled "$target_smod"; then
@@ -1587,9 +1637,10 @@ site_new() {
     log_error "$(_t "SITE_NEW_ERR_USER_EXISTS" "${siteuser}")"
     default_user=$(suggest_site_user "$domain")
     if [[ "$non_interactive" == "true" ]]; then
-      siteuser="${default_user}_$RANDOM"
+      # suggest_site_user 已回傳未使用、不超過 32 字元的名稱；不再加 _$RANDOM（可能超過 CloudPanel 的 32 字元上限）
+      siteuser="$default_user"
       log_warn "$(_t "SITE_NEW_WARN_AUTO_USER" "${siteuser}")"
-      break
+      continue
     fi
     read -p "$(_t "SITE_NEW_PROMPT_RETRY_USER" "${default_user}")" input_user
     siteuser="${input_user:-$default_user}"
@@ -1678,8 +1729,9 @@ site_new() {
 
   # 9. WordPress 核心下載與安裝
   local wpdir="/home/${siteuser}/htdocs/${domain}"
-  mkdir -p "$wpdir"
-  find "${wpdir:?}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+  # 網站目錄中的檔案操作以網站使用者身分執行（root 不以路徑操作網站使用者可控制的目錄）
+  sudo -H -u "$siteuser" mkdir -p -- "$wpdir"
+  sudo -H -u "$siteuser" find "${wpdir:?}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
 
   log_step "$(_t "SITE_NEW_STEP_WP_DOWNLOAD" "$wp_locale")"
   if [[ "$wp_locale" == "en_US" ]]; then
@@ -1776,7 +1828,10 @@ site_new() {
   # 10. 客製化 wp-config.php (安全與效能常數、快取隔離)
   if is_site_mod_enabled "wp_hardening"; then
     log_step "$(_t "SITE_NEW_STEP_HARDENING_CONFIG")"
-    update_cloned_wpconfig "$wpdir" "$dbname" "$dbpass" "$domain" "$siteuser" "$wp_admin_email"
+    if ! update_cloned_wpconfig "$wpdir" "$dbname" "$dbpass" "$domain" "$siteuser" "$wp_admin_email"; then
+      log_error "$(_t "SITE_NEW_ERR_WPCONFIG_UPDATE")"
+      return 1
+    fi
     if [[ "$wp_locale" != "en_US" ]]; then
       sudo -H -u "$siteuser" wp config set WPLANG "$wp_locale" --type=constant --path="$wpdir" 2>/dev/null || true
     else
@@ -1786,8 +1841,8 @@ site_new() {
     local wpconfig="${wpdir}/wp-config.php"
     if [[ -f "$wpconfig" ]]; then
       # 只把 DB_CHARSET 由 utf8 改為 utf8mb4（全域取代會把既有的 utf8mb4 變成 utf8mb4mb4）
-      sed -i -E "s/(define\([[:space:]]*['\"]DB_CHARSET['\"][[:space:]]*,[[:space:]]*['\"])utf8(['\"])/\1utf8mb4\2/" "$wpconfig"
-      if ! grep -q "WP_DEBUG_LOG" "$wpconfig"; then
+      sudo -H -u "$siteuser" sed -i -E "s/(define\([[:space:]]*['\"]DB_CHARSET['\"][[:space:]]*,[[:space:]]*['\"])utf8(['\"])/\1utf8mb4\2/" "$wpconfig"
+      if ! sudo -H -u "$siteuser" grep -q "WP_DEBUG_LOG" "$wpconfig"; then
         # 必須放在 require_once wp-settings.php 之前，WordPress 啟動後才定義的常數不會生效
         CLP_LIB_DIR="${CLP_LIB_DIR}" CLP_SITE_USER="$siteuser" python3 -I - "$wpconfig" <<'PYDEBUG'
 import os, re, sys
@@ -1824,8 +1879,11 @@ PYDEBUG
     sudo -H -u "$siteuser" wp plugin install clp-varnish-cache --activate --path="$wpdir" 2>/dev/null || true
   fi
 
-  # 校正目錄權限
-  chown -R "$siteuser:$siteuser" "$wpdir"
+  # 校正目錄權限：只處理不屬於網站使用者的項目；find 不跟隨 symlink，-execdir 在檔案所在目錄執行（不以完整路徑解析中間目錄），
+  # chown -h 不經由 symlink 修改
+  if [[ -d "$wpdir" && ! -L "$wpdir" ]]; then
+    find "$wpdir" -xdev \( ! -user "$siteuser" -o ! -group "$siteuser" \) -execdir chown -h "$siteuser:$siteuser" {} + 2>/dev/null || true
+  fi
 
   # 12. PHP-FPM Pool 自動調校
   if is_site_mod_enabled "php_fpm_tuning"; then
@@ -1891,7 +1949,7 @@ update_cloned_wpconfig() {
   local new_cache_salt
   new_cache_salt="${target_domain}:$(openssl rand -hex 8)"
 
-  CLP_LIB_DIR="${CLP_LIB_DIR}" CLP_SITE_USER="${target_user}" CLP_WPCONFIG_MODE="$mode" python3 -I - "$target_wpconfig" "$target_domain" "$target_dbname" "$target_dbpass" "$new_cache_salt" "$recovery_email" << 'PYEOF'
+  CLP_LIB_DIR="${CLP_LIB_DIR}" CLP_SITE_USER="${target_user}" CLP_WPCONFIG_MODE="$mode" CLP_DBPASS="$target_dbpass" python3 -I - "$target_wpconfig" "$target_domain" "$target_dbname" "$new_cache_salt" "$recovery_email" << 'PYEOF'
 import os, sys, re
 sys.path.insert(0, os.environ.get("CLP_LIB_DIR", "/usr/local/share/clp-helper/lib"))
 import clp_fileops
@@ -1899,9 +1957,10 @@ import clp_fileops
 wpconfig_path = sys.argv[1]
 target_domain = sys.argv[2]
 target_dbname = sys.argv[3]
-target_dbpass = sys.argv[4]
-new_cache_salt = sys.argv[5]
-recovery_email = sys.argv[6] if len(sys.argv) > 6 else ""
+# 密碼以環境變數傳入，不出現在命令列（ps 看得到）
+target_dbpass = os.environ.get("CLP_DBPASS", "")
+new_cache_salt = sys.argv[4]
+recovery_email = sys.argv[5] if len(sys.argv) > 5 else ""
 site_user = clp_fileops.get_required_site_user()
 
 try:
@@ -1946,26 +2005,36 @@ try:
         # PHP 單引號字串：跳脫反斜線與單引號（例如 o'neil@corp.com 或含反斜線的密碼）
         formatted_val = val if is_raw else "'" + val.replace("\\", "\\\\").replace("'", "\\'") + "'"
         new_line = f"define( '{key}', {formatted_val} );"
+        # 行尾的 // 或 # 註解也算同一行（保留註解），否則會重複加入 define
         pattern = re.compile(
-            r"^[ \t]*define\s*\(\s*['\"]" + re.escape(key) + r"['\"]\s*,\s*.*?\)\s*;\s*$",
+            # 值以 PHP 字串為單位比對：字串內的 ); 或 # 不可被當成結尾或註解（否則舊值的一部分會留在行尾）
+            r"^[ \t]*define\s*\(\s*['\"]" + re.escape(key) + r"['\"]\s*,\s*"
+            r"(?:'(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\"|[^'\";\n])*?"
+            r"\)\s*;(?P<tail>[ \t]*(?://|#)[^\n]*)?[ \t]*$",
             re.MULTILINE
         )
         if pattern.search(content):
-            content = pattern.sub(lambda m, nl=new_line: nl, content)
+            content = pattern.sub(lambda m, nl=new_line: nl + (m.group("tail") or ""), content)
         else:
             missing_defines.append(new_line)
 
     # 3. 缺漏之常數統一乾淨插入於 <?php 之後、主註解區塊之前
+    #    以字串切片插入（re.sub 的取代字串會解讀 \1、反斜線）；檔頭有 BOM 時 <?php 不在行首也找得到
     if missing_defines:
         block = "\n".join(missing_defines) + "\n"
-        if re.search(r"<\?php", content):
-            content = re.sub(r"^(<\?php[^\n]*\n)", r"\1" + block + "\n", content, count=1, flags=re.MULTILINE)
+        m = re.search(r"<\?php[^\n]*\n", content)
+        if m:
+            content = content[:m.end()] + block + "\n" + content[m.end():]
+        elif "<?php" in content:
+            i = content.index("<?php") + len("<?php")
+            content = content[:i] + "\n" + block + "\n" + content[i:]
         else:
             content = "<?php\n" + block + "\n" + content
 
     clp_fileops.safe_atomic_write(wpconfig_path, content, user=site_user, allow_create=False)
 except Exception as e:
-    print(f"Error updating wp-config.php: {e}", file=sys.stderr)
+    # 只印出錯誤細節；說明由 bash 端以語系訊息顯示
+    print(f"  {e}", file=sys.stderr)
     sys.exit(1)
 PYEOF
 }
@@ -2020,7 +2089,7 @@ try:
         clp_fileops.safe_atomic_write(robots_path, new_content, user=site_user, allow_create=False)
         print("MODIFIED")
 except Exception as e:
-    sys.stderr.write(f"Error updating robots.txt: {e}\n")
+    sys.stderr.write(f"  {e}\n")
     sys.exit(1)
 PYEOF
 ) || rc=$?
@@ -2099,7 +2168,7 @@ try:
         clp_fileops.safe_atomic_write(user_ini, "\n".join(lines) + "\n", user=site_user, allow_create=False)
         print("USER_INI_MODIFIED")
 except Exception as e:
-    sys.stderr.write(f"Error updating .user.ini: {e}\n")
+    sys.stderr.write(f"  {e}\n")
     sys.exit(1)
 PYEOF
     then
@@ -2137,7 +2206,7 @@ try:
         clp_fileops.safe_atomic_write(wf_path, content, user=site_user, allow_create=False)
         print("WF_WAF_MODIFIED")
 except Exception as e:
-    sys.stderr.write(f"Error updating wordfence-waf.php: {e}\n")
+    sys.stderr.write(f"  {e}\n")
     sys.exit(1)
 PYEOF
     then
@@ -2181,7 +2250,7 @@ try:
         clp_fileops.safe_atomic_write(adv_path, content, user=site_user, allow_create=False)
         print("ADV_CACHE_MODIFIED")
 except Exception as e:
-    sys.stderr.write(f"Error updating advanced-cache.php: {e}\n")
+    sys.stderr.write(f"  {e}\n")
     sys.exit(1)
 PYEOF
     then
@@ -2221,7 +2290,17 @@ render_wp_users_detail() {
   _wp_session_label_env
   if command -v python3 >/dev/null 2>&1; then
     python3 -I - "$json_data" "$target_role" << "PYEOF"
-import json, os, sys
+import json, os, re, sys
+
+# 來源網站的資料（文章標題、帳號、email、角色）可能含終端機控制字元，顯示前移除
+def _clean(o):
+    if isinstance(o, str):
+        return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", o)
+    if isinstance(o, list):
+        return [_clean(x) for x in o]
+    if isinstance(o, dict):
+        return {_clean(k): _clean(v) for k, v in o.items()}
+    return o
 
 def L(key, default):
     return os.environ.get("CLP_L_" + key) or default
@@ -2230,7 +2309,7 @@ sample_json = open(sys.argv[1], encoding="utf-8", errors="replace").read()
 filter_role = sys.argv[2] if len(sys.argv) > 2 else "all"
 
 try:
-    data = json.loads(sample_json)
+    data = _clean(json.loads(sample_json))
 except Exception:
     sys.exit(0)
 
@@ -2275,7 +2354,12 @@ else:
 PYEOF
   elif command -v php >/dev/null 2>&1; then
     php -r '
-$data = json_decode(file_get_contents($argv[1]), true);
+function clp_clean($v) {
+  if (is_string($v)) { return preg_replace("/[\\x{00}-\\x{1F}\\x{7F}-\\x{9F}]/u", "", $v); }
+  if (is_array($v)) { $o = array(); foreach ($v as $k => $x) { $o[clp_clean($k)] = clp_clean($x); } return $o; }
+  return $v;
+}
+$data = clp_clean(json_decode(file_get_contents($argv[1]), true));
 $filter_role = isset($argv[2]) ? $argv[2] : "all";
 function L($key, $default) { $v = getenv("CLP_L_" . $key); return ($v !== false && $v !== "") ? $v : $default; }
 function format_ago($sec) {
@@ -2484,12 +2568,22 @@ echo "CLP_JSON_START" . json_encode(array(
   _wp_session_label_env
   if command -v python3 >/dev/null 2>&1; then
     python3 -I - "$json_data" << "PYEOF"
-import json, os, sys
+import json, os, re, sys
+
+# 來源網站的資料（文章標題、帳號、email、角色）可能含終端機控制字元，顯示前移除
+def _clean(o):
+    if isinstance(o, str):
+        return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", o)
+    if isinstance(o, list):
+        return [_clean(x) for x in o]
+    if isinstance(o, dict):
+        return {_clean(k): _clean(v) for k, v in o.items()}
+    return o
 
 def L(key, default):
     return os.environ.get("CLP_L_" + key) or default
 
-data = json.load(open(sys.argv[1], encoding="utf-8", errors="replace"))
+data = _clean(json.load(open(sys.argv[1], encoding="utf-8", errors="replace")))
 roles = data.get("roles", {})
 for r, cnt in roles.items():
     print(L("ROLE_COUNT", "   • {role} : {count} 位").replace("{role}", f"{r:<15}").replace("{count}", str(cnt)))
@@ -2501,7 +2595,12 @@ if editing_count > 0:
 PYEOF
   elif command -v php >/dev/null 2>&1; then
     php -r '
-$d = json_decode(file_get_contents($argv[1]), true);
+function clp_clean($v) {
+  if (is_string($v)) { return preg_replace("/[\\x{00}-\\x{1F}\\x{7F}-\\x{9F}]/u", "", $v); }
+  if (is_array($v)) { $o = array(); foreach ($v as $k => $x) { $o[clp_clean($k)] = clp_clean($x); } return $o; }
+  return $v;
+}
+$d = clp_clean(json_decode(file_get_contents($argv[1]), true));
 function L($key, $default) { $v = getenv("CLP_L_" . $key); return ($v !== false && $v !== "") ? $v : $default; }
 foreach (($d["roles"] ?? array()) as $r => $cnt) {
     echo str_replace(array("{role}", "{count}"), array(sprintf("%-15s", $r), (int)$cnt), L("ROLE_COUNT", "   • {role} : {count} 位")) . "\n";
@@ -2574,6 +2673,7 @@ if ($editing_count > 0) {
         echo ""
         ;;
       *)
+        [[ "$user_choice" =~ ^[0-9]{1,6}$ ]] && user_choice=$((10#$user_choice))  # 010 不可被當成八進位的 8
         if [[ "$user_choice" =~ ^[0-9]+$ ]] && [[ "$user_choice" -ge 1 && "$user_choice" -lt "$all_idx" ]]; then
           local selected_role="${roles[$((user_choice - 1))]}"
           echo ""
@@ -3096,8 +3196,9 @@ probe_remote_site() {
       log_info "$(_t "SITE_PROBE_REMOTE_SITE_2" "${remote_host}")"
       local -a all_sites_arr=()
       read -ra all_sites_arr <<< "$all_sites"
+      # 呼叫端以 $(...) 取得 stdout：清單寫到 stderr 才看得到
       for s in "${all_sites_arr[@]}"; do
-        echo -e "  - ${C_CYAN}${s}${C_NC}"
+        echo -e "  - ${C_CYAN}${s}${C_NC}" >&2
       done
     fi
     return 1
@@ -3254,19 +3355,22 @@ site_migrate_all() {
         local -a clean_items=()
         read -ra clean_items <<< "$clean_input"
         for item in "${clean_items[@]}"; do
-          if [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            local start="${BASH_REMATCH[1]}"
-            local end="${BASH_REMATCH[2]}"
+          # 以十進位解讀（08、010 不可被當成八進位）；範圍上限不超過清單長度（避免 1-999999999 跑很久）
+          if [[ "$item" =~ ^([0-9]{1,6})-([0-9]{1,6})$ ]]; then
+            local start=$((10#${BASH_REMATCH[1]}))
+            local end=$((10#${BASH_REMATCH[2]}))
             if (( start > end )); then
               local tmp=$start; start=$end; end=$tmp
             fi
+            (( end > ${#domains_to_migrate[@]} )) && end=${#domains_to_migrate[@]}
             for ((n=start; n<=end; n++)); do
               if (( n >= 1 && n <= ${#domains_to_migrate[@]} )); then
                 to_remove_indexes+=("$n")
                 valid_input=1
               fi
             done
-          elif [[ "$item" =~ ^[0-9]+$ ]]; then
+          elif [[ "$item" =~ ^[0-9]{1,6}$ ]]; then
+            item=$((10#$item))
             if (( item >= 1 && item <= ${#domains_to_migrate[@]} )); then
               to_remove_indexes+=("$item")
               valid_input=1
@@ -3408,7 +3512,15 @@ _migrate_single_site() {
   local domain_mode="${4:-diff_domain}"   # same_domain | diff_domain
   local replace_existing="${5:-0}"        # 1 = 確認遠端可搬移後刪除本地既有網站
 
-  if ! is_valid_domain "$target_domain"; then
+  # 來源網域也要驗證：會放進遠端的 ls /home/*/htdocs/<網域> 與本機檔名（-from='*' 會比對到任意網站；
+  # -all 時網域名稱來自遠端主機）
+  # is_valid_domain 驗證的是 clean_domain 之後的值（會去掉引號、分號）；名稱必須本來就是乾淨的，
+  # 否則 a.com';id;' 會通過檢查，原字串卻被放進遠端指令
+  if [[ "$(clean_domain "$source_domain")" != "$source_domain" ]] || ! is_valid_domain "$source_domain"; then
+    log_error "$(_t "SITE_MIGRATE_ERR_INVALID_SOURCE" "${source_domain}")"
+    return 1
+  fi
+  if [[ "$(clean_domain "$target_domain")" != "$target_domain" ]] || ! is_valid_domain "$target_domain"; then
     log_error "$(_t "SITE_CLONE_2" "${target_domain}")"
     return 1
   fi
@@ -3748,7 +3860,9 @@ site_migrate() {
 # 7. Cloudflare Edge WAF & Security Optimization (clp site <domain> -cf-waf)
 # ------------------------------------------------------------------------------
 site_cf_waf() {
-  local domain="${1:-}"
+  # 與其他 site 指令相同先整理網域（https://、結尾 /、大小寫）；不檢查本機是否有該網站（zone 網域也可以設定 WAF）
+  local domain
+  domain="$(clean_domain "${1:-}")"
 
   if [[ -z "$domain" ]]; then
     log_error "$(_t "SITE_CF_WAF_1")"
@@ -3821,9 +3935,18 @@ site_cf_waf() {
       local res=0
       cf_deploy_waf_rules "$zone_id" "$domain" "$token" "$whitelist" "$custom_rules" "$dry_run" || res=$?
       if [[ $res -eq 0 ]]; then
-        cf_configure_zone_settings "$zone_id" "$token" "$dry_run" || log_warn "$(_t "CF_WARN_ZONE_SETTINGS_FAILED")"
+        local zone_rc=0
+        cf_configure_zone_settings "$zone_id" "$token" "$dry_run" || zone_rc=$?
+        if [[ "$zone_rc" -ne 0 ]]; then
+          log_warn "$(_t "CF_WARN_ZONE_SETTINGS_FAILED")"
+        fi
         cf_check_and_enable_proxy "$zone_id" "$domain" "$token" "$dry_run" || true
         echo ""
+        # zone 設定有失敗時不顯示「完成」，並回傳失敗（WAF 規則已部署）
+        if [[ "$zone_rc" -ne 0 ]]; then
+          log_warn "$(_t "CF_BANNER_PARTIAL")"
+          return 1
+        fi
         echo -e "${C_GREEN}${C_BOLD}======================================================================${C_NC}"
         echo -e " 🎉 $(_t "CF_BANNER_COMPLETE")"
         echo -e "$(_t "SITE_CF_WAF_2")"
@@ -3935,7 +4058,8 @@ cf_only_realip_disable() {
     if ! read -r -p "$(_t "SITE_CF_ONLY_REALIP_PROMPT")" ans; then
       ans="n"
     fi
-    if [[ -n "$ans" && "$ans" != "y" && "$ans" != "Y" && "$ans" != "yes" ]]; then
+    ans="$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"  # Yes／YES 也算同意
+    if [[ -n "$ans" && "$ans" != "y" && "$ans" != "yes" ]]; then
       log_warn "$(_t "SITE_CF_ONLY_WARN_REAL_IP")"
       return 0
     fi
@@ -3976,22 +4100,27 @@ cf_only_realip_maybe_restore() {
 
 # cf_only_firewall_check：UFW 沒啟用，或明確開放 8080（nginx backend）／6081（Varnish）時警告——直連這些埠不受 cf-only 限制
 cf_only_firewall_check() {
-  if ! command -v ufw >/dev/null 2>&1 || ! ufw status 2>/dev/null | grep -q '^Status: active'; then
+  if ! command -v ufw >/dev/null 2>&1 || ! LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
     log_warn "$(_t "SITE_CF_ONLY_WARN_FIREWALL_OFF")"
     return 0
   fi
-  local port
+  # verbose 才會顯示預設政策；預設允許連入時 8080／6081 都對外開放
+  local port st
+  st=$(LC_ALL=C ufw status verbose 2>/dev/null || true)
   for port in 8080 6081; do
-    if ufw status 2>/dev/null | awk -v p="$port" '
+    if grep -qE '^Default:.*allow \(incoming\)' <<< "$st" || awk -v p="$port" '
       $0 ~ /ALLOW/ {
-        split($1, a, "/"); spec = a[1]
-        if (spec == p) { found = 1 }
-        else if (index(spec, ":") > 0) {
-          split(spec, r, ":"); if (p + 0 >= r[1] + 0 && p + 0 <= r[2] + 0) found = 1
+        split($1, a, "/"); n = split(a[1], items, ",")
+        for (i = 1; i <= n; i++) {
+          spec = items[i]
+          if (spec == p) { found = 1 }
+          else if (index(spec, ":") > 0) {
+            split(spec, r, ":"); if (p + 0 >= r[1] + 0 && p + 0 <= r[2] + 0) found = 1
+          }
         }
       }
       END { exit found ? 0 : 1 }
-    '; then
+    ' <<< "$st"; then
       log_warn "$(_t "SITE_CF_ONLY_WARN_FIREWALL_PORT" "$port")"
     fi
   done
@@ -4108,8 +4237,10 @@ cf_only_apply() {
       return 1
     fi
     # 主要網域與 www 以外的 server_name（例如 CloudPanel 測試用的 www1.*）不檢查，只提醒
-    local n base="${domain#www.}" others=()
-    for n in $names; do
+    local n base="${domain#www.}" others=() name_list=()
+    # read -a 只依空白分割，不做萬用字元展開（*.example.com 不可展開成目前目錄的檔名）
+    read -r -a name_list <<< "$names"
+    for n in ${name_list[@]+"${name_list[@]}"}; do
       [[ "$n" == "$base" || "$n" == "www.${base}" ]] || others+=("$n")
     done
     [[ ${#others[@]} -gt 0 ]] && log_info "$(_t "SITE_CF_ONLY_INFO_OTHER_NAMES" "${others[*]}")"
@@ -4160,8 +4291,13 @@ cf_only_apply() {
     local prev
     if ! prev=$(cf_only_py db-set "$CF_ONLY_DB" "$domain" "$want_db" 2>&1); then
       log_error "$(_t "SITE_CF_ONLY_ERR_DB_SET" "$domain" "$prev")"
+      # vhost 有改過才還原；訊息依實際結果顯示
       if [[ "$vhost_changed" -eq 1 ]]; then
-        atomic_replace "$vbak" "$vhost" || log_error "$(_t "SITE_CF_ONLY_ERR_RESTORE" "$vbak" "$vhost")"
+        if atomic_replace "$vbak" "$vhost"; then
+          log_info "$(_t "SITE_CF_ONLY_INFO_VHOST_RESTORED" "$domain")"
+        else
+          log_error "$(_t "SITE_CF_ONLY_ERR_RESTORE" "$vbak" "$vhost")"
+        fi
         nginx -t >/dev/null 2>&1 && { systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true; }
       fi
       return 1

@@ -46,7 +46,7 @@ import tempfile
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from clp_fileops import read_text_nofollow, safe_atomic_write  # noqa: E402
+from clp_fileops import read_bytes_nofollow, read_text_nofollow, safe_atomic_write  # noqa: E402
 
 DOMAIN_RE = re.compile(r'^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$')
 USER_RE = re.compile(r'^[a-z_][a-z0-9_.-]{0,63}$')
@@ -67,11 +67,32 @@ def controller_path(user):
 
 
 # ------------------------------------------------------------------ vhost
+def strip_comment(line):
+    """The code part of an nginx line: '#' starts a comment only outside quotes and at the start of a
+    token (nginx reads "location ~ ^/a#b {" as a regex containing '#')."""
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in ('"', "'"):
+            quote = c
+        elif c == '#' and (i == 0 or line[i - 1] in ' \t;{}'):
+            return line[:i]
+        i += 1
+    return line
+
+
 def server_blocks(lines):
     """[(start, end)] of the top-level server blocks."""
     blocks, depth, start = [], 0, None
     for i, line in enumerate(lines):
-        code = line.split('#', 1)[0]
+        code = strip_comment(line)
         if depth == 0 and SERVER_RE.match(code):
             start = i
         depth += code.count('{') - code.count('}')
@@ -124,14 +145,14 @@ def front_location(lines):
     for s, e in server_blocks(lines):
         if any(LISTEN_8080_RE.match(l) for l in lines[s:e + 1]):
             continue
-        locs = [i for i in range(s, e + 1) if LOCATION_ROOT_RE.match(lines[i].split('#', 1)[0])]
+        locs = [i for i in range(s, e + 1) if LOCATION_ROOT_RE.match(strip_comment(lines[i]))]
         if len(locs) == 1:
             found.append(locs[0])
     if len(found) != 1:
         return None
     depth = 0
     for j in range(found[0], len(lines)):
-        code = lines[j].split('#', 1)[0]
+        code = strip_comment(lines[j])
         depth += code.count('{') - code.count('}')
         if depth == 0:
             return lines[found[0] + 1:j]
@@ -194,7 +215,7 @@ def userini_prepend(root, user):
     val = None
     for line in text.splitlines():
         line = line.split(';', 1)[0] if line.lstrip().startswith(';') else line
-        m = re.match(r'^\s*auto_prepend_file\s*=\s*["\']?([^"\'\s;]*)["\']?\s*$', line)
+        m = re.match(r'^\s*auto_prepend_file\s*=\s*["\']?([^"\'\s;]*)["\']?\s*(;.*)?$', line)
         if m:
             val = m.group(1)
     return val
@@ -210,12 +231,15 @@ def cmd_fix_wfwaf(root, user, backup_dir):
         fail("invalid user")
     path = os.path.join(root, "wordfence-waf.php")
     controller = controller_path(user)
-    text = read_user_file(path, user)
-    if text is None:
+    if not os.path.lexists(path):
         fail("%s not found" % path)
+    # 以位元組讀寫：CRLF 與非 UTF-8 位元組原樣保留，備份與原檔完全相同
+    raw = read_bytes_nofollow(path, user=user)
+    text = raw.decode("utf-8", "surrogateescape")
     if wfwaf_includes(text, controller):
         sys.exit(3)
     lines = text.split("\n")
+    eol_cr = "\r" if lines and lines[0].endswith("\r") else ""
     if not lines or not lines[0].startswith("<?php"):
         fail("wordfence-waf.php does not start with <?php; not modified")
     idx = [i for i, l in enumerate(lines) if l.startswith("if (file_exists(")]
@@ -229,27 +253,31 @@ def cmd_fix_wfwaf(root, user, backup_dir):
         "\tinclude_once '%s';" % controller,
         "}",
     ]
-    new_text = "\n".join(lines[:idx[0]] + block + lines[idx[0]:])
+    block = [l + eol_cr for l in block]
+    new_bytes = "\n".join(lines[:idx[0]] + block + lines[idx[0]:]).encode("utf-8", "surrogateescape")
 
     os.makedirs(backup_dir, mode=0o700, exist_ok=True)
     bak = os.path.join(backup_dir, "wordfence-waf.php")
-    with open(bak, "w", encoding="utf-8") as f:
-        f.write(text)
+    bfd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(bfd, "wb") as f:
+        f.write(raw)
     os.chmod(bak, 0o600)
 
     php = shutil_which("php")
     if php:
         fd, tmp = tempfile.mkstemp(dir=backup_dir, suffix=".php")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(new_text)
-        r = subprocess.run([php, "-l", tmp], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        os.unlink(tmp)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(new_bytes)
+            r = subprocess.run([php, "-l", tmp], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        finally:
+            os.unlink(tmp)
         if r.returncode != 0:
             fail("php -l failed for the edited wordfence-waf.php; not modified")
     else:
         sys.stderr.write("warning: php not found, skipped php -l\n")
 
-    safe_atomic_write(path, new_text, user=user, allow_create=False)
+    safe_atomic_write(path, new_bytes, user=user, allow_create=False)
 
 
 def shutil_which(name):
@@ -269,7 +297,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def probe(domain):
     req = urllib.request.Request("http://127.0.0.1:8080/", headers={
         "Host": domain, "X-Forwarded-Proto": "https", "User-Agent": "clp-helper-varnish-probe"})
-    opener = urllib.request.build_opener(_NoRedirect)
+    # ProxyHandler({})：本機探測不可經過環境變數 http_proxy 指定的 proxy
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     try:
         resp = opener.open(req, timeout=30)
         headers = resp.headers
@@ -319,8 +348,19 @@ def cmd_diagnose(db, domain):
     if stype != "php":
         done("not-php")
 
-    s_text = read_user_file("/home/%s/.varnish-cache/settings.json" % user, user)
+    # 讀取失敗（例如 ~/.varnish-cache 是 symlink）只標示在 settings 欄；Varnish 在 DB 中關閉的網站仍判定為 off-db，
+    # 不讓 -check 誤報 problem
+    try:
+        s_text = read_user_file("/home/%s/.varnish-cache/settings.json" % user, user)
+        s_err = False
+    except (OSError, ValueError):
+        s_text, s_err = None, True
     server = None
+    if s_err:
+        out["settings"] = "error"
+        if vdb != 1:
+            done("off-db")
+        fail("cannot read /home/%s/.varnish-cache/settings.json" % user)
     if s_text is None:
         out["settings"] = "missing"
     else:
@@ -415,5 +455,6 @@ def main(argv):
 if __name__ == "__main__":
     try:
         main(sys.argv)
-    except (OSError, PermissionError) as e:
+    except (OSError, ValueError, sqlite3.Error) as e:
+        # 非 UTF-8 的 vhost（UnicodeDecodeError 是 ValueError）、鎖住或損壞的 db.sq3：顯示一行錯誤，不印出 traceback
         fail("error: %s" % e)

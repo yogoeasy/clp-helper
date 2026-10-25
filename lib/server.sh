@@ -70,9 +70,11 @@ get_clp_version() {
   local ver
   ver=$(dpkg -s cloudpanel 2>/dev/null | grep '^Version:' | awk '{print $2}' | cut -d'-' -f1 || true)
   if [[ -z "$ver" ]] && command -v clpctl >/dev/null 2>&1; then
-    ver=$(clpctl --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+    ver=$(clpctl --version 2>/dev/null | awk '{print $NF}' || true)
   fi
-  echo "${ver:-unknown}"
+  # 只用於顯示
+  [[ -n "$ver" ]] || ver="$(_t "SERVER_DASH_UNKNOWN")"
+  echo "$ver"
 }
 
 # 偵測已安裝之資料庫引擎類型與完整版本號 (如 MySQL 8.4.11 或 MariaDB 11.4.13)
@@ -93,7 +95,9 @@ get_database_engine_info() {
 
   if echo "$raw" | grep -qi "mariadb"; then
     db_name="MariaDB"
-    db_ver=$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)
+    # 伺服器版本緊接在 -MariaDB 之前；10.x 用戶端的 "Ver 15.1 Distrib 10.6.18-MariaDB" 第一個數字是用戶端協定版本
+    db_ver=$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?-MariaDB' | head -n 1 | sed 's/-MariaDB$//' || true)
+    [[ -n "$db_ver" ]] || db_ver=$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)
   elif echo "$raw" | grep -qiE "percona|mysql"; then
     db_name="MySQL"
     db_ver=$(echo "$raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)
@@ -326,7 +330,11 @@ install_cloudpanel_core() {
     installed_db=$(get_database_engine_info)
     log_info "$(_t "SERVER_INSTALL_INFO_ALREADY_INSTALLED" "${installed_ver}" "${installed_db}")"
     # 自動自我修復可能殘留的 dpkg postinst 狀態 (防止後續 apt 安裝報錯)
-    if [[ -f /var/lib/dpkg/info/cloudpanel.postinst ]] && ! grep -qF 'if [ ! -d /tmp/cloudpanel ]; then exit 0; fi' /var/lib/dpkg/info/cloudpanel.postinst 2>/dev/null; then
+    #   只在套件確實停在 half-configured／unpacked 時才改官方的 postinst（正常安裝的主機不動）
+    local clp_pkg_status=""
+    clp_pkg_status=$(dpkg-query -W -f='${Status}' cloudpanel 2>/dev/null || true)
+    if [[ "$clp_pkg_status" =~ (half-configured|unpacked)$ ]] && \
+       [[ -f /var/lib/dpkg/info/cloudpanel.postinst ]] && ! grep -qF 'if [ ! -d /tmp/cloudpanel ]; then exit 0; fi' /var/lib/dpkg/info/cloudpanel.postinst 2>/dev/null; then
       sed -i '2i if [ ! -d /tmp/cloudpanel ]; then exit 0; fi' /var/lib/dpkg/info/cloudpanel.postinst 2>/dev/null || true
       dpkg --configure cloudpanel >/dev/null 2>&1 || true
     fi
@@ -358,7 +366,7 @@ install_cloudpanel_core() {
     # 步驟 A: 動態爬取官方文件 SHA256 驗證碼與資料庫引擎清單
     log_info "$(_t "SERVER_INSTALL_INFO_FETCHING_HASH")"
     local page_content=""
-    page_content=$(curl -fsSL --connect-timeout 10 "$CLP_DOCS_URL" 2>/dev/null || true)
+    page_content=$(curl -fsSL --connect-timeout 10 --max-time 30 "$CLP_DOCS_URL" 2>/dev/null || true)
 
     if [[ -n "$page_content" ]]; then
       checksum=$(echo "$page_content" | grep -oE '[a-f0-9]{64}' | head -n 1 || true)
@@ -391,7 +399,7 @@ install_cloudpanel_core() {
   local installer_tmp
   installer_tmp=$(mktemp /tmp/clp_install.XXXXXX)
   log_info "$(_t "SERVER_INSTALL_INFO_DOWNLOADING_SCRIPT")"
-  if ! curl -fsSL "$CLP_INSTALLER_URL" -o "$installer_tmp"; then
+  if ! curl -fsSL --connect-timeout 15 --max-time 600 "$CLP_INSTALLER_URL" -o "$installer_tmp"; then
     log_error "$(_t "SERVER_INSTALL_ERR_DOWNLOAD_FAILED" "$CLP_INSTALLER_URL")"
     rm -f "$installer_tmp"
     return 1
@@ -438,7 +446,9 @@ install_cloudpanel_core() {
 # 驗證時區名稱（必須存在於 /usr/share/zoneinfo，例如 Asia/Taipei、UTC）
 is_valid_timezone() {
   local tz="$1"
-  [[ -n "$tz" && "$tz" != *..* && "$tz" =~ ^[A-Za-z0-9_+/-]+$ && -f "/usr/share/zoneinfo/${tz}" ]]
+  [[ -n "$tz" && "$tz" != *..* && "$tz" =~ ^[A-Za-z0-9_+/-]+$ && -f "/usr/share/zoneinfo/${tz}" ]] || return 1
+  # 只接受時區檔（TZif 開頭），leapseconds 等其他檔案不是時區
+  [[ "$(head -c 4 "/usr/share/zoneinfo/${tz}" 2>/dev/null)" == "TZif" ]]
 }
 
 # 取得目前系統時區
@@ -501,7 +511,12 @@ set_system_timezone() {
   fi
   if ! timedatectl set-timezone "$tz" 2>/dev/null; then
     ln -sf "/usr/share/zoneinfo/${tz}" /etc/localtime
-    echo "$tz" > /etc/timezone 2>/dev/null || true
+    local tz_tmp
+    if tz_tmp=$(mktemp 2>/dev/null); then
+      # atomic_replace 沿用原檔權限，原檔不存在時沿用暫存檔（mktemp 為 600）：先設為 644
+      printf '%s\n' "$tz" > "$tz_tmp" && chmod 644 "$tz_tmp" && atomic_replace "$tz_tmp" /etc/timezone 2>/dev/null || true
+      rm -f "$tz_tmp"
+    fi
   fi
 }
 
@@ -751,6 +766,8 @@ setup_ufw() {
 setup_ssh_hardening() {
   local skip_check="${1:-false}"
   local dry_run="${2:-false}"
+  # 因沒有金鑰而略過時設為 1（回傳 0 但沒有套用，server -harden 不計入已套用）
+  SSH_HARDEN_SKIPPED=0
 
   log_step "$(_t "SERVER_SSH_STEP")"
   if [[ "$dry_run" == "true" ]]; then
@@ -783,6 +800,7 @@ setup_ssh_hardening() {
       log_warn "$(_t "SERVER_SSH_WARN_NO_KEY_AUTO_SKIP_3")"
       log_warn "$(_t "SERVER_SSH_WARN_OPERATOR" "$SSH_OPERATOR")"
       log_warn "======================================================================"
+      SSH_HARDEN_SKIPPED=1
       return 0
     fi
 
@@ -794,6 +812,7 @@ setup_ssh_hardening() {
       log_warn "======================================================================"
       if ! prompt_confirm "$(_t "SERVER_SSH_PROMPT_FORCE_DISABLE")" "n"; then
         log_warn "$(_t "SERVER_SSH_WARN_CANCELLED_LOCKOUT")"
+        SSH_HARDEN_SKIPPED=1
         return 0
       fi
     fi
@@ -912,7 +931,7 @@ setup_fail2ban() {
     local f2b_banaction="iptables-multiport" f2b_ufw_out=""
     command -v iptables >/dev/null 2>&1 || f2b_banaction="nftables-multiport"
     if command -v ufw >/dev/null 2>&1; then
-      f2b_ufw_out=$(ufw status 2>/dev/null || true)
+      f2b_ufw_out=$(LC_ALL=C ufw status 2>/dev/null || true)
       grep -q "Status: active" <<< "$f2b_ufw_out" && f2b_banaction="ufw"
     fi
     cat <<EOF > "$jail_local"
@@ -958,13 +977,14 @@ setup_dns() {
     return 0
   fi
 
-  local resolved_conf="/etc/systemd/resolved.conf"
-  if [[ ! -f "$resolved_conf" ]]; then
-    log_warn "$(_t "SERVER_DNS_WARN_CONF_NOT_FOUND" "$resolved_conf")"
+  # 寫在 drop-in（resolved.conf.d/99-clp.conf），不改套件的 resolved.conf（改了 conffile 會讓升級時 dpkg 詢問）
+  local resolved_dropin_dir="/etc/systemd/resolved.conf.d"
+  local resolved_dropin="${resolved_dropin_dir}/99-clp.conf"
+  # 沒有 systemd-resolved（例如 Debian 12、部分 LXC）：與舊版相同，警告後略過，不算失敗
+  if ! command -v resolvectl >/dev/null 2>&1 && [[ ! -f /etc/systemd/resolved.conf ]]; then
+    log_warn "$(_t "SERVER_DNS_WARN_CONF_NOT_FOUND" "/etc/systemd/resolved.conf")"
     return 0
   fi
-
-  backup_file "$resolved_conf"
 
   local primary_dns="8.8.8.8 8.8.4.4"
   local fallback_dns="1.1.1.1 1.0.0.1"
@@ -984,17 +1004,19 @@ setup_dns() {
       ;;
   esac
 
-  if grep -q "^DNS=" "$resolved_conf"; then
-    sed -i "s/^DNS=.*/DNS=${primary_dns}/" "$resolved_conf"
-  else
-    echo "DNS=${primary_dns}" >> "$resolved_conf"
+  # 目錄固定 755：umask 077 時 systemd-resolved（以 systemd-resolve 身分執行）讀不到 drop-in
+  install -d -m 0755 "$resolved_dropin_dir"
+  [[ -f "$resolved_dropin" ]] && backup_file "$resolved_dropin"
+  local tmp_resolved
+  tmp_resolved=$(mktemp) || return 1
+  # DNS=／FallbackDNS= 是清單，drop-in 會「附加」在 resolved.conf 的值後面：先以空值清空再設定
+  printf '# Managed by CLP Helper (clp server -dns)\n[Resolve]\nDNS=\nDNS=%s\nFallbackDNS=\nFallbackDNS=%s\n' "$primary_dns" "$fallback_dns" > "$tmp_resolved"
+  chmod 644 "$tmp_resolved"
+  if ! atomic_replace "$tmp_resolved" "$resolved_dropin"; then
+    rm -f "$tmp_resolved"
+    return 1
   fi
-
-  if grep -q "^FallbackDNS=" "$resolved_conf"; then
-    sed -i "s/^FallbackDNS=.*/FallbackDNS=${fallback_dns}/" "$resolved_conf"
-  else
-    echo "FallbackDNS=${fallback_dns}" >> "$resolved_conf"
-  fi
+  rm -f "$tmp_resolved"
 
   systemctl restart systemd-resolved 2>/dev/null || true
   log_success "$(_t "SERVER_DNS_SUCCESS" "${primary_dns}" "${fallback_dns}")"
@@ -1048,23 +1070,24 @@ setup_journald() {
     return 0
   fi
 
-  local journal_conf="/etc/systemd/journald.conf"
-  if [[ ! -f "$journal_conf" ]]; then
-    log_warn "$(_t "SERVER_JOURNALD_WARN_CONF_NOT_FOUND" "$journal_conf")"
+  # 寫在 drop-in（journald.conf.d/99-clp.conf），不改套件的 journald.conf（改了 conffile 會讓升級時 dpkg 詢問）
+  local journal_dropin_dir="/etc/systemd/journald.conf.d"
+  local journal_dropin="${journal_dropin_dir}/99-clp.conf"
+  if ! command -v journalctl >/dev/null 2>&1; then
+    log_warn "$(_t "SERVER_JOURNALD_WARN_CONF_NOT_FOUND" "/etc/systemd/journald.conf")"
     return 0
   fi
-
-  backup_file "$journal_conf"
-
-  if grep -q "^[#[:space:]]*SystemMaxUse=" "$journal_conf"; then
-    sed -i 's/^[#[:space:]]*SystemMaxUse=.*/SystemMaxUse=500M/' "$journal_conf"
-  else
-    if grep -q "^\[Journal\]" "$journal_conf"; then
-      sed -i '/^\[Journal\]/a SystemMaxUse=500M' "$journal_conf"
-    else
-      echo -e "\n[Journal]\nSystemMaxUse=500M" >> "$journal_conf"
-    fi
+  install -d -m 0755 "$journal_dropin_dir"
+  [[ -f "$journal_dropin" ]] && backup_file "$journal_dropin"
+  local tmp_journal
+  tmp_journal=$(mktemp) || return 1
+  printf '# Managed by CLP Helper (clp server -harden)\n[Journal]\nSystemMaxUse=500M\n' > "$tmp_journal"
+  chmod 644 "$tmp_journal"
+  if ! atomic_replace "$tmp_journal" "$journal_dropin"; then
+    rm -f "$tmp_journal"
+    return 1
   fi
+  rm -f "$tmp_journal"
 
   systemctl restart systemd-journald.service 2>/dev/null || true
   log_success "$(_t "SERVER_JOURNALD_SUCCESS")"
@@ -1131,7 +1154,8 @@ setup_php_timezone() {
 
   if [[ "$php_ini_found" == "true" ]]; then
     for svc in $(systemctl list-unit-files 2>/dev/null | grep -oE 'php[0-9.]+-fpm\.service' || true); do
-      systemctl restart "$svc" 2>/dev/null || true
+      # reload（USR2）會重新讀取 php.ini，不中斷進行中的請求；沒有執行中的服務 reload 失敗，維持停止
+      systemctl reload "$svc" 2>/dev/null || true
     done
     log_success "$(_t "SERVER_PHPTZ_SUCCESS" "${target_tz}")"
   else
@@ -1179,7 +1203,10 @@ setup_nginx_security() {
   fi
 
   # 清除舊版直接寫入 global_settings 的規則區塊
-  remove_marked_block "$global_settings" "# === CloudPanel Custom Security Rules ===" "# === End CloudPanel Custom Security Rules ===" || return 1
+  remove_marked_block "$global_settings" "# === CloudPanel Custom Security Rules ===" "# === End CloudPanel Custom Security Rules ===" || {
+    rm -f "$gs_backup" "$target_backup"
+    return 1
+  }
 
   log_info "$(_t "SERVER_NGINX_INFO_WRITING")"
   local tmp_sec
@@ -1261,12 +1288,13 @@ setup_smtp() {
   if [[ -z "$relay_host" && -t 0 && "${CLP_AUTO_YES:-false}" != "true" ]]; then
     echo ""
     echo "$(_t "SERVER_SMTP_PROMPT_CONFIG_HEADER")"
-    read -r -p "$(_t "SERVER_SMTP_PROMPT_HOST")" relay_host
+    # 讀到 EOF（Ctrl-D）一律視為取消；這些提示都在修改設定之前
+    read -r -p "$(_t "SERVER_SMTP_PROMPT_HOST")" relay_host || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
     if [[ -n "$relay_host" ]]; then
-      read -r -p "$(_t "SERVER_SMTP_PROMPT_PORT")" input_port
+      read -r -p "$(_t "SERVER_SMTP_PROMPT_PORT")" input_port || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
       relay_port="${input_port:-587}"
-      read -r -p "$(_t "SERVER_SMTP_PROMPT_USER")" smtp_user
-      read -s -r -p "$(_t "SERVER_SMTP_PROMPT_PASS")" smtp_pass
+      read -r -p "$(_t "SERVER_SMTP_PROMPT_USER")" smtp_user || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
+      read -s -r -p "$(_t "SERVER_SMTP_PROMPT_PASS")" smtp_pass || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
       echo ""
     fi
   fi
@@ -1403,7 +1431,7 @@ setup_netdata() {
   log_info "$(_t "SERVER_NETDATA_INFO_INSTALLING")"
   local kickstart_tmp
   kickstart_tmp=$(mktemp /tmp/netdata-kickstart.XXXXXX)
-  if curl -fsSL https://get.netdata.cloud/kickstart.sh -o "$kickstart_tmp"; then
+  if curl -fsSL --connect-timeout 15 --max-time 300 https://get.netdata.cloud/kickstart.sh -o "$kickstart_tmp"; then
     local ks_rc=0
     sh "$kickstart_tmp" --non-interactive --stable-channel 2>&1 || ks_rc=$?
     rm -f "$kickstart_tmp"
@@ -1432,9 +1460,14 @@ setup_netdata() {
   log_success "$(_t "SERVER_NETDATA_SUCCESS" "$(get_server_ip)")"
 
   # 主動檢查 UFW 狀態並給予 19999 放行提醒
-  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+  if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status | grep -q "Status: active"; then
     echo ""
     log_warn "$(_t "SERVER_NETDATA_WARN_UFW" "$(get_server_ip)")"
+    echo ""
+  else
+    # 沒有啟用 UFW：Netdata 預設監聽 0.0.0.0:19999 且不需登入，任何人都能看到行程、使用者與服務資訊
+    echo ""
+    log_warn "$(_t "SERVER_NETDATA_WARN_EXPOSED" "$(get_server_ip)")"
     echo ""
   fi
 
@@ -1485,7 +1518,7 @@ load_available_db_engines() {
 
   local html=""
   if [[ "$skip_network" == "false" ]]; then
-    html=$(curl -fsSL --connect-timeout 4 "$CLP_DOCS_URL" 2>/dev/null || true)
+    html=$(curl -fsSL --connect-timeout 4 --max-time 15 "$CLP_DOCS_URL" 2>/dev/null || true)
   fi
 
   if [[ -n "$html" ]] && command -v python3 >/dev/null 2>&1; then
@@ -1615,7 +1648,7 @@ handle_paste_official_command() {
     echo -e "${C_DIM}$(_t "SERVER_PASTE_PREVIEW")${C_NC}"
     echo "$pasted" | head -n 5
     echo ""
-    read -r -p "$(echo -e "${C_YELLOW}$(_t "SERVER_PASTE_PROMPT_RETURN")${C_NC}")" _
+    read -r -p "$(echo -e "${C_YELLOW}$(_t "SERVER_PASTE_PROMPT_RETURN")${C_NC}")" _ || true
     return 1
   fi
 }
@@ -1696,7 +1729,7 @@ select_db_engine_interactive() {
     echo "------------------------------------------------------------------------------"
 
     local db_choice
-    read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_DB_MENU_PROMPT" "${#dyn_engines[@]}")${C_NC}")" db_choice
+    read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_DB_MENU_PROMPT" "${#dyn_engines[@]}")${C_NC}")" db_choice || db_choice="q"
     db_choice=$(echo "$db_choice" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
 
     case "$db_choice" in
@@ -1718,7 +1751,7 @@ select_db_engine_interactive() {
         ;;
       "c"|"custom")
         local custom_input=""
-        read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_DB_MENU_CUSTOM_PROMPT")${C_NC}")" custom_input
+        read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_DB_MENU_CUSTOM_PROMPT")${C_NC}")" custom_input || custom_input=""
         custom_input=$(echo "$custom_input" | tr -d '[:space:]')
         if [[ -n "$custom_input" ]]; then
           selected=$(normalize_db_engine "$custom_input")
@@ -1729,6 +1762,7 @@ select_db_engine_interactive() {
         fi
         ;;
       *)
+        [[ "$db_choice" =~ ^[0-9]{1,6}$ ]] && db_choice=$((10#$db_choice))  # 010 不可被當成八進位的 8
         if [[ "$db_choice" =~ ^[0-9]+$ ]] && (( db_choice >= 1 && db_choice <= ${#dyn_engines[@]} )); then
           selected="${dyn_engines[$((db_choice-1))]}"
           db_engine="$selected"
@@ -1814,7 +1848,8 @@ ensure_system_bootstrap() {
   if command -v cloud-init >/dev/null 2>&1; then
     if cloud-init status 2>/dev/null | grep -qi "running"; then
       log_info "$(_t "SERVER_BOOTSTRAP_INFO_CLOUD_INIT")"
-      cloud-init status --wait >/dev/null 2>&1 || true
+      # cloud-init 卡住時不無限等待
+      timeout 600 cloud-init status --wait >/dev/null 2>&1 || true
     fi
   fi
 
@@ -1899,11 +1934,8 @@ ensure_system_bootstrap() {
             write_ok=true
           fi
           rm -f "$tmp_deb822"
-        else
-          if echo "$new_deb822" > "$deb822_file"; then
-            write_ok=true
-          fi
         fi
+        # 同目錄無法建立暫存檔時不寫入（不截斷原檔；atomic_replace 也需要在同目錄建立暫存檔），下方顯示警告
 
         if [[ "$write_ok" == "true" ]]; then
           log_success "$(_t "SERVER_BOOTSTRAP_SUCCESS_REPO_ENABLED" "${deb822_file}")"
@@ -1966,7 +1998,8 @@ ensure_system_bootstrap() {
                   }
                 }
 
-                if (has_main && !suite_has_universe[key]) {
+                # 只處理 Ubuntu 官方來源與其鏡像（URI 含 ubuntu），不改第三方 repo 與 Launchpad PPA（沒有 universe 元件）
+                if (has_main && !suite_has_universe[key] && uri ~ /ubuntu/ && uri !~ /launchpad/) {
                   cur_line = cur_line " universe"
                   suite_has_universe[key] = 1
                   modified = 1
@@ -1989,11 +2022,8 @@ ensure_system_bootstrap() {
             write_ok=true
           fi
           rm -f "$tmp_trad"
-        else
-          if echo "$new_trad" > "$trad_file"; then
-            write_ok=true
-          fi
         fi
+        # 同目錄無法建立暫存檔時不寫入（不截斷原檔；atomic_replace 也需要在同目錄建立暫存檔），下方顯示警告
 
         if [[ "$write_ok" == "true" ]]; then
           log_success "$(_t "SERVER_BOOTSTRAP_SUCCESS_REPO_ENABLED" "${trad_file}")"
@@ -2037,7 +2067,14 @@ ensure_system_bootstrap() {
         [[ -s /etc/fstab && -n "$(tail -c 1 /etc/fstab 2>/dev/null)" ]] && echo "" >> /etc/fstab
         echo "/swapfile none swap sw 0 0" >> /etc/fstab
       fi
-      log_success "$(_t "SERVER_BOOTSTRAP_SUCCESS_SWAP_ENABLED")"
+      # 既有的 /swapfile 不會重建：總量仍不到 1G 時只警告（不自動調整大小）
+      local swap_now_kb
+      swap_now_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+      if [[ "${swap_now_kb:-0}" =~ ^[0-9]+$ ]] && (( swap_now_kb < 1048576 )); then
+        log_warn "$(_t "SERVER_BOOTSTRAP_WARN_SWAP_SMALL" "$((swap_now_kb / 1024))")"
+      else
+        log_success "$(_t "SERVER_BOOTSTRAP_SUCCESS_SWAP_ENABLED")"
+      fi
     else
       log_warn "$(_t "SERVER_BOOTSTRAP_WARN_SWAP_FAILED")"
     fi
@@ -2086,6 +2123,22 @@ ensure_system_bootstrap() {
   return 0
 }
 
+# CloudPanel 的 data 目錄屬於 clp 使用者：root 不以路徑寫入或 chmod（可能是 clp 放的 symlink）
+# _clp_db_backup <db_file> <backup_file>：以 clp 身分複製
+_clp_db_backup() {
+  sudo -H -u clp cp -p -- "$1" "$2"
+}
+
+# _clp_data_fix_perms <data_dir>：root 執行 sqlite3 後產生的 root 檔案交回 clp（find 不跟隨 symlink，-execdir＋chown -h），
+# 權限以 clp 身分設定
+_clp_data_fix_perms() {
+  local data_dir="$1"
+  [[ -d "$data_dir" && ! -L "$data_dir" ]] || return 0
+  find "$data_dir" -xdev \( ! -user clp -o ! -group clp \) -execdir chown -h clp:clp {} + 2>/dev/null || true
+  sudo -H -u clp chmod 770 -- "$data_dir" 2>/dev/null || true
+  find "$data_dir" -maxdepth 1 -type f -name 'db.sq3*' -execdir sudo -H -u clp chmod 660 -- {} + 2>/dev/null || true
+}
+
 # ------------------------------------------------------------------------------
 # 3. Fresh VPS Installer Subcommand (clp server install)
 # ------------------------------------------------------------------------------
@@ -2116,7 +2169,24 @@ server_install() {
   fi
   load_available_db_engines
   if has_opt "db"; then
-    db_engine=$(normalize_db_engine "$(opt_get "db" "MYSQL_8.4")")
+    # 在 bootstrap 修改系統之前驗證：--db 沒有值（變成 true）或不在此作業系統支援清單中時報錯
+    local db_raw
+    db_raw="$(opt_get "db" "")"
+    if [[ -z "$db_raw" || "$db_raw" == "true" ]]; then
+      log_error "$(_t "SERVER_DB_ERR_VALUE_REQUIRED" "${CACHED_AVAILABLE_DB_ENGINES[*]:-}")"
+      return 1
+    fi
+    db_engine=$(normalize_db_engine "$db_raw")
+    if [[ ${#CACHED_AVAILABLE_DB_ENGINES[@]} -gt 0 ]]; then
+      local e db_ok=0
+      for e in "${CACHED_AVAILABLE_DB_ENGINES[@]}"; do
+        [[ "$e" == "$db_engine" ]] && db_ok=1
+      done
+      if [[ "$db_ok" -eq 0 ]]; then
+        log_error "$(_t "SERVER_DB_ERR_UNSUPPORTED" "$db_engine" "${CACHED_AVAILABLE_DB_ENGINES[*]}")"
+        return 1
+      fi
+    fi
   else
     # 未指定時採用此作業系統支援清單中的第一個引擎（例如 Ubuntu 22.04 不支援 MySQL 8.4）
     if [[ ${#CACHED_AVAILABLE_DB_ENGINES[@]} -gt 0 ]]; then
@@ -2161,7 +2231,7 @@ server_install() {
   fi
 
   # 若使用者未明確自訂關閉，核心項目預設為 yes
-  if ! has_opt "cloudpanel" && ! has_opt "cloudpanel-"; then
+  if ! has_opt "cloudpanel"; then
     set_mod_enabled "cloudpanel" "yes"
   fi
   if ! has_opt "system_basics" && ! has_opt "system-basics"; then
@@ -2268,9 +2338,9 @@ server_install() {
       echo "=============================================================================="
       echo -e "$(_t "SERVER_EXISTING_SYS_INFO")"
       echo -e "$(_t "SERVER_EXISTING_VER" "${installed_clp_ver}")"
-      echo -e "$(_t "SERVER_EXISTING_DB" "${installed_db_info:-installed}")"
+      echo -e "$(_t "SERVER_EXISTING_DB" "${installed_db_info:-$(_t "SERVER_EXISTING_DB_INSTALLED")}")"
       if (( existing_admin_count > 0 )); then
-        echo -e "$(_t "SERVER_EXISTING_ADMIN_CONFIGURED" "${existing_admins:-exists}")"
+        echo -e "$(_t "SERVER_EXISTING_ADMIN_CONFIGURED" "${existing_admins:-$(_t "SERVER_EXISTING_ADMIN_EXISTS")}")"
         echo -e "$(_t "SERVER_EXISTING_LOGIN_URL" "${server_ip}")"
       else
         echo -e "$(_t "SERVER_EXISTING_ADMIN_NOT_CONFIGURED")"
@@ -2294,7 +2364,7 @@ server_install() {
       local existing_loop=true
       while [[ "$existing_loop" == "true" ]]; do
         local existing_choice
-        read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_EXISTING_PROMPT_CHOICE" "$([ "${existing_admin_count:-0}" -gt 0 ] && echo "/2/3")")${C_NC}")" existing_choice
+        read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_EXISTING_PROMPT_CHOICE" "$([ "${existing_admin_count:-0}" -gt 0 ] && echo "/2/3")")${C_NC}")" existing_choice || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
         existing_choice=$(echo "$existing_choice" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
 
         case "$existing_choice" in
@@ -2312,7 +2382,7 @@ server_install() {
             echo "------------------------------------------------------------------------------"
             local target_user="${existing_admins%% *}"
             local input_user
-            read -r -p "$(echo -e "$(_t "SERVER_EXISTING_RESET_PROMPT_USER" "${target_user}")")" input_user
+            read -r -p "$(echo -e "$(_t "SERVER_EXISTING_RESET_PROMPT_USER" "${target_user}")")" input_user || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
             input_user="${input_user:-$target_user}"
             if [[ -z "$input_user" ]]; then
               echo -e "${C_RED}$(_t "SERVER_EXISTING_RESET_ERR_USER_EMPTY")${C_NC}"
@@ -2322,13 +2392,13 @@ server_install() {
             local new_pass=""
             local confirm_pass=""
             while true; do
-              read -r -s -p "$(_t "SERVER_EXISTING_RESET_PROMPT_PASS")" new_pass
+              read -r -s -p "$(_t "SERVER_EXISTING_RESET_PROMPT_PASS")" new_pass || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
               echo ""
               if [[ ${#new_pass} -lt 8 ]]; then
                 echo -e "${C_RED}$(_t "SERVER_EXISTING_RESET_ERR_PASS_LENGTH")${C_NC}"
                 continue
               fi
-              read -r -s -p "$(_t "SERVER_EXISTING_RESET_PROMPT_CONFIRM_PASS")" confirm_pass
+              read -r -s -p "$(_t "SERVER_EXISTING_RESET_PROMPT_CONFIRM_PASS")" confirm_pass || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
               echo ""
               if [[ "$new_pass" != "$confirm_pass" ]]; then
                 echo -e "${C_RED}$(_t "SERVER_EXISTING_RESET_ERR_PASS_MISMATCH")${C_NC}"
@@ -2346,7 +2416,7 @@ server_install() {
             fi
             echo ""
             local cont_ans
-            read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_EXISTING_PROMPT_CONTINUE_MODULES")${C_NC}")" cont_ans
+            read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_EXISTING_PROMPT_CONTINUE_MODULES")${C_NC}")" cont_ans || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
             cont_ans="${cont_ans:-y}"
             if [[ "$cont_ans" =~ ^[Yy]$ ]]; then
               existing_loop=false
@@ -2384,7 +2454,7 @@ server_install() {
 
               local new_admin_user=""
               while true; do
-                read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_USER")" new_admin_user
+                read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_USER")" new_admin_user || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
                 new_admin_user=$(echo "$new_admin_user" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
                 if [[ -z "$new_admin_user" ]]; then
                   echo -e "${C_RED}$(_t "SERVER_EXISTING_RESET_ERR_USER_EMPTY")${C_NC}"
@@ -2399,7 +2469,7 @@ server_install() {
 
               local new_admin_email=""
               while true; do
-                read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_EMAIL")" new_admin_email
+                read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_EMAIL")" new_admin_email || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
                 new_admin_email=$(echo "$new_admin_email" | tr -d '[:space:]')
                 if [[ -z "$new_admin_email" || ! "$new_admin_email" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then
                   echo -e "${C_RED}$(_t "SERVER_EXISTING_REPLACE_ERR_EMAIL_INVALID")${C_NC}"
@@ -2409,23 +2479,23 @@ server_install() {
               done
 
               local new_admin_first=""
-              read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_FIRSTNAME" "Admin")" new_admin_first
+              read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_FIRSTNAME" "Admin")" new_admin_first || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
               new_admin_first="${new_admin_first:-Admin}"
 
               local new_admin_last=""
-              read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_LASTNAME" "User")" new_admin_last
+              read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_LASTNAME" "User")" new_admin_last || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
               new_admin_last="${new_admin_last:-User}"
 
               local sys_tz
               sys_tz=$(get_current_timezone 2>/dev/null || echo "UTC")
               [[ -z "$sys_tz" || "$sys_tz" == "Etc/UTC" ]] && sys_tz="UTC"
               local new_admin_tz=""
-              read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_TIMEZONE" "$sys_tz")" new_admin_tz
+              read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_TIMEZONE" "$sys_tz")" new_admin_tz || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
               new_admin_tz="${new_admin_tz:-$sys_tz}"
               [[ "$new_admin_tz" == "Etc/UTC" ]] && new_admin_tz="UTC"
 
               local pass_mode=""
-              read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_PASS_MODE")" pass_mode
+              read -r -p "$(_t "SERVER_EXISTING_REPLACE_PROMPT_PASS_MODE")" pass_mode || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
               pass_mode="${pass_mode:-1}"
 
               local new_admin_pass=""
@@ -2445,13 +2515,13 @@ server_install() {
               else
                 local confirm_pass=""
                 while true; do
-                  read -r -s -p "$(_t "SERVER_EXISTING_RESET_PROMPT_PASS")" new_admin_pass
+                  read -r -s -p "$(_t "SERVER_EXISTING_RESET_PROMPT_PASS")" new_admin_pass || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
                   echo ""
                   if [[ ${#new_admin_pass} -lt 8 ]]; then
                     echo -e "${C_RED}$(_t "SERVER_EXISTING_RESET_ERR_PASS_LENGTH")${C_NC}"
                     continue
                   fi
-                  read -r -s -p "$(_t "SERVER_EXISTING_RESET_PROMPT_CONFIRM_PASS")" confirm_pass
+                  read -r -s -p "$(_t "SERVER_EXISTING_RESET_PROMPT_CONFIRM_PASS")" confirm_pass || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
                   echo ""
                   if [[ "$new_admin_pass" != "$confirm_pass" ]]; then
                     echo -e "${C_RED}$(_t "SERVER_EXISTING_RESET_ERR_PASS_MISMATCH")${C_NC}"
@@ -2463,7 +2533,7 @@ server_install() {
 
               # 建立新管理員之前先備份 db.sq3；備份失敗時什麼都不做，回到選單
               local clp_db_backup="${clp_db_file}.clpbak_$(date +%Y%m%d_%H%M%S)"
-              if ! cp -p "$clp_db_file" "$clp_db_backup"; then
+              if ! _clp_db_backup "$clp_db_file" "$clp_db_backup"; then
                 echo -e "${C_RED}$(_t "SERVER_EXISTING_REPLACE_ERR_BACKUP" "${clp_db_file}")${C_NC}"
                 [[ -n "$auto_pass_file" && -f "$auto_pass_file" ]] && rm -f "$auto_pass_file"
                 continue
@@ -2502,9 +2572,7 @@ server_install() {
                 echo -e "${C_RED}$(_t "SERVER_EXISTING_REPLACE_ERR_DELETE" "${del_failed% }" "${clp_db_backup}")${C_NC}"
               fi
 
-              chown -R clp:clp /home/clp/htdocs/app/data 2>/dev/null || true
-              chmod 770 /home/clp/htdocs/app/data 2>/dev/null || true
-              chmod 660 /home/clp/htdocs/app/data/db.sq3* 2>/dev/null || true
+              _clp_data_fix_perms /home/clp/htdocs/app/data
               systemctl restart clp-php-fpm clp-nginx 2>/dev/null || systemctl restart cloudpanel 2>/dev/null || true
 
               existing_admin_count=1
@@ -2525,19 +2593,17 @@ server_install() {
               echo "$(_t "SERVER_EXISTING_CLEAR_WARN2" "${server_ip}")"
               echo ""
               local confirm_clear
-              read -r -p "$(echo -e "${C_YELLOW}$(_t "SERVER_EXISTING_REPLACE_NO_DB_SRV_PROMPT")${C_NC}")" confirm_clear
+              read -r -p "$(echo -e "${C_YELLOW}$(_t "SERVER_EXISTING_REPLACE_NO_DB_SRV_PROMPT")${C_NC}")" confirm_clear || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
               confirm_clear="${confirm_clear:-n}"
               if [[ "$confirm_clear" =~ ^[Yy]$ ]]; then
                 log_info "$(_t "SERVER_EXISTING_CLEAR_INFO_CLEARING")"
                 local clp_db_backup="${clp_db_file}.clpbak_$(date +%Y%m%d_%H%M%S)"
-                if ! cp -p "$clp_db_file" "$clp_db_backup" || \
+                if ! _clp_db_backup "$clp_db_file" "$clp_db_backup" || \
                    ! sqlite3 "$clp_db_file" "PRAGMA foreign_keys=ON; DELETE FROM user;"; then
                   echo -e "${C_RED}$(_t "SERVER_EXISTING_CLEAR_ERR_FAILED" "${clp_db_backup}")${C_NC}"
                   continue
                 fi
-                chown -R clp:clp /home/clp/htdocs/app/data 2>/dev/null || true
-                chmod 770 /home/clp/htdocs/app/data 2>/dev/null || true
-                chmod 660 /home/clp/htdocs/app/data/db.sq3* 2>/dev/null || true
+                _clp_data_fix_perms /home/clp/htdocs/app/data
                 systemctl restart clp-php-fpm clp-nginx 2>/dev/null || systemctl restart cloudpanel 2>/dev/null || true
                 existing_admin_count=0
                 existing_admins=""
@@ -2551,7 +2617,7 @@ server_install() {
 
             echo ""
             local cont_ans
-            read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_EXISTING_PROMPT_CONTINUE_MODULES")${C_NC}")" cont_ans
+            read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_EXISTING_PROMPT_CONTINUE_MODULES")${C_NC}")" cont_ans || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
             cont_ans="${cont_ans:-y}"
             if [[ "$cont_ans" =~ ^[Yy]$ ]]; then
               existing_loop=false
@@ -2631,7 +2697,7 @@ server_install() {
       echo -e "$(_t "SERVER_MOD_MENU_CMD_CONFIRM")"
       echo -e "$(_t "SERVER_MOD_MENU_CMD_QUIT")"
       echo "------------------------------------------------------------------------------"
-      read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_MOD_MENU_PROMPT")${C_NC}")" choice
+      read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_MOD_MENU_PROMPT")${C_NC}")" choice || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
       choice=$(echo "$choice" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
 
       case "$choice" in
@@ -2691,6 +2757,7 @@ server_install() {
           # 直接前往確認畫面
           ;;
         *)
+          [[ "$choice" =~ ^[0-9]{1,6}$ ]] && choice=$((10#$choice))  # 010 不可被當成八進位的 8
           if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 3 && choice <= ${#MODULES[@]} )); then
             local target_mod="${MODULES[$((choice-1))]}"
             if is_mod_enabled "$target_mod"; then
@@ -2712,7 +2779,7 @@ server_install() {
       _print_install_plan
 
       local confirm_ans
-      read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_INSTALL_PROMPT_CONFIRM_PLAN")${C_NC}")" confirm_ans
+      read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_INSTALL_PROMPT_CONFIRM_PLAN")${C_NC}")" confirm_ans || { echo ""; log_info "$(_t "CORE_PROMPT_CANCELLED")"; return 1; }
       confirm_ans=$(echo "${confirm_ans:-y}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
       case "$confirm_ans" in
         "b"|"back")
@@ -2938,7 +3005,7 @@ server_status() {
   # Memory & Swap
   if command -v free >/dev/null 2>&1; then
     local m_out
-    m_out=$(free -m)
+    m_out=$(LC_ALL=C free -m)  # 解析英文欄位名稱（Mem:、Swap:），不受語系影響
     local mem_tot mem_usd swap_tot swap_usd
     mem_tot=$(echo "$m_out" | awk '/^Mem:/{print $2}')
     mem_usd=$(echo "$m_out" | awk '/^Mem:/{print $3}')
@@ -3051,7 +3118,7 @@ server_status() {
   local icmp_status=""
   if command -v ufw >/dev/null 2>&1; then
     local ufw_out
-    ufw_out=$(ufw status 2>/dev/null || true)
+    ufw_out=$(LC_ALL=C ufw status 2>/dev/null || true)
     if grep -q "Status: active" <<< "$ufw_out"; then
       ufw_status="${C_GREEN}$(_t "SERVER_DASH_UFW_ENABLED")${C_NC}"
       if [[ -f /etc/ufw/before.rules ]] && grep -q 'ufw-before-input.*icmp.*DROP' /etc/ufw/before.rules 2>/dev/null; then
@@ -3088,7 +3155,7 @@ server_status() {
   fi
 
   # UFW 埠號稽核
-  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+  if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status | grep -q "Status: active"; then
     audit_ufw="${C_GREEN}$(_t "SERVER_AUDIT_UFW_ACTIVE")${C_NC}"
   else
     audit_ufw="${C_RED}$(_t "SERVER_AUDIT_UFW_INACTIVE")${C_NC}"
@@ -3110,7 +3177,8 @@ server_status() {
   fi
 
   # Journald 上限
-  if [[ -f /etc/systemd/journald.conf ]] && grep -q '^SystemMaxUse=500M' /etc/systemd/journald.conf 2>/dev/null; then
+  # drop-in（新版）或舊版直接寫在 journald.conf
+  if grep -qs '^SystemMaxUse=500M' /etc/systemd/journald.conf.d/99-clp.conf /etc/systemd/journald.conf; then
     audit_journald="${C_GREEN}$(_t "SERVER_AUDIT_JOURNALD_LIMITED")${C_NC}"
   else
     audit_journald="${C_YELLOW}$(_t "SERVER_AUDIT_JOURNALD_UNLIMITED")${C_NC}"
@@ -3192,7 +3260,7 @@ server_harden() {
   # [2/7] SSH 安全加固
   echo -e "${C_BOLD}$(_t "SERVER_HARDEN_SSH_TITLE")${C_NC}"
   if _harden_ask "$hd_dry" "$(_t "SERVER_HARDEN_SSH_PROMPT")"; then
-    if setup_ssh_hardening "false" "$hd_dry"; then applied_count=$((applied_count + 1)); fi
+    if setup_ssh_hardening "false" "$hd_dry" && [[ "${SSH_HARDEN_SKIPPED:-0}" -eq 0 ]]; then applied_count=$((applied_count + 1)); fi
   else
     log_info "$(_t "SERVER_HARDEN_SSH_SKIPPED")"
   fi
@@ -3692,14 +3760,20 @@ server_dns() {
   dns_val=$(echo "$dns_val" | tr '[:upper:]' '[:lower:]')
 
   if [[ -n "$dns_val" && "$dns_val" != "true" ]]; then
-    setup_dns "$dns_val" "false"
+    # 不認得的名稱（例如打錯的 cloudfare）不可默默套用 Google DNS
+    case "$dns_val" in
+      auto|google|cloudflare) ;;
+      *) log_error "$(_t "SERVER_DNS_ERR_PROVIDER" "$dns_val")"; return 1 ;;
+    esac
+    setup_dns "$dns_val" "false" || return 1
     return 0
   fi
 
   # 檢視目前 DNS 解析設定
   log_step "$(_t "SERVER_DNS_MANAGE_STEP_CONFIG")"
-  if [[ -f /etc/systemd/resolved.conf ]]; then
-    grep -E '^(DNS|FallbackDNS)=' /etc/systemd/resolved.conf || echo "$(_t "SERVER_DNS_MANAGE_USING_DEFAULT")"
+  if [[ -f /etc/systemd/resolved.conf || -d /etc/systemd/resolved.conf.d ]]; then
+    # drop-in 的值優先於 resolved.conf；兩者都列出（含檔名）
+    grep -HsE '^(DNS|FallbackDNS)=' /etc/systemd/resolved.conf /etc/systemd/resolved.conf.d/*.conf || echo "$(_t "SERVER_DNS_MANAGE_USING_DEFAULT")"
   fi
   echo ""
   if command -v resolvectl >/dev/null 2>&1; then

@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.2.0 (建置時間 2026-10-25 16:05:18)`
+輸出範例：`CLP Helper v1.3.0 (建置時間 2026-10-25 18:15:01)`
 
 查看全域功能說明選單：
 
@@ -375,7 +375,7 @@ sudo clp site -list=enabled
 sudo clp site -list=disabled
 ```
 
-僅列出具備 SSL 憑證網站：
+僅列出具備受信任憑證的網站（例如 Let's Encrypt；CloudPanel 預設的自簽憑證不算，這些網站用 `-list=nossl` 列出）：
 
 ```bash
 sudo clp site -list=ssl
@@ -587,7 +587,7 @@ sudo clp site example.com -cf-waf=off
 ```
 
 - **安全設計**：
-  - **Token 四級解析**：自動支援 CLI `--token`、既有 Certbot `/root/.secrets/*.ini` 憑證檔、全域 `clp config` 設定（`/etc/clp/clp.local`）或環境變數。
+  - **Token 四級解析**：自動支援以 `-token=<憑證檔>` 指定（不接受直接寫在命令列上的 token，其他使用者可用 `ps` 看到）、既有 Certbot `/root/.secrets/*.ini` 憑證檔、全域 `clp config` 設定（`/etc/clp/clp.local`）或環境變數。
   - **自訂規則隔離保護**：僅變更標註 `[CLP]` 前綴之規則，使用者原有業務規則絕不覆蓋。
   - **配額上限檢查**：部署前依 zone 方案檢查自訂規則數量上限（Free 5／Pro 20／Business 100／Enterprise 1000），超過時停止並列出現有規則，避免 API 400 錯誤。
 

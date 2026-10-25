@@ -5,6 +5,7 @@ Provides atomic, symlink-resistant file operations and permissions preservation
 for files residing in user home directories and system paths.
 """
 
+import io
 import sys
 import os
 import re
@@ -14,6 +15,37 @@ import argparse
 import pwd
 import grp
 import secrets
+
+# read_file_nofollow only serves small config files (wp-config.php, .user.ini, .htpasswd, ...)
+MAX_READ_BYTES = 8 * 1024 * 1024
+
+
+def home_split(path):
+    """
+    Returns (user, path_under_real_home) when path lies under the home base (CLP_HOME_DIR, default
+    /home), matched against both the base as given and its realpath, so a host where /home is a
+    symlink (e.g. /home -> /data/home) still gets the fd-based path. Returns (None, path) otherwise.
+    """
+    raw = os.path.abspath(os.environ.get("CLP_HOME_DIR", "/home")).rstrip("/")
+    real = os.path.realpath(raw).rstrip("/")
+    for base in (real, raw):
+        rel = os.path.relpath(path, base)
+        if rel == "." or rel == ".." or rel.startswith(".." + os.sep):
+            continue
+        parts = rel.split(os.sep)
+        if parts and parts[0]:
+            return parts[0], os.path.join(real, rel)
+    return None, path
+
+
+def write_all(fd, data):
+    """Writes all of data to fd; raises instead of leaving a short write behind."""
+    total_written = 0
+    while total_written < len(data):
+        n = os.write(fd, data[total_written:])
+        if n <= 0:
+            raise OSError(f"short write: {total_written} of {len(data)} bytes")
+        total_written += n
 
 
 def open_dir_tree_nofollow(home_user_dir, target_dir):
@@ -31,21 +63,25 @@ def open_dir_tree_nofollow(home_user_dir, target_dir):
     home_fd = os.open(home_user_dir, flags)
     open_fds = [home_fd]
     current_fd = home_fd
-    if rel_dir != ".":
-        parts = rel_dir.split(os.sep)
-        for part in parts:
-            if not part or part == ".":
-                continue
-            if part == "..":
-                for fd in reversed(open_fds):
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                raise PermissionError("Security violation: path traverses upwards via '..'")
-            next_fd = os.open(part, flags, dir_fd=current_fd)
-            open_fds.append(next_fd)
-            current_fd = next_fd
+    try:
+        if rel_dir != ".":
+            parts = rel_dir.split(os.sep)
+            for part in parts:
+                if not part or part == ".":
+                    continue
+                if part == "..":
+                    raise PermissionError("Security violation: path traverses upwards via '..'")
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+                open_fds.append(next_fd)
+                current_fd = next_fd
+    except BaseException:
+        # 中途失敗（symlink、不存在）時關閉已開啟的目錄，不留給呼叫端
+        for fd in reversed(open_fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
     return current_fd, open_fds
 
 
@@ -73,15 +109,15 @@ def safe_atomic_write(target_path, content, user=None, allow_create=False, owner
         if not (real_dir == f"{base_home}/{user}" or real_dir.startswith(expected_prefix)):
             raise PermissionError(f"Security violation: target directory '{real_dir}' is not within '{expected_prefix}'")
 
-    inferred_user = user
-    if not inferred_user:
-        rel_to_base = os.path.relpath(target_path, base_home)
-        if not rel_to_base.startswith(".."):
-            parts = rel_to_base.split(os.sep)
-            if parts and parts[0]:
-                inferred_user = parts[0]
+    split_user, home_path = home_split(target_path)
+    inferred_user = user or split_user
+    if split_user:
+        target_path = home_path
+        target_dir = os.path.dirname(target_path)
 
     home_user_dir = f"{base_home}/{inferred_user}" if inferred_user else None
+    if user and not os.path.isdir(home_user_dir):
+        raise FileNotFoundError(f"Home directory of '{user}' not found: {home_user_dir}")
     if home_user_dir and os.path.isdir(home_user_dir):
         # Step-by-step traversal with dir_fd under /home/<user> (#10)
         target_fd, open_fds = open_dir_tree_nofollow(home_user_dir, target_dir)
@@ -136,12 +172,7 @@ def safe_atomic_write(target_path, content, user=None, allow_create=False, owner
             os.fchmod(tmp_fd, target_mode)
 
             data = content.encode("utf-8") if isinstance(content, str) else content
-            total_written = 0
-            while total_written < len(data):
-                n = os.write(tmp_fd, data[total_written:])
-                if n == 0:
-                    break
-                total_written += n
+            write_all(tmp_fd, data)
 
             os.fsync(tmp_fd)
             os.close(tmp_fd)
@@ -219,12 +250,7 @@ def safe_atomic_write(target_path, content, user=None, allow_create=False, owner
         else:
             data = content
 
-        total_written = 0
-        while total_written < len(data):
-            n = os.write(fd, data[total_written:])
-            if n == 0:
-                break
-            total_written += n
+        write_all(fd, data)
 
         os.fsync(fd)
         os.close(fd)
@@ -246,31 +272,27 @@ def safe_atomic_write(target_path, content, user=None, allow_create=False, owner
     return True
 
 
-def read_file_nofollow(path, user=None):
+def open_regular_nofollow(path, user=None):
     """
-    Reads all lines from path preventing symlink traversal via O_NOFOLLOW.
-    Opens with O_NONBLOCK and refuses anything but a regular file, so a FIFO or
-    device planted by the site user cannot block or feed root.
+    Opens path read-only without following symlinks (O_NOFOLLOW, fd walk under /home/<user>) and
+    returns the fd. Opens with O_NONBLOCK and refuses anything but a regular file, so a FIFO or
+    device planted by the site user cannot block or feed root; refuses files over MAX_READ_BYTES.
     """
     path = os.path.abspath(path)
-    if not os.path.exists(path):
-        return []
     if os.path.islink(path):
         raise OSError(f"Security violation: refusing to read symlink '{path}'")
 
+    split_user, home_path = home_split(path)
+    if split_user:
+        path = home_path
     target_dir = os.path.dirname(path)
     base_name = os.path.basename(path)
     base_home = os.path.realpath(os.environ.get("CLP_HOME_DIR", "/home")).rstrip("/")
 
-    inferred_user = user
-    if not inferred_user:
-        rel_to_base = os.path.relpath(path, base_home)
-        if not rel_to_base.startswith(".."):
-            parts = rel_to_base.split(os.sep)
-            if parts and parts[0]:
-                inferred_user = parts[0]
-
+    inferred_user = user or split_user
     home_user_dir = f"{base_home}/{inferred_user}" if inferred_user else None
+    if user and not os.path.isdir(home_user_dir):
+        raise FileNotFoundError(f"Home directory of '{user}' not found: {home_user_dir}")
     if home_user_dir and os.path.isdir(home_user_dir):
         target_fd, open_fds = open_dir_tree_nofollow(home_user_dir, target_dir)
         try:
@@ -290,11 +312,39 @@ def read_file_nofollow(path, user=None):
             flags |= os.O_NOFOLLOW
         fd = os.open(path, flags)
 
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
         os.close(fd)
         raise OSError(f"Security violation: refusing to read non-regular file '{path}'")
+    if st.st_size > MAX_READ_BYTES:
+        os.close(fd)
+        raise OSError(f"Refusing to read '{path}': larger than {MAX_READ_BYTES} bytes")
+    return fd
+
+
+def read_file_nofollow(path, user=None):
+    """
+    Reads all lines from path preventing symlink traversal via O_NOFOLLOW (see open_regular_nofollow).
+    Returns [] when the file does not exist.
+    """
+    if not os.path.exists(os.path.abspath(path)):
+        return []
+    fd = open_regular_nofollow(path, user=user)
     with open(fd, "r", encoding="utf-8", errors="replace", closefd=True) as f:
-        return f.readlines()
+        data = f.read(MAX_READ_BYTES + 1)
+    if len(data) > MAX_READ_BYTES:
+        raise OSError(f"Refusing to read '{path}': larger than {MAX_READ_BYTES} bytes")
+    return io.StringIO(data).readlines()
+
+
+def read_bytes_nofollow(path, user=None):
+    """Like read_file_nofollow, but returns the exact bytes (no newline translation or decoding)."""
+    fd = open_regular_nofollow(path, user=user)
+    with open(fd, "rb", closefd=True) as f:
+        data = f.read(MAX_READ_BYTES + 1)
+    if len(data) > MAX_READ_BYTES:
+        raise OSError(f"Refusing to read '{path}': larger than {MAX_READ_BYTES} bytes")
+    return data
 
 
 def read_text_nofollow(path, user=None):

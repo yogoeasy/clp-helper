@@ -53,8 +53,11 @@ httpauth_validate_ip() {
   local ip="$1"
   [[ -n "$ip" ]] || return 1
   python3 -I -c '
-import sys, ipaddress
+import sys, re, ipaddress
 v = sys.argv[1]
+# 只接受位址字元：ip_network 也接受 IPv6 scope ID（fe80::1%x;}），其中的任意字元會寫進 nginx 設定
+if not re.fullmatch(r"[0-9A-Fa-f.:/]+", v):
+    sys.exit(1)
 # nginx allow 僅接受前綴長度 (10.0.0.0/8)，不接受 netmask/hostmask 寫法 (10.0.0.0/255.0.0.0)
 if "/" in v and not v.split("/", 1)[1].isdigit():
     sys.exit(1)
@@ -80,13 +83,15 @@ httpauth_read_whitelist_directives() {
         valid_ips+=("$line")
       fi
     done < <(python3 -I -c '
-import sys, ipaddress
+import sys, re, ipaddress
 for raw in open(sys.argv[1], encoding="utf-8", errors="replace"):
     v = raw.strip()
     if not v or v.startswith("#"):
         continue
     ok = True
-    if "/" in v and not v.split("/", 1)[1].isdigit():
+    if not re.fullmatch(r"[0-9A-Fa-f.:/]+", v):
+        ok = False
+    elif "/" in v and not v.split("/", 1)[1].isdigit():
         ok = False
     else:
         try:
@@ -200,7 +205,7 @@ httpauth_realip_disable() {
 _httpauth_nginx_active_workers() {
   local master="$1" pid title
   for pid in $(pgrep -P "$master" 2>/dev/null || true); do
-    title=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null) || continue
+    title=$(tr '\0' ' ' 2>/dev/null < "/proc/${pid}/cmdline") || continue
     if [[ "$title" == *"worker process"* && "$title" != *"shutting down"* ]]; then
       echo "$pid"
     fi
@@ -225,7 +230,7 @@ httpauth_reload_nginx() {
   for ((i = 0; i < 75; i++)); do
     pending=0
     for pid in $old; do
-      title=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null) || continue
+      title=$(tr '\0' ' ' 2>/dev/null < "/proc/${pid}/cmdline") || continue
       if [[ -n "$title" && "$title" != *"shutting down"* ]]; then
         pending=1
         break
@@ -299,7 +304,7 @@ httpauth_add_user() {
   fi
 
   if [[ -z "$password" ]]; then
-    if ! read -r -s -p "$(_t "HTTPAUTH_ADD_USER_5")" password; then
+    if ! IFS= read -r -s -p "$(_t "HTTPAUTH_ADD_USER_5")" password; then
       echo ""
       log_info "$(_t "CORE_PROMPT_CANCELLED")"
       return 1
@@ -310,7 +315,7 @@ httpauth_add_user() {
       return 1
     fi
     local password_confirm=""
-    if ! read -r -s -p "$(_t "HTTPAUTH_ADD_USER_7")" password_confirm; then
+    if ! IFS= read -r -s -p "$(_t "HTTPAUTH_ADD_USER_7")" password_confirm; then
       echo ""
       log_info "$(_t "CORE_PROMPT_CANCELLED")"
       return 1
@@ -402,8 +407,17 @@ httpauth_del_user() {
   fi
 
   if [[ -z "$username" ]]; then
+    # 沒有終端機時無法詢問：明確報錯（用 -delete=<使用者>）；讀到 EOF（Ctrl-D）視為取消
+    if [[ ! -t 0 ]]; then
+      log_error "$(_t "HTTPAUTH_ERR_DEL_NEEDS_USER")"
+      return 1
+    fi
     echo -e "$(_t "HTTPAUTH_DEL_USER_2" "${C_CYAN}" "${C_BOLD}" "${domain}" "${C_NC}")"
-    read -r -p "$(_t "HTTPAUTH_DEL_USER_3")" username
+    if ! read -r -p "$(_t "HTTPAUTH_DEL_USER_3")" username; then
+      echo ""
+      log_info "$(_t "CORE_PROMPT_CANCELLED")"
+      return 1
+    fi
     username=$(echo "$username" | tr -d '[:space:]')
   fi
 
@@ -459,7 +473,7 @@ httpauth_del_user() {
       fi
       local p
       for p in "${active_paths[@]}"; do
-        echo -e "  • path ${p}: $(_t "HTTPAUTH_DEL_LAST_USER_HINT_PATH" "$domain" "$p")"
+        echo -e "  • $(_t "HTTPAUTH_LABEL_PATH" "$p"): $(_t "HTTPAUTH_DEL_LAST_USER_HINT_PATH" "$domain" "$p")"
       done
       log_warn "======================================================================"
 
@@ -510,7 +524,7 @@ httpauth_list_users() {
     return 0
   fi
 
-  printf "%-6s %-30s\n" "#" "USERNAME"
+  printf "%-6s %-30s\n" "#" "$(_t "HTTPAUTH_LIST_HEADER_USER")"
   echo "--------------------------------------------------"
   local idx=1
   while IFS=':' read -r u _ || [[ -n "$u" ]]; do
@@ -644,7 +658,7 @@ httpauth_set_wp_admin() {
     wl_directives=$(httpauth_read_whitelist_directives "$domain")
 
     # Python 腳本更新 Nginx 設定檔中的 location ~/(wp-admin/|wp-login.php)
-    cp "$vhost" "${vhost}.clpbak"
+    cp -p "$vhost" "${vhost}.clpbak"
     if ! python3 -I "$HTTPAUTH_VHOST_PY" wpadmin-on "$vhost" "$htpasswd_file" "$wl_directives"; then
       log_error "$(_t "HTTPAUTH_SET_WP_ADMIN_6")"
       mv "${vhost}.clpbak" "$vhost"
@@ -665,7 +679,7 @@ httpauth_set_wp_admin() {
   else
     # Turn off wp-admin protection
     log_step "$(_t "HTTPAUTH_SET_WP_ADMIN_9" "${domain}")"
-    cp "$vhost" "${vhost}.clpbak"
+    cp -p "$vhost" "${vhost}.clpbak"
 
     python3 -I "$HTTPAUTH_VHOST_PY" wpadmin-off "$vhost" "$siteuser" || {
       log_error "$(_t "HTTPAUTH_SET_WP_ADMIN_10")"
@@ -744,7 +758,7 @@ httpauth_set_path() {
     local wl_directives
     wl_directives=$(httpauth_read_whitelist_directives "$domain")
 
-    cp "$vhost" "${vhost}.clpbak"
+    cp -p "$vhost" "${vhost}.clpbak"
 
     python3 -I "$HTTPAUTH_VHOST_PY" path-on "$vhost" "$htpasswd_file" "$target_path" "$wl_directives" || {
       log_error "$(_t "HTTPAUTH_SET_PATH_5")"
@@ -766,7 +780,7 @@ httpauth_set_path() {
   else
     # Turn off path protection
     log_step "$(_t "HTTPAUTH_SET_PATH_7" "${domain}" "${target_path}")"
-    cp "$vhost" "${vhost}.clpbak"
+    cp -p "$vhost" "${vhost}.clpbak"
 
     python3 -I "$HTTPAUTH_VHOST_PY" path-off "$vhost" "$target_path" || {
       log_error "$(_t "HTTPAUTH_SET_WP_ADMIN_10")"
@@ -980,7 +994,7 @@ httpauth_clear_all_paths() {
     return 1
   fi
 
-  cp "$vhost" "${vhost}.clpbak"
+  cp -p "$vhost" "${vhost}.clpbak"
 
   python3 -I "$HTTPAUTH_VHOST_PY" clear-paths "$vhost" || {
     log_error "$(_t "HTTPAUTH_SET_WP_ADMIN_10")"
@@ -1016,7 +1030,7 @@ httpauth_refresh_active_blocks() {
   local wl_directives
   wl_directives=$(httpauth_read_whitelist_directives "$domain")
 
-  cp "$vhost" "${vhost}.clpbak"
+  cp -p "$vhost" "${vhost}.clpbak"
 
   python3 -I "$HTTPAUTH_VHOST_PY" refresh "$vhost" "$htpasswd_file" "$wl_directives" || {
     log_error "$(_t "HTTPAUTH_REFRESH_ACTIVE_BLOCKS_1")"

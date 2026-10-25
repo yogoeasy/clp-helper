@@ -50,6 +50,7 @@ cf_resolve_credentials() {
   CF_RESOLVED_FILE=""
   CF_RESOLVED_TOKEN=""
   CF_RESOLVED_SOURCE=""
+  CF_RESOLVE_ERR_SHOWN=0   # 已顯示具體錯誤時為 1，cf_resolve_token 不再加上一般的「找不到 token」
 
   local token=""
   local credentials_file=""
@@ -67,11 +68,14 @@ cf_resolve_credentials() {
       else
         # 明確指定的檔案無法取得 token 時直接失敗，不可默默改用其他帳號的 token
         log_error "$(_t "CF_ERR_TOKEN_FILE_NO_TOKEN" "$f")"
+        CF_RESOLVE_ERR_SHOWN=1
         return 1
       fi
     else
-      token="$cli_token"
-      source_desc="CLI parameter"
+      # 命令列上的 token 本身會出現在 ps／/proc/<pid>/cmdline：-token 只接受憑證檔路徑
+      log_error "$(_t "CF_ERR_TOKEN_ARG_NOT_FILE")"
+      CF_RESOLVE_ERR_SHOWN=1
+      return 1
     fi
   fi
 
@@ -226,7 +230,7 @@ cf_resolve_token() {
     echo "$CF_RESOLVED_TOKEN"
     return 0
   else
-    log_error "$(_t "CF_ERR_TOKEN_NOT_FOUND")"
+    [[ "${CF_RESOLVE_ERR_SHOWN:-0}" -eq 1 ]] || log_error "$(_t "CF_ERR_TOKEN_NOT_FOUND")"
     return 1
   fi
 }
@@ -369,7 +373,8 @@ cf_configure_zone_settings() {
     log_warn "$(_t "CF_WARN_SETTING_FAILED" "min_tls_version" "$resp")"
   fi
 
-  [[ "$ok_count" -gt 0 ]]
+  # 三項都成功才算成功（任一項失敗時呼叫端顯示警告，不可顯示成「已完成」）
+  [[ "$ok_count" -eq 3 ]]
 }
 
 # ------------------------------------------------------------------------------
@@ -413,6 +418,26 @@ cf_load_waf_rules_json() {
   local final_ip_set=""
   if [[ -n "$ip_list" ]]; then
     final_ip_set="$(echo "$ip_list" | tr ' ' '\n' | grep -v '^[[:space:]]*$' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  fi
+  # 白名單會直接放進 Cloudflare 規則的 ip.src in {...}：每一項都必須是 IP 或 CIDR
+  if [[ -n "$final_ip_set" ]]; then
+    local bad_ip
+    bad_ip="$(python3 -I -c '
+import sys, re, ipaddress
+for v in sys.argv[1].split():
+    try:
+        # 與 httpauth 相同：只接受位址字元與數字前綴長度（不接受 10.0.0.0/255.0.0.0）
+        if not re.fullmatch(r"[0-9A-Fa-f.:/]+", v) or ("/" in v and not v.split("/", 1)[1].isdigit()):
+            raise ValueError
+        ipaddress.ip_network(v, strict=False)
+    except ValueError:
+        print(v)
+        break
+' "$final_ip_set")"
+    if [[ -n "$bad_ip" ]]; then
+      log_error "$(_t "CF_ERR_WHITELIST_INVALID_IP" "$bad_ip")"
+      return 1
+    fi
   fi
 
   python3 -I - "$conf_file" "$domain" "$s_ip" "$final_ip_set" <<'PYEOF'
@@ -612,7 +637,7 @@ print(json.dumps({'rules': merged}))
     log_success "$(_t "CF_SUCCESS_RULES_DEPLOYED")"
     return 0
   else
-    log_error "Cloudflare API Error: $put_resp"
+    log_error "$(_t "CF_ERR_API_RESPONSE" "$put_resp")"
     return 1
   fi
 }
@@ -699,7 +724,7 @@ else:
     log_success "$(_t "CF_SUCCESS_RULES_REMOVED")"
     return 0
   else
-    log_error "Cloudflare API Error: $put_resp"
+    log_error "$(_t "CF_ERR_API_RESPONSE" "$put_resp")"
     return 1
   fi
 }
@@ -814,10 +839,10 @@ except Exception:
         echo -e "  $(_t "CF_STATUS_RULES_HEADER" "$f1")"
         ;;
       CLP_RULE)
-        echo -e "    ${C_GREEN}✔${C_NC} ${f1} (Action: ${f2}, Status: ${f3})"
+        echo -e "    ${C_GREEN}✔${C_NC} $(_t "CF_WAF_RULE_LINE" "$f1" "$f2" "$f3")"
         ;;
       USER_RULE)
-        echo -e "    ${C_BLUE}ℹ${C_NC} [Custom] ${f1} (Action: ${f2}, Status: ${f3})"
+        echo -e "    ${C_BLUE}ℹ${C_NC} $(_t "CF_WAF_RULE_LINE_CUSTOM" "$f1" "$f2" "$f3")"
         ;;
     esac
   done
@@ -848,18 +873,24 @@ cf_check_and_enable_proxy() {
 import sys, json
 try:
     d = json.loads(sys.argv[1])
-    if d.get('success'):
-        for r in d.get('result', []):
-            rtype = r.get('type', '')
-            proxiable = r.get('proxiable', False)
-            if rtype in ['A', 'CNAME', 'AAAA'] and proxiable:
-                rid = r.get('id', '')
-                proxied = 'true' if r.get('proxied') else 'false'
-                print(f\"{rid}\t{rtype}\t{proxied}\")
+    if not d.get('success'):
+        raise ValueError
+    for r in d.get('result', []):
+        rtype = r.get('type', '')
+        proxiable = r.get('proxiable', False)
+        if rtype in ['A', 'CNAME', 'AAAA'] and proxiable:
+            rid = r.get('id', '')
+            proxied = 'true' if r.get('proxied') else 'false'
+            print(f\"{rid}\t{rtype}\t{proxied}\")
 except Exception:
-    pass
+    print('QUERY_FAILED')
 " "$resp" 2>/dev/null || true)"
 
+  # 查詢失敗（權限不足、限流、逾時、格式錯誤）不是「沒有記錄」
+  if [[ "$records_data" == "QUERY_FAILED" ]]; then
+    log_error "$(_t "CF_ERR_DNS_QUERY_FAILED" "$domain")"
+    return 1
+  fi
   if [[ -z "$records_data" ]]; then
     log_warn "$(_t "CF_WARN_DNS_NO_RECORD_FOUND" "$domain")"
     return 0
@@ -918,6 +949,7 @@ except Exception:
   fi
 
   # 5. 更新為 Proxied (橘色雲朵)
+  local patch_failed=0
   for item in "${unproxied_records[@]}"; do
     local r_id="${item%%:*}"
     local r_type="${item##*:}"
@@ -935,8 +967,9 @@ except Exception:
       log_success "$(_t "CF_SUCCESS_DNS_PROXY_ENABLED")"
     else
       log_error "$(_t "CF_ERR_DNS_UPDATE_FAILED" "$patch_resp")"
+      patch_failed=1
     fi
   done
 
-  return 0
+  return "$patch_failed"
 }

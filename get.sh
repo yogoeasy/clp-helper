@@ -29,7 +29,8 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   die "Please run as root: sudo bash $0 $*"
 fi
 
-if [[ ! "$CLP_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+# A git ref never contains ".." or starts/ends with "/"; curl resolves "../", which could point the URL at another repository
+if [[ ! "$CLP_REF" =~ ^[A-Za-z0-9._/-]+$ || "$CLP_REF" == *..* || "$CLP_REF" == /* || "$CLP_REF" == */ ]]; then
   die "Invalid CLP_REF: ${CLP_REF}"
 fi
 

@@ -314,14 +314,14 @@ atomic_replace() {
   target_dir="$(dirname "$target")"
 
   if [[ ! -f "$src" ]]; then
-    log_error "atomic_replace: source file '${src}' not found"
+    log_error "$(_t "CORE_ERR_ATOMIC_SRC_MISSING" "$src")"
     return 1
   fi
 
   local dir_uid
   dir_uid=$(stat -c "%u" "$target_dir" 2>/dev/null || stat -f "%u" "$target_dir" 2>/dev/null || echo "999")
   if [[ "$dir_uid" -ne 0 ]]; then
-    log_error "atomic_replace: target directory '${target_dir}' is not owned by root (uid=${dir_uid}); refusing for security"
+    log_error "$(_t "CORE_ERR_ATOMIC_DIR_NOT_ROOT" "$target_dir" "$dir_uid")"
     return 1
   fi
 
@@ -372,7 +372,7 @@ remove_marked_block() {
   sc=$(grep -cF -- "$start_tag" "$target" 2>/dev/null || true)
   ec=$(grep -cF -- "$end_tag" "$target" 2>/dev/null || true)
   if [[ "$sc" -ne "$ec" ]]; then
-    log_error "remove_marked_block: tag count mismatch in ${target} (${start_tag}: ${sc}, ${end_tag}: ${ec})"
+    log_error "$(_t "CORE_ERR_MARKED_BLOCK_COUNT" "$target" "$start_tag" "$sc" "$end_tag" "$ec")"
     return 1
   fi
   [[ "$sc" -eq 0 ]] && return 0
@@ -385,7 +385,7 @@ remove_marked_block() {
     !in_block { print }
     END { if (in_block) exit 1 }
   ' "$target" > "$tmp_out"; then
-    log_error "remove_marked_block: parse error or inverted tags in ${target}"
+    log_error "$(_t "CORE_ERR_MARKED_BLOCK_PARSE" "$target")"
     rm -f "$tmp_out"
     return 1
   fi
@@ -473,7 +473,7 @@ check_wpcli() {
     local wpcli_tmp
     wpcli_tmp=$(mktemp /tmp/wp-cli.XXXXXX)
     # -f：HTTP 錯誤時失敗（不把錯誤頁面當成 wp-cli 安裝）；並確認下載的是可執行的 phar
-    if curl -fsSL -o "$wpcli_tmp" https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
+    if curl -fsSL --connect-timeout 15 --max-time 300 -o "$wpcli_tmp" https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
        && php "$wpcli_tmp" --info --allow-root >/dev/null 2>&1; then
       # mktemp 建立的檔案是 600：改成 755，網站使用者（sudo -u）才能執行
       chmod 755 "$wpcli_tmp"
@@ -505,7 +505,8 @@ check_rclone() {
   read -p "$(_t "CORE_PROMPT_INSTALL_RCLONE")" install_rc
   if [[ "$install_rc" =~ ^[Yy]$ ]]; then
     log_info "$(_t "CORE_INFO_INSTALLING_RCLONE")"
-    curl -fsSL https://rclone.org/install.sh | bash
+    # 下載失敗時往下由 command -v 判斷並顯示錯誤（不讓 set -e 直接中止）
+    curl -fsSL --connect-timeout 15 --max-time 120 https://rclone.org/install.sh | bash || true
     if command -v rclone >/dev/null 2>&1; then
       log_success "$(_t "CORE_SUCCESS_RCLONE_INSTALLED")"
       return 0

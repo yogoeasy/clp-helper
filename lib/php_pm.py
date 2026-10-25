@@ -341,12 +341,13 @@ def _int(v):
 
 def cmd_status(domain=None):
     if domain is not None and not DOMAIN_RE.match(domain):
-        fail("invalid domain: %s" % domain)
+        # 給 php_fpm.sh 的錯誤代碼（訊息由 bash 端翻譯）
+        fail("clp-error:invalid-domain:%s" % domain)
     pools = list_pools()
     if domain is not None:
         pools = [p for p in pools if p[0] == domain]
         if not pools:
-            fail("no PHP-FPM pool file found for %s" % domain)
+            fail("clp-error:no-pool:%s" % domain)
     mem = memory_info()
     cap = max(MIN_CHILDREN, mem["budget"] // mem["worker"])
     logs = reached_in_logs(sorted({p[1] for p in pools}))

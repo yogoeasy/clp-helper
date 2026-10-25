@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.2.0 (build 2026-10-25 16:05:18)`
+Output example:`CLP Helper v1.3.0 (build 2026-10-25 18:15:01)`
 
 Display global help menu:
 
@@ -367,7 +367,7 @@ Only paused sites:
 sudo clp site -list=disabled
 ```
 
-Only sites with active SSL:
+Only sites with a trusted certificate (for example Let's Encrypt; CloudPanel's self-signed fallback does not count, and `-list=nossl` lists those sites):
 
 ```bash
 sudo clp site -list=ssl
@@ -579,7 +579,7 @@ sudo clp site example.com -cf-waf=off
 ```
 
 - **Key Security Highlights**:
-  - **4-Level Token Cascade**: Supports CLI `--token`, existing Certbot `/root/.secrets/*.ini` files, global `clp config` token (`/etc/clp/clp.local`), or environment variables.
+  - **4-Level Token Cascade**: Supports a credentials file passed with `-token=<file>` (a raw token is not accepted on the command line, since other users can see it with `ps`), existing Certbot `/root/.secrets/*.ini` files, global `clp config` token (`/etc/clp/clp.local`), or environment variables.
   - **Namespace Isolation**: Only rules prefixed with `[CLP]` are managed; existing user rules are never overwritten or removed.
   - **Quota Guard**: Checks custom rules limit against zone plan (Free 5 / Pro 20 / Business 100 / Enterprise 1000) before deploying, aborting and listing existing rules if exceeded to prevent API 400 errors.
 
