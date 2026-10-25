@@ -37,7 +37,10 @@ WPADMIN_RE = re.compile(r'[ \t]*# --- CLP HTTPAUTH WPADMIN START ---.*?# --- CLP
 AUTH_RE = re.compile(r'[ \t]*# --- CLP HTTPAUTH AUTH START ---.*?# --- CLP HTTPAUTH AUTH END ---[ \t]*\n', re.DOTALL)
 # 只移除「整行」的存取控制指令 (B-7)：避免切斷 add_header ... "no-auth_basic" 之類的指令
 ACCESS_LINE_RE = re.compile(r'^\s*(auth_basic(_user_file)?|satisfy|allow|deny)\b[^;{}]*;\s*(#.*)?$')
-WPADMIN_LOC_RE = re.compile(r'location\s*~\*?\s*[\^/]*\s*\(wp-admin/\|wp-login\.php\)\s*\{')
+# 同時比對 wp-admin 與 wp-login 的 regex location（含自訂寫法），避免另外新增一個排在後面而無效的 location；
+# 只含 wp-admin 的（例如 admin-ajax.php 例外）不算
+WPADMIN_LOC_RE = re.compile(r'(?m)^[ \t]*location\s*~\*?\s*(?=[^{;\n]*wp-admin)(?=[^{;\n]*wp-login)[^{;\n]*\{')
+LOCATION_SLASH_RE = re.compile(r'(?m)^[ \t]*location\s+/\s*\{')
 DEFAULT_PASS = 'proxy_pass http://127.0.0.1:8080;\n'
 
 
@@ -100,29 +103,97 @@ def block_end(text, open_idx):
     return -1
 
 
+def code_chars(text, start, end):
+    """Yield (index, char) for characters between start and end that are outside quotes and # comments."""
+    i = start
+    quote = None
+    while i < end:
+        c = text[i]
+        if quote:
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ('"', "'"):
+            quote = c
+            i += 1
+            continue
+        if c == '#':
+            nl = text.find('\n', i, end)
+            if nl == -1:
+                return
+            i = nl
+            continue
+        yield i, c
+        i += 1
+
+
+def toplevel_text(body):
+    """Directives of this block only: nested {...} blocks, comments and quoted strings removed."""
+    out = []
+    depth = 0
+    for _, c in code_chars(body, 0, len(body)):
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        elif depth == 0:
+            out.append(c)
+    return ''.join(out)
+
+
 def https_server_span(text):
-    """(start, end) of the main HTTPS server block (not a redirect block, has location / or root)."""
+    """(start, end) of the main HTTPS server block (not a redirect block, has location / or root),
+    or None when there is no such block (callers then change nothing)."""
     candidate = None
-    first = None
     for m in re.finditer(r'(?m)^[ \t]*server\s*\{', text):
         open_idx = text.index('{', m.start())
         end = block_end(text, open_idx)
         if end == -1:
             continue
-        if first is None:
-            first = (m.start(), end)
-        header = text[open_idx:end]
-        if re.search(r'listen[^;{}]*443', header):
-            is_redirect = bool(re.search(r'(?m)^\s*return\s+30[1278]\b', header))
-            has_location_slash = bool(re.search(r'(?m)^\s*location\s+/\s*\{', header))
-            has_root = bool(re.search(r'(?m)^\s*root\s+[^;]+;', header))
-            if has_location_slash and not is_redirect:
+        # listen／return／root 只看 server 本身的指令：location 內的 return 301（例如舊網址轉址）不算轉址區塊
+        top = toplevel_text(text[open_idx + 1:end - 1])
+        if re.search(r'\blisten\s[^;]*443', top):
+            # return 可能與其他指令寫在同一行（單行 server 區塊）；toplevel_text 已去掉巢狀區塊與大括號
+            if re.search(r'(?:^|;)\s*return\s+(?:30[1278]\b|https?://)', top, re.MULTILINE):
+                continue
+            if re.search(r'(?m)^\s*location\s+/\s*\{', text[open_idx + 1:end - 1]):
                 return (m.start(), end)
-            if (has_location_slash or has_root) and not is_redirect and candidate is None:
+            if candidate is None:
                 candidate = (m.start(), end)
-            elif candidate is None and not is_redirect:
-                candidate = (m.start(), end)
-    return candidate or first
+    return candidate
+
+
+def search_https(rx, text):
+    """Search only inside the main HTTPS server block (B-12: never edit the 8080 or redirect block)."""
+    span = https_server_span(text)
+    if span:
+        return rx.search(text, span[0], span[1])
+    return None
+
+
+def search_wpadmin_loc(text):
+    """The wp-admin/wp-login location of the HTTPS server block that serves requests:
+    a location that only denies or redirects (e.g. a hardening rule naming both) is skipped;
+    one that passes requests on (proxy_pass etc.) is used even if it also has allow/deny."""
+    span = https_server_span(text)
+    if not span:
+        return None
+    for m in WPADMIN_LOC_RE.finditer(text, span[0], span[1]):
+        open_idx = m.end() - 1
+        end = block_end(text, open_idx)
+        if end == -1:
+            continue
+        top = toplevel_text(text[open_idx + 1:end - 1])
+        if re.search(r'\b(proxy_pass|fastcgi_pass|try_files)\b', top):
+            return m
+        if re.search(r'\bdeny\s+all\s*;', top) or re.search(r'(?:^|;)\s*return\b', top, re.MULTILINE):
+            continue
+        return m
+    return None
 
 
 def patch_deny_all_locations(content):
@@ -137,8 +208,10 @@ def patch_deny_all_locations(content):
         if m.start() < pos:
             continue
         body = content[open_idx + 1:end - 1]
-        if re.search(r'\bdeny\s+all\s*;', body) and not re.search(r'\bauth_basic\b', body):
-            if not re.search(r'\b(proxy_pass|fastcgi_pass|try_files)\b', body):
+        # 只看這個 location 本身的指令：巢狀 location、limit_except 或註解裡的 deny all 不算
+        top = toplevel_text(body)
+        if re.search(r'\bdeny\s+all\s*;', top) and not re.search(r'\bauth_basic\b', top):
+            if not re.search(r'\b(proxy_pass|fastcgi_pass|try_files)\b', top):
                 indent_m = re.search(r'(?m)^([ \t]+)\S', body)
                 indent = indent_m.group(1) if indent_m else '    '
                 if body.startswith('\n'):
@@ -194,12 +267,30 @@ def get_pass_directives(text):
 
 
 def insert_root_block(text, block):
-    for pat in (r'(server\s*\{[^{}]*?listen[^;{}]*443[^{}]*?\n[ \t]*root\s+[^;]+;[ \t]*\n)',
-                r'(server\s*\{[^{}]*?\n[ \t]*root\s+[^;]+;[ \t]*\n)'):
-        new_text, n = re.subn(pat, lambda m: m.group(1) + '\n' + block, text, count=1)
-        if n:
-            return new_text
-    return None
+    """Insert after the server-level 'root' of the HTTPS server block (B-11: never the 8080 block),
+    or right after 'server {' when that block has no server-level root."""
+    span = https_server_span(text)
+    if not span:
+        return None
+    open_idx = text.index('{', span[0])
+    line_starts = []
+    depth = 0
+    for i, c in code_chars(text, open_idx + 1, span[1] - 1):
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        elif c == '\n' and depth == 0:
+            line_starts.append(i + 1)
+    if not line_starts:
+        return None
+    root_re = re.compile(r'[ \t]*root\s+[^;{}]+;[ \t]*(?:#[^\n]*)?\n')
+    for pos in line_starts:
+        m = root_re.match(text, pos)
+        if m:
+            return text[:m.end()] + '\n' + block + text[m.end():]
+    pos = line_starts[0]
+    return text[:pos] + block + '\n' + text[pos:]
 
 
 def root_block(htpasswd, wl):
@@ -241,15 +332,25 @@ def path_region_re(path):
 def cmd_wpadmin_on(vhost, htpasswd, wl):
     content = WPADMIN_RE.sub('', read(vhost))
     block = wpadmin_block(htpasswd, wl)
-    # 插入在 location 開頭；CloudPanel 範本原有的 #auth_basic 註解行保留不動，關閉時即可完整還原
-    pattern = re.compile(r'(location\s*~\*?\s*[\^/]*\s*\(wp-admin/\|wp-login\.php\)\s*\{[ \t]*\n)')
-    new_content, count = pattern.subn(lambda m: m.group(1) + block, content, count=1)
-    if count == 0:
+    # 插入在既有 wp-admin location 開頭；CloudPanel 範本原有的 #auth_basic 註解行保留不動，關閉時即可完整還原
+    m = search_wpadmin_loc(content)
+    if m:
+        open_idx = m.end() - 1
+        nl = content.find('\n', open_idx)
+        rest = content[open_idx + 1:nl] if nl != -1 else content[open_idx + 1:]
+        if nl != -1 and re.fullmatch(r'[ \t\r]*(?:#.*)?', rest):
+            # '{' 後面只有空白、CR 或註解：插在下一行
+            new_content = content[:nl + 1] + block + content[nl + 1:]
+        else:
+            new_content = content[:open_idx + 1] + '\n' + block + content[open_idx + 1:]
+    else:
         wp_loc = (f'location ~/(wp-admin/|wp-login.php) {{\n{block}{get_pass_directives(content)}  }}\n\n')
-        m = re.search(r'(?m)^([ \t]*)location\s+/\s*\{', content)
+        m = search_https(LOCATION_SLASH_RE, content)
         if not m:
             return 1
-        new_content = content[:m.start()] + m.group(1) + wp_loc + content[m.start():]
+        line_start = content.rfind('\n', 0, m.start()) + 1
+        indent = re.match(r'[ \t]*', content[line_start:]).group(0)
+        new_content = content[:line_start] + indent + wp_loc + content[line_start:]
     write(vhost, new_content)
     return 0
 
@@ -266,9 +367,9 @@ def cmd_wpadmin_off(vhost, siteuser):
 
     content = WPADMIN_RE.sub(replace_block, content)
     # Comment out any remaining active auth lines inside the wp-admin location
-    m = WPADMIN_LOC_RE.search(content)
+    m = search_wpadmin_loc(content)
     if m:
-        open_idx = content.index('{', m.start())
+        open_idx = m.end() - 1
         end = block_end(content, open_idx)
         if end != -1:
             body = content[open_idx:end]
@@ -292,8 +393,8 @@ def cmd_path_on(vhost, htpasswd, path, wl):
 
     content = path_region_re(path).sub('', content)
     block = path_block(path, htpasswd, wl, get_pass_directives(content)) + '\n'
-    # 插入於 wp-admin regex location 或 location / 之前（同一個 server 區塊內）
-    m = WPADMIN_LOC_RE.search(content) or re.search(r'(?m)^[ \t]*location\s+/\s*\{', content)
+    # 插入於 HTTPS server 區塊內的 wp-admin regex location 或 location / 之前
+    m = search_wpadmin_loc(content) or search_https(LOCATION_SLASH_RE, content)
     if not m:
         return 1
     line_start = content.rfind('\n', 0, m.start()) + 1

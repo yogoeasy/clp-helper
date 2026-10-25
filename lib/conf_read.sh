@@ -42,13 +42,30 @@ clp_conf_is_managed() {
   [[ "$first" == "$CLP_CONF_MARKER"* ]]
 }
 
-# Regex (for grep -E) of the names a key may be written as, including legacy aliases
+# Regex (for grep -E) of the names a key may be written as, including legacy aliases.
+# Must list every alias that canonical_config_key (lib/config.sh) maps to the key.
 _clp_conf_key_regex() {
   case "$1" in
-    CLP_LANG) echo "CLP_LANG|lang" ;;
-    CF_API_TOKEN) echo "CF_API_TOKEN|cf-token|cf_token|cloudflare_api_token" ;;
+    CLP_LANG) echo "CLP_LANG|clp_lang|lang|LANG" ;;
+    CF_API_TOKEN) echo "CF_API_TOKEN|CF_TOKEN|cf_api_token|cf-api-token|cf_token|cf-token|cloudflare_api_token" ;;
+    CF_DEFAULT_MODE) echo "CF_DEFAULT_MODE|cf_default_mode|cf-default-mode" ;;
+    CF_ALWAYS_HTTPS) echo "CF_ALWAYS_HTTPS|cf_always_https|cf-always-https" ;;
+    CF_MIN_TLS) echo "CF_MIN_TLS|cf_min_tls|cf-min-tls" ;;
+    PHP_FPM_MAX_CHILDREN) echo "PHP_FPM_MAX_CHILDREN|php_max_children|php-max-children" ;;
+    PHP_FPM_IDLE_TIMEOUT) echo "PHP_FPM_IDLE_TIMEOUT|php_idle_timeout|php-idle-timeout" ;;
+    PHP_FPM_MAX_REQUESTS) echo "PHP_FPM_MAX_REQUESTS|php_max_requests|php-max-requests" ;;
+    BACKUP_DIR) echo "BACKUP_DIR|backup_dir|backup-dir" ;;
+    BACKUP_REMOTE_DIR) echo "BACKUP_REMOTE_DIR|backup_remote_dir|backup-remote-dir" ;;
+    BACKUP_TYPE) echo "BACKUP_TYPE|backup_type|backup-type" ;;
+    BACKUP_TO) echo "BACKUP_TO|backup_to|backup-to" ;;
+    BACKUP_EXPIRE) echo "BACKUP_EXPIRE|backup_expire|backup-expire" ;;
     *) echo "$1" ;;
   esac
+}
+
+# Regex (for grep -E) of a line that sets <canonical_key>; spaces around the name and "=" are allowed
+_clp_conf_line_regex() {
+  echo "^[[:space:]]*($(_clp_conf_key_regex "$1"))[[:space:]]*="
 }
 
 # Secrets are only read from user layers, never from shipped defaults
@@ -60,7 +77,7 @@ _clp_conf_user_only() {
 # and returns 0, or returns 1 when no layer has a value. Writes nothing else.
 clp_conf_read_src() {
   local key="$1" re f layer val
-  re="$(_clp_conf_key_regex "$key")"
+  re="$(_clp_conf_line_regex "$key")"
   local -a files=("$CLP_CONFIG_LOCAL_FILE" "$CLP_CONFIG_FILE" "$(_clp_conf_template_file)")
   local i
   for i in 0 1 2; do
@@ -74,7 +91,7 @@ clp_conf_read_src() {
     if [[ "$layer" != "custom" ]] && _clp_conf_user_only "$key"; then
       continue
     fi
-    val="$(grep -E "^(${re})=" "$f" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || true)"
+    val="$(grep -E "$re" "$f" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || true)"
     if [[ -n "$val" ]]; then
       printf '%s\t%s\n' "$val" "$layer"
       return 0

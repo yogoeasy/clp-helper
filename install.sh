@@ -6,8 +6,8 @@
 
 set -euo pipefail
 
-CLP_VERSION="1.1.1"
-CLP_BUILD_TIME="2026-10-23 14:02:24"
+CLP_VERSION="1.2.0"
+CLP_BUILD_TIME="2026-10-25 16:05:18"
 
 # Colors
 C_RED=$'\033[0;31m'
@@ -93,7 +93,7 @@ read_conf_lang() {
   local f v
   for f in /etc/clp/clp.local /etc/clp/clp.conf "${CURRENT_DIR}/templates/clp.conf"; do
     [[ -f "$f" ]] || continue
-    v="$(grep -E '^(CLP_LANG|lang)=' "$f" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || true)"
+    v="$(grep -E '^[[:space:]]*(CLP_LANG|clp_lang|lang|LANG)[[:space:]]*=' "$f" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || true)"
     if [[ -n "$v" ]]; then
       echo "$v"
       return 0
@@ -259,6 +259,7 @@ if [[ "$action" == "uninstall" ]]; then
   echo -e "${C_YELLOW}${MSG_UNINSTALLING}${C_NC}"
   rm -f /usr/local/bin/clp
   rm -f /etc/profile.d/clp.sh
+  rm -f /etc/cron.d/clp-helper
   if [[ -d "$TARGET_DIR" ]]; then
     rm -rf "$TARGET_DIR"
   fi
@@ -316,34 +317,72 @@ fi
 # ------------------------------------------------------------------------------
 # 9. Create Target Directories
 # ------------------------------------------------------------------------------
-mkdir -p "$TARGET_DIR"
+TARGET_PARENT="${TARGET_DIR%/*}"
+mkdir -p "$TARGET_PARENT"
+# log 只有 root 可讀（clp 本身也會把目錄設為 750、檔案設為 600）
 mkdir -p /var/log/clp
-chmod 755 /var/log/clp 2>/dev/null || true
+chmod 750 /var/log/clp 2>/dev/null || true
+
+# set_install_perms <dir>：root:root，目錄 755、檔案 644，clp.sh 與 install.sh 755
+set_install_perms() {
+  chown -R root:root "$1"
+  find "$1" -type d -exec chmod 755 {} +
+  find "$1" -type f -exec chmod 644 {} +
+  chmod 755 "${1}/clp.sh"
+  chmod 755 "${1}/install.sh"
+}
 
 # ------------------------------------------------------------------------------
-# 10. Copy Application Files
+# 10. Copy Application Files, 11. Configure Ownership and Permissions
+#     The new version is prepared in a directory next to TARGET_DIR (same file system) and then
+#     renamed into place, so a running clp never reads a half-written file and files removed in
+#     the new version do not linger. Between the two renames TARGET_DIR is briefly missing.
 # ------------------------------------------------------------------------------
+stage_dir=""
+old_parent=""
+install_cleanup() {
+  # 換上新版之前中斷：放回舊版
+  if [[ -n "$old_parent" && -d "${old_parent}/clp-helper" && ! -e "$TARGET_DIR" ]]; then
+    mv "${old_parent}/clp-helper" "$TARGET_DIR" 2>/dev/null || true
+  fi
+  if [[ -n "$stage_dir" ]]; then rm -rf "$stage_dir"; fi
+  if [[ -n "$old_parent" && ! -e "${old_parent}/clp-helper" ]]; then rm -rf "$old_parent"; fi
+}
+
 if [[ "${CURRENT_DIR}" != "${TARGET_DIR}" ]]; then
-  printf "${MSG_COPYING}" "${TARGET_DIR}"
-  cp -rf "${CURRENT_DIR}/clp.sh" "$TARGET_DIR/"
-  cp -rf "${CURRENT_DIR}/install.sh" "$TARGET_DIR/"
-  cp -rf "${CURRENT_DIR}/README"*.md "$TARGET_DIR/" 2>/dev/null || true
-  cp -rf "${CURRENT_DIR}/LICENSE" "$TARGET_DIR/" 2>/dev/null || true
-  cp -rf "${CURRENT_DIR}/lib" "$TARGET_DIR/"
-  cp -rf "${CURRENT_DIR}/templates" "$TARGET_DIR/" 2>/dev/null || true
-  cp -rf "${CURRENT_DIR}/locales" "$TARGET_DIR/" 2>/dev/null || true
-fi
-rm -rf "${TARGET_DIR}/logs" 2>/dev/null || true
+  # 先前中斷的安裝留下的暫存目錄
+  rm -rf "${TARGET_PARENT}"/.clp-helper.new.* 2>/dev/null || true
+  for d in "${TARGET_PARENT}"/.clp-helper.old.*; do
+    if [[ -d "$d" && ! -e "${d}/clp-helper" ]]; then rm -rf "$d"; fi
+  done
 
-# ------------------------------------------------------------------------------
-# 11. Configure Ownership and Permissions
-# ------------------------------------------------------------------------------
-printf "${MSG_PERMS}"
-chown -R root:root "$TARGET_DIR"
-find "$TARGET_DIR" -type d -exec chmod 755 {} +
-find "$TARGET_DIR" -type f -exec chmod 644 {} +
-chmod 755 "${TARGET_DIR}/clp.sh"
-chmod 755 "${TARGET_DIR}/install.sh"
+  trap install_cleanup EXIT
+  stage_dir="$(mktemp -d "${TARGET_PARENT}/.clp-helper.new.XXXXXX")"
+  printf "${MSG_COPYING}" "${TARGET_DIR}"
+  cp -rf "${CURRENT_DIR}/clp.sh" "$stage_dir/"
+  cp -rf "${CURRENT_DIR}/install.sh" "$stage_dir/"
+  cp -rf "${CURRENT_DIR}/README"*.md "$stage_dir/" 2>/dev/null || true
+  cp -rf "${CURRENT_DIR}/LICENSE" "$stage_dir/" 2>/dev/null || true
+  cp -rf "${CURRENT_DIR}/lib" "$stage_dir/"
+  cp -rf "${CURRENT_DIR}/templates" "$stage_dir/" 2>/dev/null || true
+  cp -rf "${CURRENT_DIR}/locales" "$stage_dir/" 2>/dev/null || true
+  printf "${MSG_PERMS}"
+  set_install_perms "$stage_dir"
+
+  if [[ -e "$TARGET_DIR" || -L "$TARGET_DIR" ]]; then
+    old_parent="$(mktemp -d "${TARGET_PARENT}/.clp-helper.old.XXXXXX")"
+    mv "$TARGET_DIR" "${old_parent}/clp-helper"
+  fi
+  mv "$stage_dir" "$TARGET_DIR"
+  trap - EXIT
+  stage_dir=""
+  if [[ -n "$old_parent" ]]; then rm -rf "$old_parent"; fi
+  old_parent=""
+else
+  rm -rf "${TARGET_DIR}/logs" 2>/dev/null || true
+  printf "${MSG_PERMS}"
+  set_install_perms "$TARGET_DIR"
+fi
 
 # ------------------------------------------------------------------------------
 # 12. Create Global Symlink
@@ -352,6 +391,16 @@ printf "${MSG_SYMLINK}"
 mkdir -p /usr/local/bin
 ln -sf "${TARGET_DIR}/clp.sh" /usr/local/bin/clp
 hash -r 2>/dev/null || true
+
+# 每天記錄 CloudPanel 的官方 vhost 範本版本（clp site -vhost=status 判斷舊版官方範本用；CloudPanel 06:15 更新範本）
+if [[ -d /etc/cron.d ]]; then
+  cron_tmp="$(mktemp /etc/cron.d/.clp-helper.XXXXXX)" && {
+    printf '%s\n' "# Managed by CLP Helper: record CloudPanel's official vhost templates (clp site -vhost=status)" \
+      "30 7 * * * root /usr/local/bin/clp site -vhost=record >/dev/null 2>&1" > "$cron_tmp"
+    chmod 644 "$cron_tmp"
+    mv -f "$cron_tmp" /etc/cron.d/clp-helper
+  } || rm -f "${cron_tmp:-}"
+fi
 
 # ------------------------------------------------------------------------------
 # 12.1 Migrate Legacy Installation Directory (/home/clp/clp -> /usr/local/lib/clp-helper)

@@ -59,13 +59,17 @@ fi
 CLP_LOG_DIR="/var/log/clp"
 CLP_LOG_FILE="${CLP_LOG_DIR}/clp.log"
 
+# log 會記錄網域、路徑等資訊：目錄 750、檔案 600（只有 root 可讀）。umask 只在子 shell 中設定，
+# 不影響之後 clp 建立的其他檔案；非 root 執行時失敗忽略
 init_logging() {
   if [[ ! -d "$CLP_LOG_DIR" ]]; then
-    mkdir -p "$CLP_LOG_DIR" 2>/dev/null || true
+    (umask 077; mkdir -p "$CLP_LOG_DIR") 2>/dev/null || true
   fi
   if [[ -d "$CLP_LOG_DIR" && ! -f "$CLP_LOG_FILE" ]]; then
-    touch "$CLP_LOG_FILE" 2>/dev/null || true
+    (umask 077; touch "$CLP_LOG_FILE") 2>/dev/null || true
   fi
+  chmod 750 "$CLP_LOG_DIR" 2>/dev/null || true
+  chmod 600 "$CLP_LOG_FILE" 2>/dev/null || true
 }
 
 log_write() {
@@ -163,6 +167,90 @@ require_clp_db_server_ready() {
 # 取得 CloudPanel MySQL master (root) 密碼；失敗時輸出空字串
 get_mysql_master_pass() {
   clpctl db:show:master-credentials 2>/dev/null | grep -i 'Password' | awk -F'|' '{print $3}' | tr -d ' ' || true
+}
+
+# 取得 CloudPanel MySQL master 的連線位置，輸出「主機 埠號」（例如 127.0.0.1 3306）；失敗時輸出空字串
+#   由 CloudPanel 管理，不受網站使用者控制（不可改用 wp-config.php 的 DB_HOST）
+get_mysql_master_host_port() {
+  clpctl db:show:master-credentials 2>/dev/null | awk -F'|' '
+    /^\| *Host *\|/ { h = $3; gsub(/ /, "", h) }
+    /^\| *Port *\|/ { p = $3; gsub(/ /, "", p) }
+    END { if (h != "") print h, (p != "" ? p : 3306) }' || true
+}
+
+# ------------------------------------------------------------------------------
+# nginx real-ip：CloudPanel 的 nginx.conf 預設有 set_real_ip_from 0.0.0.0/0（http 層級、讀 X-Real-IP），
+#   任何 IPv4 用戶端都能以偽造的 X-Real-IP 換掉 $remote_addr，依 IP 判斷的 allow
+#   （cf-only、httpauth 白名單）因此可被繞過。cf-only 與 httpauth 共用以下函式。
+#   標記字串沿用 cf-only 最早的寫法，已被註解的主機才能繼續辨識。
+# ------------------------------------------------------------------------------
+CLP_REALIP_NGINX_CONF="/etc/nginx/nginx.conf"
+CLP_REALIP_MARK="# disabled by CLP Helper (cf-only)"
+CLP_REALIP_RE='^[[:space:]]*set_real_ip_from[[:space:]]+0\.0\.0\.0/0[[:space:]]*;'
+
+# clp_realip_state：輸出 active（生效中）| clp（已由 clp 註解）| none（不存在）
+clp_realip_state() {
+  if grep -Eq "$CLP_REALIP_RE" "$CLP_REALIP_NGINX_CONF" 2>/dev/null; then
+    echo "active"
+  elif grep -Fq "$CLP_REALIP_MARK" "$CLP_REALIP_NGINX_CONF" 2>/dev/null; then
+    echo "clp"
+  else
+    echo "none"
+  fi
+}
+
+# clp_realip_whitelists_exist：是否有網站設定 httpauth IP 白名單（非空的 /etc/nginx/security/*.whitelist）
+clp_realip_whitelists_exist() {
+  local f
+  for f in /etc/nginx/security/*.whitelist; do
+    [[ -s "$f" ]] && return 0
+  done
+  return 1
+}
+
+# clp_realip_write <disable|restore> <backup_dir>：改寫 nginx.conf（先備份到 <backup_dir>、原子置換、
+#   nginx -t 失敗則還原），成功後 reload
+clp_realip_write() {
+  local mode="$1" backup_dir="$2"
+  local conf="$CLP_REALIP_NGINX_CONF"
+  [[ -n "$backup_dir" && -d "$backup_dir" ]] || return 1
+  local bak="${backup_dir}/nginx.conf"
+  cp -p "$conf" "$bak" || return 1
+  local tmp
+  tmp=$(mktemp "${backup_dir}/.nginx.XXXXXX") || return 1
+  if [[ "$mode" == "disable" ]]; then
+    # 保留原縮排，在行首加 # 並附上標記
+    awk -v mark="$CLP_REALIP_MARK" '
+      /^[[:space:]]*set_real_ip_from[[:space:]]+0\.0\.0\.0\/0[[:space:]]*;/ {
+        match($0, /^[[:space:]]*/)
+        ind = substr($0, 1, RLENGTH); rest = substr($0, RLENGTH + 1)
+        print ind "#" rest " " mark; next
+      }
+      { print }
+    ' "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    awk -v mark="$CLP_REALIP_MARK" '
+      index($0, mark) > 0 && /^[[:space:]]*#[[:space:]]*set_real_ip_from[[:space:]]+0\.0\.0\.0\/0/ {
+        line = substr($0, 1, index($0, mark) - 1)
+        sub(/[[:space:]]+$/, "", line)
+        sub(/#[[:space:]]*/, "", line)
+        print line; next
+      }
+      { print }
+    ' "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  if ! atomic_replace "$tmp" "$conf"; then
+    rm -f "$tmp"
+    log_error "$(_t "SITE_CF_ONLY_REALIP_ERR_WRITE" "$conf")"
+    return 1
+  fi
+  rm -f "$tmp"
+  if ! nginx -t >/dev/null 2>&1; then
+    atomic_replace "$bak" "$conf" || log_error "$(_t "SITE_CF_ONLY_ERR_RESTORE" "$bak" "$conf")"
+    log_error "$(_t "SITE_CF_ONLY_REALIP_ERR_TEST" "$conf")"
+    return 1
+  fi
+  systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
 }
 
 # cf_credentials_match_score <ini 檔名(不含 .ini)> <domain>
@@ -313,25 +401,45 @@ remove_marked_block() {
 # 全域非互動免確認開關 (由 -y / --yes 觸發)
 CLP_AUTO_YES=false
 
+# clp_auto_yes：使用者是否已事先同意（-y / -yes / -non-interactive / CLP_AUTO_YES）
+clp_auto_yes() {
+  [[ "${CLP_AUTO_YES:-false}" == "true" ]] || has_opt "y" || has_opt "yes" || \
+    has_opt "non_interactive" || has_opt "non-interactive"
+}
+
+# require_tty_or_yes：沒有終端機又沒有 -y 時報錯並回傳 1（AGENTS.md 第 8 節：不可讓 read 讀到 EOF 後靜默中止，
+#   也不可在沒有確認的情況下套用預設值）。會詢問確認的指令在任何修改之前呼叫。
+require_tty_or_yes() {
+  clp_auto_yes && return 0
+  [[ -t 0 ]] && return 0
+  log_error "$(_t "CORE_ERR_NEED_TTY_OR_Y")"
+  return 1
+}
+
 prompt_confirm() {
   local prompt_msg="$1"
   local default_ans="${2:-y}" # y or n
 
-  # 若明確指定 -y / --yes 或啟用 CLP_AUTO_YES，一律視為同意 (return 0)
-  if [[ "${CLP_AUTO_YES:-false}" == "true" ]] || has_opt "y" || has_opt "yes"; then
+  # 若明確指定 -y / --yes / -non-interactive 或啟用 CLP_AUTO_YES，一律視為同意 (return 0)
+  if clp_auto_yes; then
     return 0
   fi
 
-  # 若為非終端環境（且未指定 -y），則遵循預設值
+  # 非終端環境（且未指定 -y）一律視為否；需要執行的指令應先呼叫 require_tty_or_yes 明確報錯
   if [[ ! -t 0 ]]; then
-    [[ "$default_ans" == "y" ]] && return 0 || return 1
+    return 1
   fi
 
   local yn_display="[Y/n]"
   [[ "$default_ans" == "n" ]] && yn_display="[y/N]"
 
+  local ans
   while true; do
-    read -r -p "$(echo -e "${C_YELLOW}? ${prompt_msg} ${yn_display}: ${C_NC}")" ans
+    # 讀到 EOF（Ctrl-D）視為取消，不套用預設值
+    if ! read -r -p "$(echo -e "${C_YELLOW}? ${prompt_msg} ${yn_display}: ${C_NC}")" ans; then
+      echo ""
+      return 1
+    fi
     ans="${ans:-$default_ans}"
     case "$ans" in
       [Yy]* ) return 0 ;;
@@ -367,7 +475,8 @@ check_wpcli() {
     # -f：HTTP 錯誤時失敗（不把錯誤頁面當成 wp-cli 安裝）；並確認下載的是可執行的 phar
     if curl -fsSL -o "$wpcli_tmp" https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
        && php "$wpcli_tmp" --info --allow-root >/dev/null 2>&1; then
-      chmod +x "$wpcli_tmp"
+      # mktemp 建立的檔案是 600：改成 755，網站使用者（sudo -u）才能執行
+      chmod 755 "$wpcli_tmp"
       mv "$wpcli_tmp" /usr/local/bin/wp
       log_success "$(_t "CORE_SUCCESS_WPCLI_INSTALLED" "$(/usr/local/bin/wp --version --allow-root 2>/dev/null || _t "CORE_TXT_INSTALLED")")"
       return 0
@@ -483,32 +592,23 @@ ensure_certbot_renew_cron() {
 
   local cron_job="0 3 * * 0 ${cb_path} renew --quiet --deploy-hook \"systemctl reload nginx\""
 
-  # 1. 檢查是否已設定為每週日執行的任務
-  if echo "$existing_cron" | grep -v '^[[:space:]]*#' | grep -qE "\* \* 0.*certbot.*renew"; then
+  # 1. 已有生效中的 certbot renew 排程（不論時間與參數）就不改寫，保留使用者自訂的時間與 hook
+  if printf '%s\n' "$existing_cron" | grep -v '^[[:space:]]*#' | grep -qE "certbot.*renew"; then
     log_info "$(_t "CORE_INFO_CRON_ALREADY_SET")"
     return 0
   fi
 
-  # 2. 若存在舊版每日執行或非週日的任務，自動更新為每週日執行
-  if echo "$existing_cron" | grep -v '^[[:space:]]*#' | grep -qE "certbot.*renew"; then
-    log_step "$(_t "CORE_STEP_CRON_UPDATING")"
-    local updated_cron
-    # 只改寫第一筆生效中的 certbot renew 排程，其餘生效中的重複排程移除；註解掉的排程保持不動
-    updated_cron=$(echo "$existing_cron" | awk -v new="$cron_job" '
-      /^[[:space:]]*#/ { print; next }
-      /certbot.*renew/ { if (!done) { print new; done = 1 }; next }
-      { print }')
-    printf "%s\n" "$updated_cron" | crontab -
-    log_success "$(_t "CORE_SUCCESS_CRON_UPDATED" "$cron_job")"
-    return 0
-  fi
-
-  # 3. 若尚未存在任何 certbot renew 任務，則新增每週日排程
+  # 2. 沒有任何 certbot renew 排程時，新增每週日排程；失敗只警告（呼叫端此時憑證已簽發完成）
   log_step "$(_t "CORE_STEP_CRON_ADDING")"
+  local cron_rc=0
   if [[ -n "$existing_cron" ]]; then
-    printf "%s\n%s\n" "$existing_cron" "$cron_job" | crontab -
+    printf "%s\n%s\n" "$existing_cron" "$cron_job" | crontab - || cron_rc=$?
   else
-    printf "%s\n" "$cron_job" | crontab -
+    printf "%s\n" "$cron_job" | crontab - || cron_rc=$?
+  fi
+  if [[ "$cron_rc" -ne 0 ]]; then
+    log_warn "$(_t "CORE_WARN_CRON_ADD_FAILED" "$cron_job")"
+    return 0
   fi
 
   log_success "$(_t "CORE_SUCCESS_CRON_ADDED" "$cron_job")"
@@ -1237,11 +1337,12 @@ run_wp() {
     return 1
   fi
 
+  # 不以 root 執行 WP-CLI（會以 root 身分載入網站的 PHP 程式）
   if [[ -z "$site_user" || "$site_user" == "root" ]]; then
-    wp --allow-root --path="$site_root" "$@"
-  else
-    sudo -H -u "$site_user" wp --path="$site_root" "$@"
+    log_error "$(_t "CORE_ERR_WP_SITE_USER" "$domain")"
+    return 1
   fi
+  sudo -H -u "$site_user" wp --path="$site_root" "$@"
 }
 
 # Initialize log file on load

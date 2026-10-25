@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.1.1 (build 2026-10-23 14:02:24)`
+Output example:`CLP Helper v1.2.0 (build 2026-10-25 16:05:18)`
 
 Display global help menu:
 
@@ -412,7 +412,7 @@ sudo clp site example.com -new -force-replace
 ```
 
 > [!TIP]
-> When running `-new`, pressing `Enter` to leave administrator credentials blank automatically applies defaults (Username defaults to `wpadmin`, a strong password is auto-generated and saved to `/root/.clp/<domain>-wp-admin.txt`, and Email defaults to `wpadmin@wp.com`).
+> When running `-new`, pressing `Enter` to leave administrator credentials blank automatically applies defaults (Username defaults to `wpadmin`, a strong password is auto-generated and saved to `/root/.clp/<domain>-wp-admin.txt`, and the administrator email is taken from `-email=` or asked for — even with `-y` — in a terminal; without a terminal, `-email=` is required).
 
 #### ③ SSL Certificate Management (`clp site <domain> -ssl`)
 
@@ -444,6 +444,10 @@ Remove and disable SSL certificate:
 sudo clp site example.com -ssl=off
 ```
 
+The site goes back to the self-signed certificate CloudPanel created with it (read from the CloudPanel database; a new one is generated only if it is missing). Let's Encrypt files under `/etc/letsencrypt` are not touched. The CloudPanel SSL page may still list the previously imported certificate.
+
+> **Cloudflare credentials for renewal**: when the token comes from `clp.local`, an environment variable or a plain token file, `-dns` writes it to `/root/.clp/cf-certbot/<domain>.ini` (root only, 600), because certbot reads that file again on every renewal. After you rotate the token, run `-ssl=on -dns` again for each such site (or edit that file); deleting a site does not remove it.
+
 #### ④ Clone / Duplicate Site on Same Host (`clp site -clone-from`)
 
 Basic clone (target site is automatically created if absent):
@@ -458,6 +462,8 @@ Overwrite existing target site:
 sudo clp site -clone-from=example.com new-example.com -force-replace
 ```
 
+With `-force-replace`, the existing site is deleted only after every check passes and the source database has been exported (user name, PHP version, export). If a later step fails, the old site is not restored, so back it up first if you need it. Only `-force-replace` replaces a site; `-force` does not.
+
 Customize user and PHP version for target site:
 
 ```bash
@@ -468,11 +474,12 @@ sudo clp site -clone-from=example.com new-example.com -user=newuser -php=8.4
   - SSL validation executed first with Fail-Fast abort to prevent wasted transfer time.
   - Automatically detects and updates Wordfence WAF paths, neutralizing missing paths to avoid PHP 500 errors.
   - Automatically injects unique random salt (`WP_CACHE_KEY_SALT`) for Redis cache to prevent cross-site cache poisoning.
-  - WP-CLI deep URL replacement and automatic correction of Sitemap URLs in `robots.txt`.
+  - WP-CLI deep URL replacement and automatic correction of Sitemap URLs in `robots.txt`. Only URLs are replaced (`https://`, `http://`, `//` and the JSON-escaped `https:\/\/` used by Elementor, with or without `www.`); `www.` URLs become the new domain without `www.`, and `http://` URLs become `https://`. E-mail addresses, plain-text domain names and post GUIDs are not changed. The site's absolute path in the database (for example plugin settings) is replaced as well; for a same-domain migration only the path is replaced.
+  - Known limits: a URL of another domain that starts with the source domain (for example `https://example.com.tw` when cloning `example.com`) is also changed; URL-encoded links (`https%3A%2F%2F…`) and URLs written in a different letter case are not changed. It runs `wp search-replace` about ten times; most runs find nothing, and on a 392 MB test database it took about 15% longer than before.
 
 #### ⑤ Zero-Write Cross-Server Migration (`clp site -migrate`)
 
-Same domain migration (keeps domain, skips search-replace):
+Same domain migration (keeps domain; URLs are not replaced, only the site path):
 
 ```bash
 sudo clp site -migrate=remote-vps -from=example.com
@@ -489,6 +496,8 @@ Migrate all sites from remote server to local:
 ```bash
 sudo clp site -migrate=remote-vps -all
 ```
+
+Only WordPress (PHP) sites are migrated; other site types on the remote host are listed as skipped. For a replacement, the remote database is downloaded and verified before the local site is deleted.
 
 Batch migrate with domain exclusions:
 
@@ -537,6 +546,12 @@ Optimize edge security and deploy WAF rules for domain:
 
 ```bash
 sudo clp site example.com -cf-waf
+```
+
+If the DNS record is not proxied (grey cloud), the WAF rules do not apply. In a terminal you are asked whether to switch it to proxied; with `-y` or without a terminal it is left as is (proxying can break SSH or mail that uses the same hostname). To switch it, add `-proxy=on` (or keep it with `-proxy=off`):
+
+```bash
+sudo clp site example.com -cf-waf -proxy=on -y
 ```
 
 Dry-run simulation (verifies token, resolves zone, outputs payload without changes):
@@ -718,6 +733,25 @@ After the fix, Varnish stores pages and serves the same copy to every visitor fo
   - Shorten the cache lifetime on the same tab (for example 1 day) to make expired form tokens less likely.
   - Purge the cache from the CLP Varnish Cache plugin in WordPress or from CloudPanel.
 
+#### ⑩ Update a Site's Vhost to CloudPanel's Current Template (`clp site <domain> -vhost=status|diff|update`)
+
+CloudPanel copies a vhost template into each site when the site is created; later updates of the official template (for example the WordPress template's `xmlrpc.php` block added in 2024) never reach existing sites. `-vhost` compares each site with CloudPanel's current templates and can update it.
+
+```bash
+sudo clp site -vhost=status -all                 # every site: up to date / older official version / customised
+sudo clp site example.com -vhost=diff            # what would change
+sudo clp site example.com -vhost=update          # update to the current template (asks first; -y skips)
+sudo clp site example.com -vhost=update -force   # also replace a customised template
+sudo clp site example.com -vhost=update -template=WordPress   # choose the template explicitly
+```
+
+- **Status**: *up to date*; *older official version* (identical to an official version clp recorded earlier, safe to update); *customised* (differs from every known official version: edited in the panel, or an official version from before clp started recording; `-force` replaces it, a backup is kept). Line endings, trailing spaces and the `server_name` lines are ignored in the comparison.
+- clp records CloudPanel's official templates every day (`/etc/cron.d/clp-helper`, 07:30, in `/root/.clp/vhost-templates/`); a version that changed before clp was installed cannot be recognised and shows as customised.
+- A site created from the WordPress template before 2024-11 is identical to the current WooCommerce template and shows as WooCommerce; use `-template=WordPress` to update it.
+- **Update**: backs up the CloudPanel database, the site's template and its vhost to `/root/.clp/vhost-backup/<time>/<domain>/`, writes the new template (keeping the site's own `server_name` lines) and regenerates the vhost with CloudPanel's own code, exactly as clicking Save in the Vhost tab: settings such as Varnish, Cloudflare-only and Basic Auth follow what is set in CloudPanel (a Varnish site whose front end still bypasses Varnish starts using it). clp httpauth protection is applied again afterwards; if that or `nginx -t` fails, the template and vhost are restored.
+- If clp cannot use this CloudPanel version's code, only the template in the database is updated and you are asked to click Save in the site's Vhost tab.
+- Only PHP sites; a disabled site (`-off`) must be enabled first, because regenerating the vhost enables it.
+
 ---
 
 ### 2. Server Operations & Hardening (`clp server`)
@@ -770,7 +804,7 @@ sudo clp server install --dry-run
 4. `ssh_hardening`: Strict SSH key anti-lockout check, disable password authentication
 5. `fail2ban`: Brute-force protection rules and auto-ban jails
 6. `dns`: System DNS resolver optimization (Google 8.8.8.8 & Cloudflare 1.1.1.1)
-7. `sysctl`: Linux kernel performance tuning (`swappiness=10`, `file-max=500000`)
+7. `sysctl`: Linux kernel performance tuning (`swappiness=10`)
 8. `journald`: Limit systemd journal logs to 500M max disk usage
 9. `unattended_upgrades`: Automatic security patch updates
 10. `snap_retention`: Cap Snap revisions to 2 to reclaim disk space
@@ -795,6 +829,12 @@ Apply all hardening rules without interactive confirmation:
 
 ```bash
 sudo clp server -harden -y
+```
+
+Preview every step without changing anything:
+
+```bash
+sudo clp server -harden -dry-run
 ```
 
 #### ④ Tool Installation On-Demand (`sudo clp server -install=...`)
@@ -845,11 +885,25 @@ Allow port:
 sudo clp server -ufw -allow=8080
 ```
 
+Remove or block a port (a single numeric port such as `8080` or `8080/tcp`; the active SSH port is refused):
+
+```bash
+sudo clp server -ufw -deny=8080
+```
+
+Enable UFW (rules for the detected SSH ports are added first if none exist):
+
+```bash
+sudo clp server -ufw=on
+```
+
 Drop external ICMP ping:
 
 ```bash
 sudo clp server -ufw -icmp=drop
 ```
+
+> **SSH lockout protection**: the SSH ports are collected from `sshd -T`, `ssh.socket` and the listening sockets; if none can be found, UFW is not enabled. An existing SSH rule (including one limited to a source IP) is kept as is.
 
 **SSH management & emergency recovery**
 
@@ -864,6 +918,10 @@ Disable password authentication:
 ```bash
 sudo clp server -ssh -harden
 ```
+
+- The account running the command must have a usable SSH key (when using sudo, the sudo user's own key). Otherwise `-y` skips the step and interactive mode asks first.
+- An existing stricter `PermitRootLogin no` is kept. `PasswordAuthentication yes` inside a `Match` block is kept with a warning.
+- If the configuration test fails, `sshd_config` and `sshd_config.d/` are restored exactly as before.
 
 Emergency recovery, temporarily re-enable password login:
 
@@ -1046,7 +1104,9 @@ By default, a file restore deletes files on the site that are not in the backup 
 - **Each type only touches its own scope**:
   - `full`: the whole site directory.
   - `compact`: `uploads/<year>/` of the backup year and the rest of the site files; other years and non-year folders in uploads, `shield` and `WPvivid_Uploads` are left alone.
-  - `archive`: only `wp-content/uploads` (except the backup year's folder), plus `shield` and `WPvivid_Uploads` if they are in the backup; other site files are left alone.
+  - `archive`: only the `wp-content/uploads` entries that are in the backup (except the backup year's folder), plus `shield` and `WPvivid_Uploads` if they are in the backup. Years newer than the backup, folders that are not in the backup and other site files are left alone. A folder that is in the backup (for example `uploads/elementor/`) is mirrored, so files added there after the backup are deleted.
+- **Files are written as the site user**: the backup is unpacked into a root-only temporary folder, handed to the site user, and copied into the site as that user (device files and FIFOs in the archive are dropped). If the site contains items owned by another user (for example root), the restore stops before changing anything and lists them, so you can fix the ownership first.
+- **Archives from another site are refused**: a `.tar.gz` without the site's top-level `<domain>/` folder is rejected before anything is changed. To copy a site to another domain, use `clp site -clone-from` or `-migrate`.
   - `db`: imports the database only; no files are touched.
 - **The year comes from the backup**: it is read from the timestamp in the file name, not the date of the restore.
 - **Always protected**: the current `wp-config.php` (the backup's copy is saved in the snapshot folder) and the cache and backup-plugin folders listed above.
@@ -1068,6 +1128,19 @@ Keep extra files on the site:
 
 ```bash
 sudo clp restore example.com -type=compact -keep-extra
+```
+
+#### Database Access (`-db-root`)
+
+`backup` and `restore` access the database with the site's own permissions only: first WP-CLI as the site user, then the database credentials in `wp-config.php`.
+
+- **No automatic MySQL root**: if both fail, the command stops with an error. A restore checks database access before the snapshot: if the restore imports a database (`.sql`, `full`), it stops there and nothing has been changed; a files-only restore (`compact`, `archive`) continues with a warning and the snapshot does not include the database.
+- **`-db-root`**: allows the MySQL root account as a last resort. It always connects to the CloudPanel MySQL master server from `clpctl db:show:master-credentials` (the `DB_HOST` in `wp-config.php` is ignored), and the database name may contain only letters, digits, `_` and `-`.
+- **Database names starting with `-`** are never passed to `mysql`／`mysqldump` (WP-CLI runs as the site user and is not affected).
+
+```bash
+sudo clp backup example.com -type=db -db-root
+sudo clp restore example.com -file=example.com-db-20260921_120000.sql.gz -db-root
 ```
 
 #### ⑤ Restoring a Complete Site from compact + db + archive
@@ -1102,11 +1175,7 @@ Interactive user creation (masked password input):
 sudo clp httpauth example.com -add
 ```
 
-Command-line creation with inline credentials (Note: inline password will appear in shell history; interactive mode is recommended):
-
-```bash
-sudo clp httpauth example.com -add=[admin,StrongPassword123!]
-```
+User name and password are always entered interactively, so the password never appears in the shell history or the process list. `-add` requires a terminal.
 
 Delete user:
 
@@ -1159,6 +1228,8 @@ sudo clp httpauth example.com -path=/staging
 #### ④ IP / CIDR Whitelisting (`-whitelist`)
 
 Allow specified IP addresses or office subnets direct access without passwords (Nginx `satisfy any` mechanism):
+
+> **Spoofing protection**: CloudPanel's `/etc/nginx/nginx.conf` has `set_real_ip_from 0.0.0.0/0`, which lets anyone send `X-Real-IP: <a whitelisted IP>` and skip the password. When a command writes a whitelist (`-whitelist=<ip>`, or `-wp-admin` / `-path` on a site that already has one), CLP Helper explains this and comments that line out (asks first, default yes; `-y` applies it directly; non-interactive without `-y` stops before changing anything). It applies to every site on the server; 127.0.0.1 and private ranges stay trusted. The backup goes to `/root/.clp/httpauth-backup/<time>/`. `-list=protected` warns if the line is still active.
 
 Add IPs or CIDR blocks to whitelist:
 
@@ -1285,7 +1356,7 @@ sudo clp php-pm -fix -all -exclude="test.,dev."
 Where the numbers come from:
 
 - **peak**: the most workers that ran at the same time since PHP-FPM started (`max active processes` on the pool's status page). **days** shows how long that period is.
-- **reached**: how often the pool hit `pm.max_children` — from the status page and from the PHP-FPM log of the last 7 days.
+- **reached**: how often the pool hit `pm.max_children` — from the status page and from the PHP-FPM log of the last 7 days (log hits under a lower, earlier limit are not counted).
 - **Memory limit**: total memory minus MySQL/MariaDB, Varnish (its `malloc` size), Redis and 512MB reserve, divided by the memory of one PHP worker (measured from busy workers; 100MB when there are too few to measure).
 
 How the suggestion is calculated:
@@ -1332,7 +1403,7 @@ The first choice shown is the recommended one; `sudo bash install.sh -y` uses it
 | `cf-default-mode` | Cloudflare SSL mode applied by `-cf-waf=on` | `off`, `flexible`, `full`, `strict`; default `strict` |
 | `cf-always-https` | Cloudflare "Always Use HTTPS" applied by `-cf-waf=on` | `on`, `off`; default `on` |
 | `cf-min-tls` | Cloudflare minimum TLS version applied by `-cf-waf=on` | `1.0`–`1.3`; default `1.2` |
-| `backup-dir` | Local directory used by `clp backup` / `clp restore` when `-path` is not given, and for the database copy kept by `clp site -clone` / `-migrate`. After changing it, older backups stay where they were; `clp restore` points them out (use `-path`) | Absolute path outside `/home`; default `/root/clpBackup` |
+| `backup-dir` | Local directory used by `clp backup` / `clp restore` when `-path` is not given, and for the database copy kept by `clp site -clone` / `-migrate`. After changing it, older backups stay where they were; `clp restore` points them out (use `-path`) | Absolute path outside `/home`, not under `/tmp`, `/var/tmp`, `/dev`, `/run`, `/proc` or `/sys`, and not a system directory itself (`/etc`, `/usr`, `/var`, …); `-path` follows the same rule; default `/root/clpBackup` |
 | `backup-remote-dir` | Directory on the rclone remote when `-path` is not given (`<value>/<domain>`) | Relative path; default `clpBackup` |
 | `backup-type` | Backup type when `-type` is not given | `db`, `full`, `compact`, `archive`; default `full` |
 | `backup-to` | Destination (and `clp restore` source) when `-to` is not given | `local` or an rclone remote name; default `local` |

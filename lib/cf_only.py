@@ -183,9 +183,13 @@ def cmd_dns_check(domain, ips_file):
     for name in (domain, other):
         try:
             infos = socket.getaddrinfo(name, None, proto=socket.IPPROTO_TCP)
-        except socket.gaierror:
-            print("%s\t-\tnone" % name)
-            continue
+        except socket.gaierror as e:
+            # 只有「名稱不存在／沒有位址」才算沒有記錄；解析器逾時、SERVFAIL 等錯誤不可當成沒有記錄而放行
+            no_record = {getattr(socket, n) for n in ("EAI_NONAME", "EAI_NODATA", "EAI_ADDRFAMILY") if hasattr(socket, n)}
+            if e.errno in no_record:
+                print("%s\t-\tnone" % name)
+                continue
+            fail("DNS lookup failed for %s: %s" % (name, e))
         addrs = sorted({i[4][0] for i in infos})
         for a in addrs:
             ip = ipaddress.ip_address(a.split('%', 1)[0])

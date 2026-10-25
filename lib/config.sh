@@ -71,14 +71,22 @@ _extract_token_from_file() {
   [[ ! -f "$f" ]] && return 1
 
   # Priority 1: standard certbot / cloudflare ini key
-  local t
-  t="$(grep -E '^[[:space:]]*(dns_cloudflare_api_token|cloudflare_api_token)[[:space:]]*=' "$f" 2>/dev/null \
-    | tail -n1 \
-    | cut -d'=' -f2- \
-    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/#.*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' \
-    | tr -d '[:space:]' || true)"
+  local t raw
+  raw="$(grep -E '^[[:space:]]*(dns_cloudflare_api_token|cloudflare_api_token)[[:space:]]*=' "$f" 2>/dev/null \
+    | tail -n1 | cut -d'=' -f2- || true)"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  # 有引號時取引號內的內容（之後的 # 註解不影響）；沒有引號時去掉行內 # 註解
+  if [[ "$raw" == \"* ]]; then
+    raw="${raw#\"}"; raw="${raw%%\"*}"
+  elif [[ "$raw" == \'* ]]; then
+    raw="${raw#\'}"; raw="${raw%%\'*}"
+  else
+    raw="${raw%%#*}"
+  fi
+  t="$(tr -d '[:space:]' <<< "$raw")"
 
-  if [[ -n "$t" ]]; then
+  # setup_certbot 舊版建立的範本檔只有佔位字串，不可當成 token
+  if [[ -n "$t" && "$t" != YOUR_* ]]; then
     echo "$t"
     return 0
   fi
@@ -207,6 +215,14 @@ _config_valid_backup_dir() {
   [[ -n "${v//\//}" ]] || return 1
   [[ "/${v}/" != *"/../"* ]] || return 1
   [[ "$v" != "/home" && "$v" != /home/* ]] || return 1
+  # 不接受 // 或 /./（可用來繞過以下檢查）
+  [[ "$v" != *"//"* && "/${v}/" != *"/./"* ]] || return 1
+  # 不可使用任何使用者都能寫入的目錄（其他使用者可預先建立目錄或放置 symlink），也不可是系統目錄本身（chmod 700 會改壞它）
+  local d="${v%/}"
+  case "$d" in
+    /tmp|/tmp/*|/var/tmp|/var/tmp/*|/dev|/dev/*|/run|/run/*|/proc|/proc/*|/sys|/sys/*) return 1 ;;
+    /etc|/usr|/var|/bin|/sbin|/lib|/lib64|/boot) return 1 ;;
+  esac
 }
 
 # _config_valid_remote_dir：rclone 遠端上的相對路徑
@@ -316,11 +332,11 @@ display_config_key() {
 }
 
 # _config_del_pattern <正規化鍵名>：刪除設定時要一併移除的鍵（含舊版別名）的 grep -E 樣式（set／unset 共用）
+# 別名與讀取端共用 _clp_conf_key_regex（lib/conf_read.sh）；token 一併移除它的來源紀錄
 _config_del_pattern() {
   case "$1" in
-    CLP_LANG) echo "^(CLP_LANG|lang)=" ;;
-    CF_API_TOKEN) echo "^(CF_API_TOKEN|CF_API_TOKEN_SOURCE|cf-token|cf_token|cloudflare_api_token)=" ;;
-    *) echo "^${1}=" ;;
+    CF_API_TOKEN) echo "^[[:space:]]*($(_clp_conf_key_regex "$1")|CF_API_TOKEN_SOURCE)[[:space:]]*=" ;;
+    *) _clp_conf_line_regex "$1" ;;
   esac
 }
 

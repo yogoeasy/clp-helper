@@ -516,8 +516,12 @@ setup_system_basics() {
   fi
 
   log_info "$(_t "SERVER_BASICS_INFO_INSTALL_PKGS")"
-  apt-get -o DPkg::Lock::Timeout=60 update -y
-  apt-get -o DPkg::Lock::Timeout=60 install -y build-essential tar zip unzip git sudo cron rsync ncdu jq trash-cli expect ca-certificates
+  # 呼叫端以 || 擷取結果，set -e 在函式內不會生效，必須自行檢查
+  apt-get -o DPkg::Lock::Timeout=60 update -y || log_warn "$(_t "SERVER_WARN_APT_UPDATE_FAILED")"
+  if ! apt-get -o DPkg::Lock::Timeout=60 install -y build-essential tar zip unzip git sudo cron rsync ncdu jq trash-cli expect ca-certificates; then
+    log_error "$(_t "SERVER_ERR_APT_INSTALL_FAILED")"
+    return 1
+  fi
 
   log_info "$(_t "SERVER_BOOTSTRAP_INFO_LOCALES_GEN")"
   locale-gen en_US.UTF-8 2>/dev/null || true
@@ -528,6 +532,133 @@ setup_system_basics() {
   set_system_timezone "$target_tz" || return 1
   log_success "$(_t "SERVER_BASICS_SUCCESS")"
   return 0
+}
+
+# ------------------------------------------------------------------------------
+# SSH 共用工具（UFW 與 SSH hardening）
+# ------------------------------------------------------------------------------
+# ssh_prepare_privsep：sshd -t／-T 需要 /run/sshd；ssh.socket 啟動的主機在 ssh.service 尚未執行時
+#   （例如重開機後只用 console 登入）這個目錄不存在，測試會因此失敗而不是設定有錯
+ssh_prepare_privsep() {
+  [[ -d /run/sshd ]] || mkdir -p -m 0755 /run/sshd 2>/dev/null || true
+}
+
+# ssh_config_test：檢查 sshd 設定語法；錯誤訊息輸出到 stdout 供呼叫端顯示
+ssh_config_test() {
+  ssh_prepare_privsep
+  sshd -t 2>&1
+}
+
+# ssh_detect_ports：輸出所有 SSH 監聽埠（每行一個、排序去重）；完全抓不到時回傳 1
+#   來源：sshd -T 的每個 port 與 listenaddress、ssh.socket 的 Listen、sshd／systemd 正在監聽的 TCP 埠
+ssh_detect_ports() {
+  local key val p
+  local -a ports=()
+  ssh_prepare_privsep
+  while read -r key val; do
+    case "$key" in
+      port) ports+=("$val") ;;
+      listenaddress) p="${val##*:}"; [[ "$val" == *:* ]] && ports+=("$p") ;;
+    esac
+  done < <(sshd -T 2>/dev/null || true)
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    while read -r p; do
+      ports+=("$p")
+    done < <(systemctl show ssh.socket -p Listen --value 2>/dev/null | grep -oE ':[0-9]+ \(Stream\)' | grep -oE '[0-9]+' || true)
+  fi
+  while read -r p; do
+    ports+=("$p")
+  done < <(ss -Hltnp 2>/dev/null | awk '/"sshd"/ { n = split($4, a, ":"); print a[n] }' || true)
+  local out
+  out=$(for p in ${ports[@]+"${ports[@]}"}; do [[ "$p" =~ ^[0-9]+$ && "$p" -ge 1 && "$p" -le 65535 ]] && echo "$p"; done | sort -un)
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# ufw_port_has_rule <port>：UFW 是否已有提到這個埠號的 allow／limit 規則（包括只允許特定來源 IP 的規則與 OpenSSH）
+#   用於啟用前補 SSH 規則：已有任何規則時不再加入對所有來源開放的 allow，避免放寬原本的限制
+ufw_port_has_rule() {
+  local p="$1" names="${1}(/tcp)?|port ${1}"
+  # OpenSSH 應用程式設定檔固定是 22
+  [[ "$p" == "22" ]] && names="${names}|OpenSSH"
+  ufw show added 2>/dev/null | grep -qE "^ufw (allow|limit) (.* )?(${names})( |\$)"
+}
+
+# ssh_config_snapshot：把 sshd_config 與 sshd_config.d/ 複製到 root 專屬暫存目錄，輸出目錄路徑
+ssh_config_snapshot() {
+  local d
+  d=$(mktemp -d /tmp/clp-sshd.XXXXXX) || return 1
+  if ! cp -p /etc/ssh/sshd_config "${d}/sshd_config"; then
+    rm -rf "$d"
+    return 1
+  fi
+  if [[ -d /etc/ssh/sshd_config.d ]] && ! cp -a /etc/ssh/sshd_config.d "${d}/sshd_config.d"; then
+    rm -rf "$d"
+    return 1
+  fi
+  echo "$d"
+}
+
+# ssh_config_restore <snapshot_dir>：還原 sshd_config 與 sshd_config.d/（刪除快照之後新增的檔案）
+ssh_config_restore() {
+  local d="$1"
+  [[ -n "$d" && -f "${d}/sshd_config" ]] || return 1
+  atomic_replace "${d}/sshd_config" /etc/ssh/sshd_config || return 1
+  if [[ -d "${d}/sshd_config.d" ]]; then
+    local f
+    for f in /etc/ssh/sshd_config.d/* /etc/ssh/sshd_config.d/.[!.]*; do
+      [[ -e "$f" || -L "$f" ]] || continue
+      [[ -e "${d}/sshd_config.d/${f##*/}" ]] || rm -f "$f" || return 1
+    done
+    cp -a "${d}/sshd_config.d/." /etc/ssh/sshd_config.d/ || return 1
+  fi
+}
+
+# ssh_write_file <path> <content>：原子寫入 sshd 設定檔（同目錄暫存檔、644）
+ssh_write_file() {
+  local path="$1" content="$2" tmp
+  tmp=$(mktemp "${path}.tmp.XXXXXX") || return 1
+  if ! printf '%s\n' "$content" > "$tmp" || ! chmod 644 "$tmp" || ! atomic_replace "$tmp" "$path"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+  chmod 644 "$path" 2>/dev/null || true
+}
+
+# ssh_insert_block <sshd_config> <block>：把設定區塊寫進主設定檔（原子置換）
+#   sshd 採用第一個讀到的值，所以寫在第一個 Match 之前；沒有 Match 時寫在檔案開頭（寫在結尾會被前面的同名設定蓋過）
+ssh_insert_block() {
+  local cfg="$1" block="$2" tmp
+  tmp=$(mktemp "${cfg}.tmp.XXXXXX") || return 1
+  if grep -qiE '^[[:space:]]*Match[[:space:]]' "$cfg"; then
+    # 區塊含換行，awk -v 無法傳遞，改以環境變數傳入
+    CLP_SSHD_BLOCK="$block" awk '
+      !done && tolower($0) ~ /^[[:space:]]*match[[:space:]]/ { printf "%s\n", ENVIRON["CLP_SSHD_BLOCK"]; done = 1 }
+      { print }' "$cfg" > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    { printf '%s\n' "$block"; cat "$cfg"; } > "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  if ! atomic_replace "$tmp" "$cfg"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+}
+
+# ssh_operator_has_key：實際操作的帳號是否有可用的金鑰
+#   以 sudo 執行時看 SUDO_USER 自己的 authorized_keys（root 有金鑰不代表這位操作者能用金鑰登入）；直接以 root 執行時看 root 的
+#   只計算沒有前置選項的金鑰行（雲端映像常見的 command="echo Please login as ..." 不算）
+ssh_operator_has_key() {
+  local user="root" home="/root"
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    user="$SUDO_USER"
+    home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)
+    [[ -n "$home" ]] || home="/home/${user}"
+  fi
+  SSH_OPERATOR="$user"
+  [[ -s "${home}/.ssh/authorized_keys" ]] && \
+    grep -qE '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-|sk-)' "${home}/.ssh/authorized_keys" 2>/dev/null
 }
 
 # Module 3: UFW Firewall & ICMP
@@ -544,22 +675,32 @@ setup_ufw() {
     return 1
   fi
 
+  # SSH 埠必須先確定，抓不到就不啟用（default deny 之後會鎖死）
+  local ssh_ports
+  if ! ssh_ports=$(ssh_detect_ports); then
+    log_error "$(_t "SERVER_UFW_ERR_SSH_PORT_UNKNOWN")"
+    return 1
+  fi
+
+  # 先加入 SSH 允許規則，再設定 default deny（UFW 已啟用時 default deny 會立即生效）
+  log_info "$(_t "SERVER_UFW_INFO_ALLOW_PORTS" "$(echo $ssh_ports)")"
+  local sp
+  for sp in $ssh_ports; do
+    if ! ufw allow "${sp}/tcp" comment 'SSH'; then
+      log_error "$(_t "SERVER_UFW_ERR_ALLOW_SSH" "$sp")"
+      return 1
+    fi
+  done
+
   log_info "$(_t "SERVER_UFW_INFO_DEFAULT_POLICY")"
-  ufw default deny incoming
-  ufw default allow outgoing
-
-  local active_ssh_port
-  active_ssh_port=$(sshd -T 2>/dev/null | grep -i '^port[[:space:]]' | head -n1 | awk '{print $2}' || true)
-  [[ -z "$active_ssh_port" ]] && active_ssh_port="22"
-
-  log_info "$(_t "SERVER_UFW_INFO_ALLOW_PORTS" "${active_ssh_port}")"
-  ufw allow "${active_ssh_port}/tcp" comment 'SSH'
-  [[ "$active_ssh_port" != "22" ]] && ufw allow 22/tcp comment 'SSH default'
-  ufw allow http
-  ufw allow https
-  ufw allow 8443/tcp comment 'CloudPanel Control Panel'
+  ufw default deny incoming || return 1
+  ufw default allow outgoing || return 1
+  ufw allow http || log_warn "$(_t "SERVER_UFW_WARN_ALLOW_FAILED" "http")"
+  ufw allow https || log_warn "$(_t "SERVER_UFW_WARN_ALLOW_FAILED" "https")"
+  ufw allow 8443/tcp comment 'CloudPanel Control Panel' || log_warn "$(_t "SERVER_UFW_WARN_ALLOW_FAILED" "8443/tcp")"
   # CloudPanel 官方安裝程式會加入 8433:8443/tcp 範圍規則（多開放 8433–8442），收斂為只開放 8443
-  if ufw status 2>/dev/null | grep -qE '^8433:8443/tcp'; then
+  # （ufw show added 在 UFW 尚未啟用時也會列出規則）
+  if ufw show added 2>/dev/null | grep -qE 'allow 8433:8443/tcp'; then
     ufw --force delete allow 8433:8443/tcp >/dev/null 2>&1 || true
     log_info "$(_t "SERVER_UFW_INFO_REMOVED_8433_RANGE")"
   fi
@@ -571,7 +712,10 @@ setup_ufw() {
   fi
 
   log_info "$(_t "SERVER_UFW_INFO_ENABLE")"
-  ufw --force enable
+  if ! ufw --force enable; then
+    log_error "$(_t "SERVER_UFW_ERR_ENABLE")"
+    return 1
+  fi
 
   # 處理 Oracle Cloud / 雲端發行版預設 iptables REJECT 規則衝突 (常見於 /etc/iptables/rules.v4)
   # 這些預設規則會攔截在 UFW 鏈之前，導致除 22 以外的所有連接埠 (80, 443, 8443) 即使在 UFW 放行也被強行拒絕！
@@ -614,33 +758,30 @@ setup_ssh_hardening() {
     return 0
   fi
 
-  local auth_keys_root="/root/.ssh/authorized_keys"
-  local has_valid_key=false
-
-  # 1. 檢查 root 金鑰
-  if [[ -s "$auth_keys_root" ]] && grep -qE '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-|sk-)' "$auth_keys_root" 2>/dev/null; then
-    has_valid_key=true
+  # 1. 不放寬既有設定：目前生效的 PermitRootLogin 比 prohibit-password 嚴格時沿用
+  local root_login="prohibit-password" cur_root_login
+  ssh_prepare_privsep
+  cur_root_login=$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" { print $2; exit }' || true)
+  if [[ "$cur_root_login" == "no" || "$cur_root_login" == "forced-commands-only" ]]; then
+    root_login="$cur_root_login"
+    log_info "$(_t "SERVER_SSH_INFO_KEEP_ROOT_LOGIN" "$cur_root_login")"
   fi
 
-  # 2. 檢查 SUDO_USER 金鑰 (避免以 sudo 執行時 root 尚未建 key 造成誤判)
-  if [[ "$has_valid_key" == "false" && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-    local sudo_user_home=""
-    sudo_user_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "/home/${SUDO_USER}")
-    [[ -z "$sudo_user_home" ]] && sudo_user_home="/home/${SUDO_USER}"
-    local sudo_user_keys="${sudo_user_home}/.ssh/authorized_keys"
-    if [[ -s "$sudo_user_keys" ]] && grep -qE '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-|sk-)' "$sudo_user_keys" 2>/dev/null; then
-      has_valid_key=true
-      log_info "$(_t "SERVER_SSH_INFO_SUDO_KEY_DETECTED" "${SUDO_USER}")"
-    fi
+  # 2. 鎖死檢查：實際操作的帳號（sudo 的 SUDO_USER，或直接登入的 root）必須有可用的金鑰；
+  #    root 不允許 SSH 登入（沿用 no／forced-commands-only）時，root 的金鑰不算（可能是 su - 之後執行）
+  local operator_ok=true
+  ssh_operator_has_key || operator_ok=false
+  if [[ "$operator_ok" == "true" && "$SSH_OPERATOR" == "root" && "$root_login" != "prohibit-password" ]]; then
+    operator_ok=false
   fi
-
-  if [[ "$has_valid_key" == "false" ]]; then
+  if [[ "$operator_ok" != "true" ]]; then
     # 若為非互動模式 (-y / --yes / CLP_AUTO_YES / --non-interactive)，強制安全略過，絕對不可自動停用密碼登入導致反鎖！
     if [[ "${CLP_AUTO_YES:-false}" == "true" ]] || has_opt "y" || has_opt "yes" || has_opt "non_interactive" || has_opt "non-interactive"; then
       log_warn "======================================================================"
       log_warn "$(_t "SERVER_SSH_WARN_NO_KEY_AUTO_SKIP_1")"
       log_warn "$(_t "SERVER_SSH_WARN_NO_KEY_AUTO_SKIP_2")"
       log_warn "$(_t "SERVER_SSH_WARN_NO_KEY_AUTO_SKIP_3")"
+      log_warn "$(_t "SERVER_SSH_WARN_OPERATOR" "$SSH_OPERATOR")"
       log_warn "======================================================================"
       return 0
     fi
@@ -649,12 +790,15 @@ setup_ssh_hardening() {
       log_warn "======================================================================"
       log_warn "$(_t "SERVER_SSH_WARN_NO_KEY_PROMPT_1")"
       log_warn "$(_t "SERVER_SSH_WARN_NO_KEY_PROMPT_2")"
+      log_warn "$(_t "SERVER_SSH_WARN_OPERATOR" "$SSH_OPERATOR")"
       log_warn "======================================================================"
       if ! prompt_confirm "$(_t "SERVER_SSH_PROMPT_FORCE_DISABLE")" "n"; then
         log_warn "$(_t "SERVER_SSH_WARN_CANCELLED_LOCKOUT")"
         return 0
       fi
     fi
+  elif [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    log_info "$(_t "SERVER_SSH_INFO_SUDO_KEY_DETECTED" "${SUDO_USER}")"
   fi
 
   local sshd_config="/etc/ssh/sshd_config"
@@ -663,68 +807,75 @@ setup_ssh_hardening() {
     return 1
   fi
 
+  # 3. 修改前快照 sshd_config 與 sshd_config.d/，語法檢查失敗時全部還原
   backup_file "$sshd_config"
+  local snap
+  if ! snap=$(ssh_config_snapshot); then
+    log_error "$(_t "SERVER_SSH_ERR_SNAPSHOT")"
+    return 1
+  fi
 
   # 清理任何先前的緊急復原 drop-in 與設定
   rm -f "/etc/ssh/sshd_config.d/00-clp-emergency.conf"
-  remove_marked_block "$sshd_config" "# === CloudPanel Emergency Unharden ===" "# === End CloudPanel Emergency Unharden ===" || return 1
+  local changed_ok=true
+  remove_marked_block "$sshd_config" "# === CloudPanel Emergency Unharden ===" "# === End CloudPanel Emergency Unharden ===" || changed_ok=false
+
+  local settings="PermitRootLogin ${root_login}
+PasswordAuthentication no
+KbdInteractiveAuthentication no"
 
   # 處理 Ubuntu/Debian 雲端主機 /etc/ssh/sshd_config.d/ 覆蓋問題 (如 50-cloud-init.conf)
-  if [[ -d "/etc/ssh/sshd_config.d" ]]; then
+  if [[ "$changed_ok" == "true" && -d "/etc/ssh/sshd_config.d" ]]; then
     local dropin_file="/etc/ssh/sshd_config.d/01-clp-hardening.conf"
     log_info "$(_t "SERVER_SSH_INFO_APPLYING")"
-    cat <<'EOF' > "$dropin_file"
-# === CloudPanel Hardening Drop-in ===
-PermitRootLogin prohibit-password
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-# === End CloudPanel Hardening ===
-EOF
-    chmod 644 "$dropin_file"
+    ssh_write_file "$dropin_file" "# === CloudPanel Hardening Drop-in ===
+${settings}
+# === End CloudPanel Hardening ===" || changed_ok=false
 
-    # 同步檢查並中和 50-cloud-init.conf 等衝突項
+    # 同步中和 50-cloud-init.conf 等衝突項：只改 Match 區塊之前的全域設定，
+    # Match 區塊中的 PasswordAuthentication yes 通常是刻意的例外（例如只允許內網），保留並提示
+    local conf tmp_conf
     for conf in /etc/ssh/sshd_config.d/*.conf; do
-      [[ ! -f "$conf" || "$conf" == "$dropin_file" ]] && continue
-      if grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' "$conf" 2>/dev/null; then
-        backup_file "$conf"
-        sed -i 's/^[[:space:]]*PasswordAuthentication[[:space:]]\+yes/PasswordAuthentication no/g' "$conf"
-        log_info "$(_t "SERVER_SSH_INFO_FIXED_OVERRIDE" "${conf}")"
+      [[ "$changed_ok" == "true" && -f "$conf" && "$conf" != "$dropin_file" ]] || continue
+      grep -qiE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' "$conf" 2>/dev/null || continue
+      backup_file "$conf"
+      tmp_conf=$(mktemp "${conf}.tmp.XXXXXX") || { changed_ok=false; break; }
+      awk '
+        tolower($0) ~ /^[[:space:]]*match[[:space:]]/ { in_match = 1 }
+        !in_match && tolower($0) ~ /^[[:space:]]*passwordauthentication[[:space:]]+yes/ { print "PasswordAuthentication no"; next }
+        { print }' "$conf" > "$tmp_conf" && atomic_replace "$tmp_conf" "$conf" || changed_ok=false
+      rm -f "$tmp_conf"
+      log_info "$(_t "SERVER_SSH_INFO_FIXED_OVERRIDE" "${conf}")"
+      if awk 'tolower($0) ~ /^[[:space:]]*match[[:space:]]/ { m = 1 } m && tolower($0) ~ /^[[:space:]]*passwordauthentication[[:space:]]+yes/ { f = 1 } END { exit !f }' "$conf"; then
+        log_warn "$(_t "SERVER_SSH_WARN_MATCH_PASSWORD_KEPT" "${conf}")"
       fi
     done
   fi
 
-  # 更新主設定檔 /etc/ssh/sshd_config
-  remove_marked_block "$sshd_config" "# === CloudPanel Hardening Settings ===" "# === End CloudPanel Hardening ===" || return 1
-
-  # 必須寫在第一個 Match 區塊之前，否則只會套用到該 Match 條件而非全域
-  local hardening_block
-  hardening_block=$'\n# === CloudPanel Hardening Settings ===\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n# === End CloudPanel Hardening ===\n'
-  local sshd_tmp
-  sshd_tmp=$(mktemp)
-  if grep -qiE '^[[:space:]]*Match[[:space:]]' "$sshd_config"; then
-    # 區塊含換行，awk -v 無法傳遞，改以環境變數傳入
-    CLP_SSHD_BLOCK="$hardening_block" awk '
-      !done && tolower($0) ~ /^[[:space:]]*match[[:space:]]/ { printf "%s\n", ENVIRON["CLP_SSHD_BLOCK"]; done = 1 }
-      { print }' "$sshd_config" > "$sshd_tmp"
-  else
-    cat "$sshd_config" > "$sshd_tmp"
-    printf '%s' "$hardening_block" >> "$sshd_tmp"
+  # 更新主設定檔 /etc/ssh/sshd_config（寫在第一個 Match 之前；沒有 Match 時寫在開頭）
+  if [[ "$changed_ok" == "true" ]]; then
+    remove_marked_block "$sshd_config" "# === CloudPanel Hardening Settings ===" "# === End CloudPanel Hardening ===" || changed_ok=false
   fi
-  atomic_replace "$sshd_tmp" "$sshd_config"
-  rm -f "$sshd_tmp"
+  if [[ "$changed_ok" == "true" ]]; then
+    ssh_insert_block "$sshd_config" "# === CloudPanel Hardening Settings ===
+${settings}
+# === End CloudPanel Hardening ===" || changed_ok=false
+  fi
 
-  # 驗證語法
+  # 驗證語法；任何一步失敗都還原快照
   log_info "$(_t "SERVER_SSH_INFO_TESTING")"
-  local sshd_err
-  if ! sshd_err=$(sshd -t 2>&1); then
+  local sshd_err=""
+  if [[ "$changed_ok" != "true" ]] || ! sshd_err=$(ssh_config_test); then
     log_error "$(_t "SERVER_SSH_ERR_SYNTAX_FAILED" "${sshd_err}")"
     log_error "$(_t "SERVER_SSH_ERR_REVERTING")"
-    local latest_bak
-    latest_bak=$(ls -t "${sshd_config}".bak_* 2>/dev/null | head -n 1 || true)
-    [[ -n "$latest_bak" ]] && cp "$latest_bak" "$sshd_config"
-    rm -f "/etc/ssh/sshd_config.d/01-clp-hardening.conf"
+    if ssh_config_restore "$snap"; then
+      rm -rf "$snap"
+    else
+      log_error "$(_t "SERVER_SSH_ERR_RESTORE" "$snap")"
+    fi
     return 1
   fi
+  rm -rf "$snap"
 
   systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
 
@@ -757,12 +908,19 @@ setup_fail2ban() {
   local jail_local="/etc/fail2ban/jail.local"
   if [[ ! -f "$jail_local" ]]; then
     log_info "$(_t "SERVER_F2B_INFO_CONFIGURING")"
+    # UFW 未啟用時 banaction=ufw 不會有效封鎖，改用 iptables
+    local f2b_banaction="iptables-multiport" f2b_ufw_out=""
+    command -v iptables >/dev/null 2>&1 || f2b_banaction="nftables-multiport"
+    if command -v ufw >/dev/null 2>&1; then
+      f2b_ufw_out=$(ufw status 2>/dev/null || true)
+      grep -q "Status: active" <<< "$f2b_ufw_out" && f2b_banaction="ufw"
+    fi
     cat <<EOF > "$jail_local"
 [DEFAULT]
 bantime  = 1h
 findtime = 10m
 maxretry = 5
-banaction = ufw
+banaction = ${f2b_banaction}
 
 [sshd]
 enabled = true
@@ -781,7 +939,10 @@ EOF
   fi
 
   systemctl enable fail2ban 2>/dev/null || true
-  systemctl restart fail2ban 2>/dev/null || true
+  if ! systemctl restart fail2ban 2>/dev/null; then
+    log_error "$(_t "SERVER_F2B_ERR_RESTART")"
+    return 1
+  fi
   log_success "$(_t "SERVER_F2B_SUCCESS")"
   return 0
 }
@@ -857,16 +1018,23 @@ setup_sysctl() {
 
   local tmp_dropin
   tmp_dropin=$(mktemp "${dropin_dir}/.99-clp.XXXXXX")
+  # 不設定 fs.file-max：systemd 開機時已設為最大值，舊版寫入的 500000 反而會調低上限
   cat <<'EOF' > "$tmp_dropin"
 # === CloudPanel Sysctl Optimizations ===
-fs.file-max = 500000
 vm.swappiness = 10
 EOF
   chmod 644 "$tmp_dropin"
-  atomic_replace "$tmp_dropin" "$dropin_file"
+  if ! atomic_replace "$tmp_dropin" "$dropin_file"; then
+    rm -f "$tmp_dropin"
+    return 1
+  fi
   rm -f "$tmp_dropin"
 
-  sysctl -p "$dropin_file" 2>/dev/null || sysctl --system 2>/dev/null || true
+  sysctl --system >/dev/null 2>&1 || true
+  # 舊版設定的 500000 在重新開機前仍有效，恢復 systemd 的預設值
+  if [[ "$(sysctl -n fs.file-max 2>/dev/null)" == "500000" ]]; then
+    sysctl -qw fs.file-max=9223372036854775807 2>/dev/null || true
+  fi
   log_success "$(_t "SERVER_SYSCTL_SUCCESS")"
   return 0
 }
@@ -1111,11 +1279,24 @@ setup_smtp() {
     postconf -e "default_transport = smtp"
     postconf -e "bounce_queue_lifetime = 1h"
 
+    # 465 為 implicit TLS（SMTPS），需要 wrappermode 並強制加密
+    if [[ -n "$relay_host" ]]; then
+      if [[ "$relay_port" == "465" ]]; then
+        postconf -e "smtp_tls_wrappermode = yes"
+      else
+        postconf -e "smtp_tls_wrappermode = no"
+      fi
+    fi
+
     if [[ -n "$relay_host" && ( -z "$smtp_user" || -z "$smtp_pass" ) ]]; then
       # 不需驗證的轉送主機（只填主機）
       postconf -e "relayhost = [${relay_host}]:${relay_port}"
       postconf -e "smtp_sasl_auth_enable = no"
-      postconf -e "smtp_tls_security_level = may"
+      if [[ "$relay_port" == "465" ]]; then
+        postconf -e "smtp_tls_security_level = encrypt"
+      else
+        postconf -e "smtp_tls_security_level = may"
+      fi
       log_info "$(_t "SERVER_SMTP_INFO_CONFIGURING" "${relay_host}" "${relay_port}")"
     elif [[ -n "$relay_host" && -n "$smtp_user" && -n "$smtp_pass" ]]; then
       local sasl_passwd_file="/etc/postfix/sasl_passwd"
@@ -1129,21 +1310,48 @@ setup_smtp() {
       postconf -e "smtp_sasl_auth_enable = yes"
       postconf -e "smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd"
       postconf -e "smtp_sasl_security_options = noanonymous"
-      postconf -e "smtp_tls_security_level = may"
+      # 有帳密時強制 TLS，避免密碼以明文送出
+      postconf -e "smtp_tls_security_level = encrypt"
       log_info "$(_t "SERVER_SMTP_INFO_CONFIGURING" "${relay_host}" "${relay_port}")"
     fi
   fi
 
   # 靜音本機吵鬧的背景守護行程郵件 (例如 www-data 產生的 cron 失敗等)
-  local transport_file="/etc/postfix/transport"
-  cat <<'EOF' > "$transport_file"
-# Discard system background daemon noisy emails
-/^www-data(@|$)/       discard:
-/^localhost(@|$)/      discard:
-/^wordpress(@|$)/      discard:
-EOF
-  postmap "$transport_file" 2>/dev/null || true
-  postconf -e "transport_maps = regexp:/etc/postfix/transport" 2>/dev/null || true
+  # 只比對寄往本機的收件者，寫在獨立檔案，不覆蓋使用者自己的 /etc/postfix/transport
+  if [[ -d /etc/postfix ]]; then
+    local transport_file="/etc/postfix/clp_transport"
+    local old_transport="/etc/postfix/transport"
+    local old_header="# Discard system background daemon noisy emails"
+    local local_hosts="localhost" h
+    for h in "$(postconf -h myhostname 2>/dev/null || true)" "$(cat /etc/mailname 2>/dev/null || true)"; do
+      [[ "$h" =~ ^[A-Za-z0-9.-]+$ ]] || continue
+      local_hosts+="|${h//./\\.}"
+    done
+    local tmp_transport
+    tmp_transport=$(mktemp "/etc/postfix/.clp_transport.XXXXXX")
+    {
+      echo "# Managed by clp: discard noisy local daemon mail (local recipients only)"
+      printf '/^(www-data|localhost|wordpress)(@(%s))?$/ discard:\n' "$local_hosts"
+    } > "$tmp_transport"
+    chmod 644 "$tmp_transport"
+    if atomic_replace "$tmp_transport" "$transport_file"; then
+      # 保留既有的 transport_maps，移除舊版指向 /etc/postfix/transport 的設定（只在該檔是舊版 clp 寫的時候）
+      local maps="" item new_maps="regexp:${transport_file}"
+      local -a map_items=()
+      maps=$(postconf -h transport_maps 2>/dev/null || true)
+      IFS=', ' read -r -a map_items <<< "$maps"
+      for item in ${map_items[@]+"${map_items[@]}"}; do
+        [[ -z "$item" ]] && continue
+        [[ "$item" == "regexp:${transport_file}" ]] && continue
+        if [[ "$item" == "regexp:${old_transport}" ]] && [[ "$(head -n1 "$old_transport" 2>/dev/null)" == "$old_header" ]]; then
+          continue
+        fi
+        new_maps+=", ${item}"
+      done
+      postconf -e "transport_maps = ${new_maps}" 2>/dev/null || true
+    fi
+    rm -f "$tmp_transport"
+  fi
 
   systemctl restart postfix 2>/dev/null || true
   log_success "$(_t "SERVER_SMTP_SUCCESS")"
@@ -1165,8 +1373,9 @@ setup_certbot() {
 
   # 建立憑證金鑰範本檔
   mkdir -p /root/.secrets && chmod 700 /root/.secrets
-  local cf_ini="/root/.secrets/cloudflare.ini"
-  if [[ ! -f "$cf_ini" ]]; then
+  # 範本檔不使用 .ini 副檔名：clp 會掃描 .secrets/*.ini 尋找 token，佔位字串不可被當成真的 token
+  local cf_ini="/root/.secrets/cloudflare.ini.example"
+  if [[ ! -f "$cf_ini" ]] && ! compgen -G "/root/.secrets/*.ini" >/dev/null; then
     (
       umask 077
       cat <<'EOF' > "$cf_ini"
@@ -1837,8 +2046,9 @@ ensure_system_bootstrap() {
   # 6. Bootstrap 安裝必備核心系統套件
   log_info "$(_t "SERVER_BOOTSTRAP_INFO_APT_INSTALL")"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get -o DPkg::Lock::Timeout=60 update -y
-  apt-get -o DPkg::Lock::Timeout=60 install -y \
+  # 呼叫端以 || 擷取結果，set -e 在函式內不會生效，必須自行檢查
+  apt-get -o DPkg::Lock::Timeout=60 update -y || log_warn "$(_t "SERVER_WARN_APT_UPDATE_FAILED")"
+  if ! apt-get -o DPkg::Lock::Timeout=60 install -y \
     curl \
     wget \
     sudo \
@@ -1850,7 +2060,10 @@ ensure_system_bootstrap() {
     debconf-utils \
     openssl \
     iproute2 \
-    iptables
+    iptables; then
+    log_error "$(_t "SERVER_ERR_APT_INSTALL_FAILED")"
+    return 1
+  fi
 
   # 7. 生成標準 UTF-8 語系 (en_US.UTF-8, zh_TW.UTF-8)
   log_info "$(_t "SERVER_BOOTSTRAP_INFO_LOCALES_GEN")"
@@ -1896,6 +2109,10 @@ server_install() {
   fi
   if has_opt "dry_run" || has_opt "dry-run"; then
     dry_run=true
+  fi
+  # 沒有終端機又沒有 -y 時，不可在沒有確認的情況下安裝與強化主機
+  if [[ "$dry_run" != "true" ]] && ! require_tty_or_yes; then
+    return 1
   fi
   load_available_db_engines
   if has_opt "db"; then
@@ -2244,6 +2461,14 @@ server_install() {
                 done
               fi
 
+              # 建立新管理員之前先備份 db.sq3；備份失敗時什麼都不做，回到選單
+              local clp_db_backup="${clp_db_file}.clpbak_$(date +%Y%m%d_%H%M%S)"
+              if ! cp -p "$clp_db_file" "$clp_db_backup"; then
+                echo -e "${C_RED}$(_t "SERVER_EXISTING_REPLACE_ERR_BACKUP" "${clp_db_file}")${C_NC}"
+                [[ -n "$auto_pass_file" && -f "$auto_pass_file" ]] && rm -f "$auto_pass_file"
+                continue
+              fi
+
               log_info "$(_t "SERVER_EXISTING_REPLACE_INFO_CREATING" "${new_admin_user}")"
               local add_out=""
               local add_rc=0
@@ -2255,15 +2480,27 @@ server_install() {
                 continue
               fi
 
-              local clp_db_backup="${clp_db_file}.clpbak_$(date +%Y%m%d_%H%M%S)"
-              cp -p "$clp_db_file" "$clp_db_backup" 2>/dev/null || true
+              # 刪除其他管理員前列出名單確認；任何一位刪除失敗都不可回報成功（db.sq3 已在建立新管理員前備份）
 
               local old_admins_to_del
               old_admins_to_del=$(sqlite3 -readonly "$clp_db_file" "SELECT user_name FROM user WHERE role = 'ROLE_ADMIN' AND user_name != '$new_admin_user';" 2>/dev/null || true)
+              if [[ -n "$old_admins_to_del" ]]; then
+                echo -e "${C_YELLOW}$(_t "SERVER_EXISTING_REPLACE_INFO_WILL_DELETE" "$(echo $old_admins_to_del)")${C_NC}"
+                if ! prompt_confirm "$(_t "SERVER_EXISTING_REPLACE_PROMPT_DELETE")" "y"; then
+                  echo -e "${C_YELLOW}$(_t "SERVER_EXISTING_REPLACE_INFO_KEPT" "${new_admin_user}")${C_NC}"
+                  old_admins_to_del=""
+                fi
+              fi
+              local del_failed=""
               for old_adm in $old_admins_to_del; do
-                clpctl user:delete --userName="$old_adm" --force >/dev/null 2>&1 || \
-                  sqlite3 "$clp_db_file" "PRAGMA foreign_keys=ON; DELETE FROM user WHERE user_name = '$old_adm' AND role = 'ROLE_ADMIN';" 2>/dev/null || true
+                if ! clpctl user:delete --userName="$old_adm" --force >/dev/null 2>&1 && \
+                   ! sqlite3 "$clp_db_file" "PRAGMA foreign_keys=ON; DELETE FROM user WHERE user_name = '$old_adm' AND role = 'ROLE_ADMIN';" 2>/dev/null; then
+                  del_failed+="${old_adm} "
+                fi
               done
+              if [[ -n "$del_failed" ]]; then
+                echo -e "${C_RED}$(_t "SERVER_EXISTING_REPLACE_ERR_DELETE" "${del_failed% }" "${clp_db_backup}")${C_NC}"
+              fi
 
               chown -R clp:clp /home/clp/htdocs/app/data 2>/dev/null || true
               chmod 770 /home/clp/htdocs/app/data 2>/dev/null || true
@@ -2273,7 +2510,7 @@ server_install() {
               existing_admin_count=1
               existing_admins="$new_admin_user"
 
-              echo -e "${C_GREEN}${C_BOLD}$(_t "SERVER_EXISTING_REPLACE_SUCCESS" "${new_admin_user}")${C_NC}"
+              [[ -z "$del_failed" ]] && echo -e "${C_GREEN}${C_BOLD}$(_t "SERVER_EXISTING_REPLACE_SUCCESS" "${new_admin_user}")${C_NC}"
               if [[ -n "$auto_pass_file" ]]; then
                 echo -e "${C_YELLOW}$(_t "SERVER_EXISTING_REPLACE_INFO_AUTO_PASS_SAVED" "${auto_pass_file}")${C_NC}"
               fi
@@ -2501,7 +2738,10 @@ server_install() {
     _print_install_plan
     if [[ -t 0 ]] && ! has_opt "force"; then
       local confirm_ans
-      read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_INSTALL_PROMPT_CONFIRM_NON_INTERACTIVE")${C_NC}")" confirm_ans
+      if ! read -r -p "$(echo -e "${C_CYAN}$(_t "SERVER_INSTALL_PROMPT_CONFIRM_NON_INTERACTIVE")${C_NC}")" confirm_ans; then
+        echo "$(_t "SERVER_INSTALL_MSG_CANCELLED")"
+        return 0
+      fi
       confirm_ans="${confirm_ans:-y}"
       case "$confirm_ans" in
         [Yy]*|"")
@@ -2520,8 +2760,13 @@ server_install() {
   # 執行系統環境 Bootstrap 初始化 (APT 鎖定、/etc/hosts、universe、磁碟空間、Swap、必備套件)
   ensure_system_bootstrap "$dry_run" || return 1
 
-  # 依序執行已啟用的模組
+  # 依序執行已啟用的模組；CloudPanel 核心安裝失敗時停止，不再繼續強化主機
+  local install_failed=0 core_failed=0
   for mod in "${MODULES[@]}"; do
+    if [[ "$core_failed" -eq 1 ]]; then
+      set_mod_status "$mod" "SKIPPED"
+      continue
+    fi
     if is_mod_enabled "$mod"; then
       local status_code=0
       case "$mod" in
@@ -2583,6 +2828,11 @@ server_install() {
       else
         log_warn "$(_t "SERVER_INSTALL_WARN_MOD_FAILED" "$mod")"
         set_mod_status "$mod" "FAILED"
+        install_failed=1
+        if [[ "$mod" == "cloudpanel" ]]; then
+          log_error "$(_t "SERVER_INSTALL_ERR_CORE_FAILED")"
+          core_failed=1
+        fi
       fi
     else
       set_mod_status "$mod" "SKIPPED"
@@ -2620,6 +2870,11 @@ server_install() {
   echo -e " $(_t "SERVER_INSTALL_SUMMARY_TARGET_TZ" "${C_BOLD}${target_tz}${C_NC}")"
   echo "=============================================================================="
   echo ""
+  # CloudPanel 核心沒有安裝成功時，不顯示「建立管理員」等後續步驟
+  if [[ "$core_failed" -eq 1 ]]; then
+    log_error "$(_t "SERVER_INSTALL_ERR_CORE_FAILED")"
+    return 1
+  fi
   echo -e "${C_BOLD}${C_CYAN}$(_t "SERVER_INSTALL_SUMMARY_NEXT_STEPS")${C_NC}"
   if [[ "$clp_already_installed" == "true" && $existing_admin_count -gt 0 ]]; then
     echo -e " $(_t "SERVER_INSTALL_SUMMARY_NEXT_ADMIN_EXISTS")"
@@ -2643,7 +2898,8 @@ server_install() {
   echo -e " $(_t "SERVER_INSTALL_SUMMARY_NEXT_REBOOT")"
   echo "=============================================================================="
   echo ""
-  return 0
+  # 有任何模組失敗時回傳非 0，讓腳本與 CI 能偵測
+  return "$install_failed"
 }
 
 # ------------------------------------------------------------------------------
@@ -2758,7 +3014,10 @@ server_status() {
 
   # PHP-FPM
   local php_fpm_str=""
-  for php_svc in $(systemctl list-unit-files 2>/dev/null | grep -oE 'php[0-9.]+-fpm\.service' | sort -r || true); do
+  # 先存成變數再 grep：直接接 grep -q 時 systemctl 可能收到 SIGPIPE，在 pipefail 下誤判為未安裝
+  local unit_files
+  unit_files=$(systemctl list-unit-files 2>/dev/null || true)
+  for php_svc in $(grep -oE 'php[0-9.]+-fpm\.service' <<< "$unit_files" | sort -r || true); do
     local v
     v=$(echo "$php_svc" | grep -oE '[0-9]+\.[0-9]+')
     if systemctl is-active --quiet "$php_svc" 2>/dev/null; then
@@ -2775,7 +3034,7 @@ server_status() {
   local db_label="${db_engine_info:-$(_t "SERVER_DASH_DB_FALLBACK")}"
   if systemctl is-active --quiet mysql 2>/dev/null || systemctl is-active --quiet mariadb 2>/dev/null; then
     db_status="${C_GREEN}$(_t "SERVER_DASH_DB_RUNNING" "${db_label}" "${db_port}")${C_NC}"
-  elif systemctl list-unit-files 2>/dev/null | grep -qiE 'mysql|mariadb'; then
+  elif grep -qiE 'mysql|mariadb' <<< "$unit_files"; then
     db_status="${C_RED}$(_t "SERVER_DASH_DB_STOPPED" "${db_label}" "${db_port}")${C_NC}"
   fi
 
@@ -2783,7 +3042,7 @@ server_status() {
   local redis_status="${C_YELLOW}$(_t "SERVER_DASH_NOT_INSTALLED")${C_NC}"
   if systemctl is-active --quiet redis 2>/dev/null || systemctl is-active --quiet redis-server 2>/dev/null; then
     redis_status="${C_GREEN}$(_t "SERVER_DASH_REDIS_RUNNING")${C_NC}"
-  elif systemctl list-unit-files 2>/dev/null | grep -qiE 'redis'; then
+  elif grep -qiE 'redis' <<< "$unit_files"; then
     redis_status="${C_RED}$(_t "SERVER_DASH_REDIS_STOPPED")${C_NC}"
   fi
 
@@ -2791,7 +3050,9 @@ server_status() {
   local ufw_status="${C_RED}$(_t "SERVER_DASH_UFW_DISABLED")${C_NC}"
   local icmp_status=""
   if command -v ufw >/dev/null 2>&1; then
-    if ufw status | grep -q "Status: active"; then
+    local ufw_out
+    ufw_out=$(ufw status 2>/dev/null || true)
+    if grep -q "Status: active" <<< "$ufw_out"; then
       ufw_status="${C_GREEN}$(_t "SERVER_DASH_UFW_ENABLED")${C_NC}"
       if [[ -f /etc/ufw/before.rules ]] && grep -q 'ufw-before-input.*icmp.*DROP' /etc/ufw/before.rules 2>/dev/null; then
         icmp_status="$(_t "SERVER_DASH_ICMP_BLOCKED")"
@@ -2899,7 +3160,21 @@ server_status() {
 # ------------------------------------------------------------------------------
 # 5. Security Hardening Subcommand (clp server -harden / harden)
 # ------------------------------------------------------------------------------
+# _harden_ask <dry_run> <prompt>：dry-run 時不詢問，直接當作同意（各 setup_* 只會列出動作）
+_harden_ask() {
+  [[ "$1" == "true" ]] || prompt_confirm "$2" "y"
+}
+
 server_harden() {
+  # -dry-run：不詢問、不修改，逐項列出會做的事
+  local hd_dry=false
+  if has_opt "dry-run" || has_opt "dry_run"; then
+    hd_dry=true
+  fi
+  # 每一項都會詢問；沒有終端機又沒有 -y 時在任何修改之前報錯
+  if [[ "$hd_dry" != "true" ]]; then
+    require_tty_or_yes || return 1
+  fi
   log_step "$(_t "SERVER_HARDEN_STEP_START")"
   echo ""
 
@@ -2907,8 +3182,8 @@ server_harden() {
 
   # [1/7] UFW 防火牆加固
   echo -e "${C_BOLD}$(_t "SERVER_HARDEN_UFW_TITLE")${C_NC}"
-  if prompt_confirm "$(_t "SERVER_HARDEN_UFW_PROMPT")" "y"; then
-    if setup_ufw "false"; then applied_count=$((applied_count + 1)); fi
+  if _harden_ask "$hd_dry" "$(_t "SERVER_HARDEN_UFW_PROMPT")"; then
+    if setup_ufw "$hd_dry"; then applied_count=$((applied_count + 1)); fi
   else
     log_info "$(_t "SERVER_HARDEN_UFW_SKIPPED")"
   fi
@@ -2916,8 +3191,8 @@ server_harden() {
 
   # [2/7] SSH 安全加固
   echo -e "${C_BOLD}$(_t "SERVER_HARDEN_SSH_TITLE")${C_NC}"
-  if prompt_confirm "$(_t "SERVER_HARDEN_SSH_PROMPT")" "y"; then
-    if setup_ssh_hardening "false" "false"; then applied_count=$((applied_count + 1)); fi
+  if _harden_ask "$hd_dry" "$(_t "SERVER_HARDEN_SSH_PROMPT")"; then
+    if setup_ssh_hardening "false" "$hd_dry"; then applied_count=$((applied_count + 1)); fi
   else
     log_info "$(_t "SERVER_HARDEN_SSH_SKIPPED")"
   fi
@@ -2925,8 +3200,8 @@ server_harden() {
 
   # [3/7] Fail2ban 入侵防護
   echo -e "${C_BOLD}$(_t "SERVER_HARDEN_F2B_TITLE")${C_NC}"
-  if prompt_confirm "$(_t "SERVER_HARDEN_F2B_PROMPT")" "y"; then
-    if setup_fail2ban "false"; then applied_count=$((applied_count + 1)); fi
+  if _harden_ask "$hd_dry" "$(_t "SERVER_HARDEN_F2B_PROMPT")"; then
+    if setup_fail2ban "$hd_dry"; then applied_count=$((applied_count + 1)); fi
   else
     log_info "$(_t "SERVER_HARDEN_F2B_SKIPPED")"
   fi
@@ -2934,8 +3209,8 @@ server_harden() {
 
   # [4/7] Nginx 全域資安防護
   echo -e "${C_BOLD}$(_t "SERVER_HARDEN_NGINX_TITLE")${C_NC}"
-  if prompt_confirm "$(_t "SERVER_HARDEN_NGINX_PROMPT")" "y"; then
-    if setup_nginx_security "false"; then applied_count=$((applied_count + 1)); fi
+  if _harden_ask "$hd_dry" "$(_t "SERVER_HARDEN_NGINX_PROMPT")"; then
+    if setup_nginx_security "$hd_dry"; then applied_count=$((applied_count + 1)); fi
   else
     log_info "$(_t "SERVER_HARDEN_NGINX_SKIPPED")"
   fi
@@ -2943,8 +3218,8 @@ server_harden() {
 
   # [5/7] Linux Kernel Sysctl 調校
   echo -e "${C_BOLD}$(_t "SERVER_HARDEN_SYSCTL_TITLE")${C_NC}"
-  if prompt_confirm "$(_t "SERVER_HARDEN_SYSCTL_PROMPT")" "y"; then
-    if setup_sysctl "false"; then applied_count=$((applied_count + 1)); fi
+  if _harden_ask "$hd_dry" "$(_t "SERVER_HARDEN_SYSCTL_PROMPT")"; then
+    if setup_sysctl "$hd_dry"; then applied_count=$((applied_count + 1)); fi
   else
     log_info "$(_t "SERVER_HARDEN_SYSCTL_SKIPPED")"
   fi
@@ -2952,8 +3227,8 @@ server_harden() {
 
   # [6/7] Systemd Journald 日誌限制
   echo -e "${C_BOLD}$(_t "SERVER_HARDEN_JOURNALD_TITLE")${C_NC}"
-  if prompt_confirm "$(_t "SERVER_HARDEN_JOURNALD_PROMPT")" "y"; then
-    if setup_journald "false"; then applied_count=$((applied_count + 1)); fi
+  if _harden_ask "$hd_dry" "$(_t "SERVER_HARDEN_JOURNALD_PROMPT")"; then
+    if setup_journald "$hd_dry"; then applied_count=$((applied_count + 1)); fi
   else
     log_info "$(_t "SERVER_HARDEN_JOURNALD_SKIPPED")"
   fi
@@ -2961,14 +3236,18 @@ server_harden() {
 
   # [7/7] 自動安全性更新
   echo -e "${C_BOLD}$(_t "SERVER_HARDEN_AUTOUP_TITLE")${C_NC}"
-  if prompt_confirm "$(_t "SERVER_HARDEN_AUTOUP_PROMPT")" "y"; then
-    if setup_unattended_upgrades "false"; then applied_count=$((applied_count + 1)); fi
+  if _harden_ask "$hd_dry" "$(_t "SERVER_HARDEN_AUTOUP_PROMPT")"; then
+    if setup_unattended_upgrades "$hd_dry"; then applied_count=$((applied_count + 1)); fi
   else
     log_info "$(_t "SERVER_HARDEN_AUTOUP_SKIPPED")"
   fi
   echo ""
 
-  log_success "$(_t "SERVER_HARDEN_SUCCESS" "${applied_count}")"
+  if [[ "$hd_dry" == "true" ]]; then
+    log_info "$(_t "SERVER_HARDEN_DRY_RUN_DONE")"
+  else
+    log_success "$(_t "SERVER_HARDEN_SUCCESS" "${applied_count}")"
+  fi
   return 0
 }
 
@@ -3008,6 +3287,7 @@ server_install_component() {
       setup_system_basics "$comp_tz" "false"
       ;;
     all)
+      require_tty_or_yes || return 1
       log_step "$(_t "SERVER_COMP_STEP_BATCH")"
       echo ""
       if prompt_confirm "$(_t "SERVER_COMP_PROMPT_NETDATA")" "y"; then
@@ -3055,8 +3335,26 @@ server_ufw() {
 
   # 啟用 / 停用
   if [[ "$ufw_opt" == "on" || "$ufw_opt" == "enable" ]]; then
+    # 啟用（default deny）前先確保 SSH 埠有允許規則，否則現有連線斷線後就無法再登入
+    local ssh_ports sp
+    if ! ssh_ports=$(ssh_detect_ports); then
+      log_error "$(_t "SERVER_UFW_ERR_SSH_PORT_UNKNOWN")"
+      return 1
+    fi
+    for sp in $ssh_ports; do
+      if ! ufw_port_has_rule "$sp"; then
+        log_info "$(_t "SERVER_UFW_MANAGE_INFO_ADD_SSH" "$sp")"
+        if ! ufw allow "${sp}/tcp" comment 'SSH'; then
+          log_error "$(_t "SERVER_UFW_ERR_ALLOW_SSH" "$sp")"
+          return 1
+        fi
+      fi
+    done
     log_info "$(_t "SERVER_UFW_MANAGE_INFO_ENABLING")"
-    ufw --force enable
+    if ! ufw --force enable; then
+      log_error "$(_t "SERVER_UFW_ERR_ENABLE")"
+      return 1
+    fi
     log_success "$(_t "SERVER_UFW_MANAGE_SUCCESS_ENABLED")"
     return 0
   elif [[ "$ufw_opt" == "off" || "$ufw_opt" == "disable" ]]; then
@@ -3070,18 +3368,64 @@ server_ufw() {
   if has_opt "allow"; then
     local p
     p=$(opt_get "allow")
+    if [[ -z "$p" || "$p" == "true" ]]; then
+      log_error "$(_t "SERVER_UFW_MANAGE_ERR_NO_PORT" "allow")"
+      return 1
+    fi
     log_info "$(_t "SERVER_UFW_MANAGE_INFO_ALLOWING" "${p}")"
-    ufw allow "$p"
+    if ! ufw allow "$p"; then
+      log_error "$(_t "SERVER_UFW_MANAGE_ERR_FAILED" "$p")"
+      return 1
+    fi
     log_success "$(_t "SERVER_UFW_MANAGE_SUCCESS_ALLOWED" "${p}")"
     return 0
   fi
 
   # 阻擋/刪除連接埠 (-deny=PORT)
+  #   不處理目前的 SSH 埠；有對應的 allow 規則（p、p/tcp、p/udp）時刪除它。
+  #   ufw delete 找不到完全相符的規則時仍回傳 0，所以先用 ufw show added 確認；
+  #   沒有 allow 規則時才加 deny，並插在最前面（ufw 採用第一條符合的規則，附加在後面可能無效）
   if has_opt "deny"; then
     local p
     p=$(opt_get "deny")
+    if [[ -z "$p" || "$p" == "true" ]]; then
+      log_error "$(_t "SERVER_UFW_MANAGE_ERR_NO_PORT" "deny")"
+      return 1
+    fi
+    # 只接受單一數字埠號（可加 /tcp、/udp）；服務名稱、範圍、清單可能涵蓋 SSH 埠，請直接使用 ufw
+    if ! [[ "$p" =~ ^[0-9]+(/(tcp|udp))?$ ]]; then
+      log_error "$(_t "SERVER_UFW_MANAGE_ERR_DENY_FORMAT" "$p")"
+      return 1
+    fi
+    local ssh_ports sp
+    if ! ssh_ports=$(ssh_detect_ports); then
+      log_error "$(_t "SERVER_UFW_ERR_SSH_PORT_UNKNOWN")"
+      return 1
+    fi
+    for sp in $ssh_ports; do
+      if [[ "${p%%/*}" == "$sp" ]]; then
+        log_error "$(_t "SERVER_UFW_MANAGE_ERR_DENY_SSH" "$p")"
+        return 1
+      fi
+    done
     log_info "$(_t "SERVER_UFW_MANAGE_INFO_DENYING" "${p}")"
-    ufw delete allow "$p" 2>/dev/null || ufw deny "$p"
+    local added variant deleted=0
+    added=$(ufw show added 2>/dev/null || true)
+    for variant in "$p" "${p%%/*}/tcp" "${p%%/*}/udp"; do
+      if awk -v r="ufw allow ${variant}" '$0 == r || index($0, r " ") == 1 { f = 1 } END { exit !f }' <<< "$added"; then
+        if ufw --force delete allow "$variant" >/dev/null; then
+          deleted=1
+          log_info "$(_t "SERVER_UFW_MANAGE_INFO_DELETED_RULE" "allow ${variant}")"
+        fi
+      fi
+      [[ "$p" == */* ]] && break
+    done
+    if [[ "$deleted" -eq 0 ]]; then
+      if ! ufw insert 1 deny "$p" 2>/dev/null && ! ufw deny "$p"; then
+        log_error "$(_t "SERVER_UFW_MANAGE_ERR_FAILED" "$p")"
+        return 1
+      fi
+    fi
     log_success "$(_t "SERVER_UFW_MANAGE_SUCCESS_DENIED" "${p}")"
     return 0
   fi
@@ -3131,6 +3475,12 @@ server_ssh() {
 
     local sshd_config="/etc/ssh/sshd_config"
     backup_file "$sshd_config"
+    # 修改前快照；任何一步失敗都還原，不留下改到一半的設定
+    local snap
+    if ! snap=$(ssh_config_snapshot); then
+      log_error "$(_t "SERVER_SSH_ERR_SNAPSHOT")"
+      return 1
+    fi
 
     # 移除或更新 drop-in
     rm -f "/etc/ssh/sshd_config.d/01-clp-hardening.conf"
@@ -3148,66 +3498,25 @@ server_ssh() {
       has_include=true
     fi
 
-    # 若存在 sshd_config.d 且主設定檔有 Include，寫入最高優先權 00-clp-emergency.conf，避免被 50-cloud-init.conf 覆蓋
-    if [[ -d "/etc/ssh/sshd_config.d" && "$has_include" == "true" ]]; then
-      local emergency_dropin="/etc/ssh/sshd_config.d/00-clp-emergency.conf"
-      local emergency_content="# === CloudPanel Emergency Unharden Drop-in ===
-PermitRootLogin yes
+    local emergency_settings="PermitRootLogin yes
 PasswordAuthentication yes
-KbdInteractiveAuthentication yes
-# === End CloudPanel Emergency Unharden ==="
-      local tmp_dropin=""
-      tmp_dropin=$(mktemp "/etc/ssh/sshd_config.d/00-clp-emergency.tmp.XXXXXX" 2>/dev/null || true)
-      local write_ok=false
-      if [[ -n "$tmp_dropin" ]]; then
-        if printf '%s\n' "$emergency_content" > "$tmp_dropin" && chmod 644 "$tmp_dropin" && atomic_replace "$tmp_dropin" "$emergency_dropin"; then
-          write_ok=true
-        fi
-        rm -f "$tmp_dropin"
-      fi
-      if [[ "$write_ok" != "true" ]]; then
-        log_warn "$(_t "SERVER_SSH_MANAGE_WARN_EMERGENCY_ATOMIC_FAILED")"
-        printf '%s\n' "$emergency_content" > "$emergency_dropin"
-        chmod 644 "$emergency_dropin"
-      fi
+KbdInteractiveAuthentication yes"
+    local write_ok=true
+    # 若存在 sshd_config.d 且主設定檔有 Include，寫入最高優先權 00-clp-emergency.conf，避免被 50-cloud-init.conf 覆蓋；
+    # 否則寫入主設定檔（第一個 Match 之前；沒有 Match 時寫在開頭）。寫入失敗時報錯，不改用會截斷檔案的寫法
+    if [[ -d "/etc/ssh/sshd_config.d" && "$has_include" == "true" ]]; then
+      ssh_write_file "/etc/ssh/sshd_config.d/00-clp-emergency.conf" "# === CloudPanel Emergency Unharden Drop-in ===
+${emergency_settings}
+# === End CloudPanel Emergency Unharden ===" || write_ok=false
     else
-      # 沒有 Include 時寫入主設定檔（必須在第一個 Match 之前，否則只會套用到該 Match 條件）
-      local emergency_block
-      emergency_block=$'\n# === CloudPanel Emergency Unharden ===\nPermitRootLogin yes\nPasswordAuthentication yes\nKbdInteractiveAuthentication yes\n# === End CloudPanel Emergency Unharden ===\n'
-      local tmp_sshd=""
-      tmp_sshd=$(mktemp "${sshd_config}.tmp.XXXXXX" 2>/dev/null || mktemp)
-      local write_ok=false
-      if [[ -n "$tmp_sshd" ]]; then
-        if grep -qiE '^[[:space:]]*Match[[:space:]]' "$sshd_config"; then
-          CLP_SSHD_BLOCK="$emergency_block" awk '
-            !done && tolower($0) ~ /^[[:space:]]*match[[:space:]]/ { printf "%s\n", ENVIRON["CLP_SSHD_BLOCK"]; done = 1 }
-            { print }' "$sshd_config" > "$tmp_sshd"
-        else
-          cat "$sshd_config" > "$tmp_sshd"
-          printf '%s' "$emergency_block" >> "$tmp_sshd"
-        fi
-        if atomic_replace "$tmp_sshd" "$sshd_config"; then
-          write_ok=true
-        fi
-        rm -f "$tmp_sshd"
-      fi
-      if [[ "$write_ok" != "true" ]]; then
-        log_warn "$(_t "SERVER_SSH_MANAGE_WARN_EMERGENCY_ATOMIC_FAILED")"
-        if grep -qiE '^[[:space:]]*Match[[:space:]]' "$sshd_config"; then
-          local fallback_tmp
-          fallback_tmp=$(mktemp)
-          CLP_SSHD_BLOCK="$emergency_block" awk '
-            !done && tolower($0) ~ /^[[:space:]]*match[[:space:]]/ { printf "%s\n", ENVIRON["CLP_SSHD_BLOCK"]; done = 1 }
-            { print }' "$sshd_config" > "$fallback_tmp"
-          cat "$fallback_tmp" > "$sshd_config"
-          rm -f "$fallback_tmp"
-        else
-          printf '%s\n' "$emergency_block" >> "$sshd_config"
-        fi
-      fi
+      ssh_insert_block "$sshd_config" "# === CloudPanel Emergency Unharden ===
+${emergency_settings}
+# === End CloudPanel Emergency Unharden ===" || write_ok=false
     fi
 
-    if sshd -t >/dev/null 2>&1; then
+    local sshd_err=""
+    if [[ "$write_ok" == "true" ]] && sshd_err=$(ssh_config_test); then
+      rm -rf "$snap"
       systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
       log_success "$(_t "SERVER_SSH_MANAGE_SUCCESS_UNHARDEN")"
 
@@ -3218,11 +3527,14 @@ KbdInteractiveAuthentication yes
         log_warn "$(_t "SERVER_SSH_MANAGE_WARN_PASSAUTH_NOT_ENABLED" "$active_passauth")"
       fi
     else
+      [[ "$write_ok" == "true" ]] || log_error "$(_t "SERVER_SSH_MANAGE_ERR_WRITE")"
       log_error "$(_t "SERVER_SSH_MANAGE_ERR_SYNTAX")"
-      rm -f "/etc/ssh/sshd_config.d/00-clp-emergency.conf"
-      local latest_bak
-      latest_bak=$(ls -t "${sshd_config}".bak_* 2>/dev/null | head -n 1 || true)
-      [[ -n "$latest_bak" ]] && cp "$latest_bak" "$sshd_config"
+      [[ -n "$sshd_err" ]] && log_error "$sshd_err"
+      if ssh_config_restore "$snap"; then
+        rm -rf "$snap"
+      else
+        log_error "$(_t "SERVER_SSH_ERR_RESTORE" "$snap")"
+      fi
       return 1
     fi
     return 0
@@ -3305,29 +3617,64 @@ server_fail2ban() {
       return 1
     fi
 
+    # 僅接受合法的 IP / CIDR；% 是 IPv6 scope，會被 fail2ban 當成插值語法
+    if [[ "$wl_ip" == *%* ]] || ! python3 -I -c 'import sys, ipaddress; ipaddress.ip_network(sys.argv[1], strict=False)' "$wl_ip" 2>/dev/null; then
+      log_error "$(_t "SERVER_F2B_ERR_INVALID_IP" "$wl_ip")"
+      return 1
+    fi
+
     local jail_conf="/etc/fail2ban/jail.local"
     if [[ ! -f "$jail_conf" ]]; then
-      setup_fail2ban "false"
+      setup_fail2ban "false" || return 1
     fi
 
     backup_file "$jail_conf"
 
-    # 僅接受合法的 IP / CIDR，並以完整欄位比對 ignoreip 既有項目（避免子字串誤判或破壞 sed）
-    if ! python3 -I -c 'import sys, ipaddress; ipaddress.ip_network(sys.argv[1], strict=False)' "$wl_ip" 2>/dev/null; then
-      log_error "$(_t "SERVER_F2B_ERR_INVALID_IP" "$wl_ip")"
+    # [DEFAULT] 一定要有 ignoreip；jail 區段自己的 ignoreip 會蓋掉 [DEFAULT]，所以既有的每一行都補上（完整欄位比對）
+    local tmp_jail
+    tmp_jail=$(mktemp "/etc/fail2ban/.jail.local.XXXXXX")
+    if ! grep -qE '^[[:space:]]*\[DEFAULT\]' "$jail_conf"; then
+      printf '[DEFAULT]\nignoreip = 127.0.0.1/8 ::1 %s\n\n' "$wl_ip" > "$tmp_jail"
+      # jail.local 比 jail.d 晚讀：jail.d 若在 [DEFAULT] 設了 ignoreip，會被這裡的值取代
+      local jaild_conf
+      for jaild_conf in /etc/fail2ban/jail.d/*.conf /etc/fail2ban/jail.d/*.local; do
+        [[ -f "$jaild_conf" ]] || continue
+        if grep -qE '^ignoreip[[:space:]]*=' "$jaild_conf"; then
+          log_warn "$(_t "SERVER_F2B_WARN_JAILD_IGNOREIP" "$jaild_conf")"
+        fi
+      done
+    fi
+    if ! awk -v ip="$wl_ip" '
+      function has(line,   v, n, a, i) {
+        v = line; sub(/^[^=]*=/, "", v)
+        n = split(v, a, /[ \t,]+/)
+        for (i = 1; i <= n; i++) if (a[i] == ip) return 1
+        return 0
+      }
+      # 讀兩次：第一次只看 [DEFAULT] 是否已有 ignoreip，第二次輸出
+      FNR == 1 { sec = "" }
+      /^[ \t]*\[[^]]*\]/ {
+        sec = $0; sub(/^[ \t]*\[/, "", sec); sub(/\].*$/, "", sec)
+        if (NR == FNR) next
+        print
+        if (sec == "DEFAULT" && !def_has && !def_done) { print "ignoreip = 127.0.0.1/8 ::1 " ip; def_done = 1 }
+        next
+      }
+      NR == FNR { if (sec == "DEFAULT" && $0 ~ /^ignoreip[ \t]*=/) def_has = 1; next }
+      /^ignoreip[ \t]*=/ { if (!has($0)) $0 = $0 " " ip }
+      { print }
+    ' "$jail_conf" "$jail_conf" >> "$tmp_jail" || ! atomic_replace "$tmp_jail" "$jail_conf"; then
+      rm -f "$tmp_jail"
       return 1
     fi
-    if grep -q "^ignoreip" "$jail_conf"; then
-      if ! grep -E "^ignoreip" "$jail_conf" | tr ' \t,=' '\n' | grep -qxF "$wl_ip"; then
-        sed -i "s|^ignoreip.*|& ${wl_ip}|" "$jail_conf"
-      fi
-    else
-      sed -i "/^\[DEFAULT\]/a ignoreip = 127.0.0.1/8 ::1 ${wl_ip}" "$jail_conf"
-    fi
+    rm -f "$tmp_jail"
 
     # 若該 IP 目前在黑名單中，自動同步解鎖
     fail2ban-client set sshd unbanip "$wl_ip" 2>/dev/null || true
-    systemctl restart fail2ban 2>/dev/null || true
+    if ! systemctl restart fail2ban 2>/dev/null; then
+      log_error "$(_t "SERVER_F2B_ERR_RESTART")"
+      return 1
+    fi
     log_success "$(_t "SERVER_F2B_MANAGE_SUCCESS_WHITELIST" "${wl_ip}")"
     return 0
   fi
@@ -3525,7 +3872,8 @@ server_handler() {
   fi
 
   # 2. 解析選項旗標 (若未由位置參數明確指定 install/harden，則以旗標分流)
-  if [[ "$action" != "install" && "$action" != "harden" ]]; then
+  # 已由位置參數指定動作時（例如 server ssh -harden）不再以旗標改判，否則 -harden 會被當成完整的 harden
+  if [[ -z "$action" ]]; then
     if has_opt "install"; then
       local opt_val
       opt_val=$(opt_get "install")

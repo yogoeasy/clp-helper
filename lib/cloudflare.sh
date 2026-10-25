@@ -36,6 +36,12 @@ CF_API_BASE="https://api.cloudflare.com/client/v4"
 # ------------------------------------------------------------------------------
 # 2. Token Resolution Cascade (4-level priority)
 # ------------------------------------------------------------------------------
+# cf_is_global_key_file <檔案>：是否為 certbot 的 Global API Key 格式（dns_cloudflare_email + dns_cloudflare_api_key）
+cf_is_global_key_file() {
+  grep -qE '^[[:space:]]*dns_cloudflare_email[[:space:]]*=[[:space:]]*[^[:space:]]' "$1" 2>/dev/null && \
+    grep -qE '^[[:space:]]*dns_cloudflare_api_key[[:space:]]*=[[:space:]]*[^[:space:]]' "$1" 2>/dev/null
+}
+
 cf_resolve_credentials() {
   local domain="${1:-}"
   local cli_token="${2:-}"
@@ -90,12 +96,24 @@ cf_resolve_credentials() {
 
     if [[ -z "$credentials_file" && -z "$token" ]]; then
       local secret_dirs=("/root/.secrets" "${HOME}/.secrets" "${HOME}/.secret")
-      local available_secrets=()
+      local available_secrets=() seen_dirs=" " real_dir
       for sdir in "${secret_dirs[@]}"; do
+        # 以 root 執行時 HOME=/root，同一個目錄不可重複計算（否則「只有一個 .ini」的備援永遠不會成立）
+        real_dir=$(realpath "$sdir" 2>/dev/null || echo "$sdir")
+        [[ "$seen_dirs" == *" ${real_dir} "* ]] && continue
+        seen_dirs+="${real_dir} "
         if [[ -d "$sdir" ]]; then
           while IFS= read -r -d '' sf; do
             available_secrets+=("$sf")
           done < <(find "$sdir" -maxdepth 1 -name "*.ini" -print0 2>/dev/null || true)
+          # 取不到 token 的檔案（例如舊版留下的佔位範本）不列入，否則會擋住「只有一個 .ini」的備援
+          local usable=() cand
+          for cand in ${available_secrets[@]+"${available_secrets[@]}"}; do
+            if _extract_token_from_file "$cand" >/dev/null 2>&1 || cf_is_global_key_file "$cand"; then
+              usable+=("$cand")
+            fi
+          done
+          available_secrets=(${usable[@]+"${usable[@]}"})
         fi
       done
 
@@ -142,7 +160,15 @@ cf_resolve_credentials() {
       if _resolve_cf_token_file "$conf_val" >/dev/null 2>&1; then
         local resolved_cf_f
         resolved_cf_f="$(_resolve_cf_token_file "$conf_val")"
-        token="$(_extract_token_from_file "$resolved_cf_f")"
+        if ! token="$(_extract_token_from_file "$resolved_cf_f")"; then
+          # Global API Key 檔（dns_cloudflare_email + dns_cloudflare_api_key）：certbot 與 cf_parse_auth 都支援，沿用檔案
+          # 其他無法取得 token 的檔案直接失敗，不可回報成功卻帶著空的 token
+          if ! cf_is_global_key_file "$resolved_cf_f"; then
+            log_error "$(_t "CF_ERR_TOKEN_FILE_NO_TOKEN" "$resolved_cf_f")"
+            return 1
+          fi
+          token=""
+        fi
         credentials_file="$resolved_cf_f"
         source_desc="${conf_file} -> ${resolved_cf_f}"
       else
@@ -681,6 +707,22 @@ else:
 # ------------------------------------------------------------------------------
 # 9. Query Cloudflare Edge WAF & Security Status
 # ------------------------------------------------------------------------------
+# cf_setting_value：從 stdin 的 Cloudflare 設定查詢回應取出 result.value；查詢失敗（success 不是 true、
+# 沒有 value、無法解析）時回傳 1，呼叫端顯示「查詢失敗」而不是 unknown
+cf_setting_value() {
+  python3 -I -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    v = d.get('result', {}).get('value') if d.get('success') is True and isinstance(d.get('result'), dict) else None
+except Exception:
+    v = None
+if v is None:
+    sys.exit(1)
+print(v)
+" 2>/dev/null
+}
+
 cf_show_status() {
   local zone_id="$1"
   local domain="$2"
@@ -697,19 +739,19 @@ cf_show_status() {
   # Query SSL
   local resp_ssl ssl_val
   resp_ssl="$(cf_api_call "GET" "/zones/${zone_id}/settings/ssl" "$token" 2>/dev/null || true)"
-  ssl_val="$(echo "$resp_ssl" | python3 -I -c "import sys, json; d=json.loads(sys.stdin.read()); print(d.get('result', {}).get('value', 'unknown'))" 2>/dev/null || echo "unknown")"
+  ssl_val="$(echo "$resp_ssl" | cf_setting_value)" || ssl_val="$(_t "CF_STATUS_QUERY_FAILED")"
   echo -e "  • $(_t "CF_STATUS_SSL_MODE" "$ssl_val")"
 
   # Query Always HTTPS
   local resp_https https_val
   resp_https="$(cf_api_call "GET" "/zones/${zone_id}/settings/always_use_https" "$token" 2>/dev/null || true)"
-  https_val="$(echo "$resp_https" | python3 -I -c "import sys, json; d=json.loads(sys.stdin.read()); print(d.get('result', {}).get('value', 'unknown'))" 2>/dev/null || echo "unknown")"
+  https_val="$(echo "$resp_https" | cf_setting_value)" || https_val="$(_t "CF_STATUS_QUERY_FAILED")"
   echo -e "  • $(_t "CF_STATUS_ALWAYS_HTTPS" "$https_val")"
 
   # Query Min TLS
   local resp_tls tls_val
   resp_tls="$(cf_api_call "GET" "/zones/${zone_id}/settings/min_tls_version" "$token" 2>/dev/null || true)"
-  tls_val="$(echo "$resp_tls" | python3 -I -c "import sys, json; d=json.loads(sys.stdin.read()); print(d.get('result', {}).get('value', 'unknown'))" 2>/dev/null || echo "unknown")"
+  tls_val="$(echo "$resp_tls" | cf_setting_value)" || tls_val="$(_t "CF_STATUS_QUERY_FAILED")"
   echo -e "  • $(_t "CF_STATUS_MIN_TLS" "$tls_val")"
 
   # Query DNS Proxy Status
@@ -739,15 +781,20 @@ except Exception:
   echo -e "  • $(_t "CF_STATUS_DNS_PROXY" "$dns_proxy_badge")"
 
   echo ""
-  # Query Ruleset
-  local get_resp
-  get_resp="$(cf_api_call "GET" "/zones/${zone_id}/rulesets/phases/http_request_firewall_custom/entrypoint" "$token" 2>/dev/null || true)"
+  # Query Ruleset（查詢失敗時顯示錯誤，不顯示成 0 條規則）
+  local rules_json
+  if ! rules_json="$(cf_get_entrypoint_rules "$zone_id" "$token")"; then
+    echo -e "  ${C_RED}$(_t "CF_STATUS_RULES_QUERY_FAILED" "$rules_json")${C_NC}"
+    echo ""
+    echo "======================================================================"
+    echo ""
+    return 0
+  fi
 
   python3 -I -c "
 import sys, json
 try:
-    d = json.loads(sys.argv[1])
-    rules = d.get('result', {}).get('rules', [])
+    rules = json.loads(sys.argv[1])
     clp_rules = [r for r in rules if r.get('description', '').startswith('[CLP]')]
     non_clp_rules = [r for r in rules if not r.get('description', '').startswith('[CLP]')]
     total = len(rules)
@@ -761,7 +808,7 @@ try:
         print(f'USER_RULE|{r.get(\"description\", \"User Custom Rule\")}|{r.get(\"action\")}|{en}')
 except Exception:
     print('TOTAL|0')
-" "$get_resp" | while IFS='|' read -r type f1 f2 f3; do
+" "$rules_json" | while IFS='|' read -r type f1 f2 f3; do
     case "$type" in
       TOTAL)
         echo -e "  $(_t "CF_STATUS_RULES_HEADER" "$f1")"
@@ -850,15 +897,15 @@ except Exception:
     return 0
   elif [[ "$proxy_opt" == "on" || "$proxy_opt" == "true" || "$proxy_opt" == "yes" ]]; then
     enable_proxy=true
-  elif has_opt "y" || has_opt "yes" || [[ "${CLP_AUTO_YES:-false}" == "true" ]]; then
-    enable_proxy=true
-  elif ! [[ -t 0 ]]; then
-    # 非互動環境且未明確同意 (-y / -proxy=on)：不自動切換橘雲，避免影響經由同名稱的 SSH、郵件等服務
+  elif has_opt "y" || has_opt "yes" || [[ "${CLP_AUTO_YES:-false}" == "true" ]] || ! [[ -t 0 ]]; then
+    # -y 只代表自動回答提示，不代表同意切換橘雲（會中斷經由同名稱的 SSH、郵件等服務）；需要明確加 -proxy=on
     log_info "$(_t "CF_INFO_KEEP_DNS_PROXY_OFF")"
+    log_info "$(_t "CF_INFO_PROXY_HINT")"
     return 0
   else
     local ans=""
-    read -r -p "$(echo -e "${C_CYAN}$(_t "CF_PROMPT_ENABLE_DNS_PROXY")${C_NC}")" ans
+    # 讀到 EOF（Ctrl-D）視為取消
+    read -r -p "$(echo -e "${C_CYAN}$(_t "CF_PROMPT_ENABLE_DNS_PROXY")${C_NC}")" ans || ans="n"
     ans=$(echo "${ans:-y}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
     if [[ "$ans" == "y" || "$ans" == "yes" ]]; then
       enable_proxy=true

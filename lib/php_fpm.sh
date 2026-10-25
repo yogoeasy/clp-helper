@@ -162,6 +162,12 @@ optimize_site_php_fpm() {
     return 0
   fi
 
+  # -dry-run：只顯示將套用的值，不寫入、不重載
+  if [[ "${PHP_FPM_DRY_RUN:-0}" -eq 1 ]]; then
+    log_info "$(_t "PHP_FPM_INFO_DRY_RUN_SITE" "$domain" "$php_ver" "$PHP_FPM_MAX_CHILDREN" "$PHP_FPM_IDLE_TIMEOUT" "$PHP_FPM_MAX_REQUESTS")"
+    return 0
+  fi
+
   local rc=0
   _php_fpm_write_pool "$domain" "$php_ver" "$pool_file" \
     "pm.max_children=${PHP_FPM_MAX_CHILDREN}" \
@@ -190,15 +196,23 @@ _php_fpm_write_pool() {
   local backup_file="${PHP_BACKUP_DIR}/${domain}.conf.backup.${timestamp}"
 
   # 1. 在暫存目錄產生新的設定，原檔另存一份供還原（不依賴 <backup-dir>/php 備份是否成功）
+  #    呼叫端以 || 擷取回傳值，set -e 在此不會生效，每一步都要自行檢查
   local work_dir
-  work_dir=$(mktemp -d)
+  work_dir=$(mktemp -d) || { log_error "$(_t "PHP_FPM_ERR_WRITE" "$pool_file")"; return 1; }
   local orig_copy="${work_dir}/orig.conf"
   local tmp_file="${work_dir}/new.conf"
-  cp -p "$pool_file" "$orig_copy"
-  cp "$pool_file" "$tmp_file"
+  if ! cp -p "$pool_file" "$orig_copy" || ! cp "$pool_file" "$tmp_file"; then
+    log_error "$(_t "PHP_FPM_ERR_WRITE" "$pool_file")"
+    rm -rf "$work_dir"
+    return 1
+  fi
   local kv
   for kv in "$@"; do
-    _php_fpm_set_directive "$tmp_file" "${kv%%=*}" "${kv#*=}"
+    if ! _php_fpm_set_directive "$tmp_file" "${kv%%=*}" "${kv#*=}"; then
+      log_error "$(_t "PHP_FPM_ERR_WRITE" "$pool_file")"
+      rm -rf "$work_dir"
+      return 1
+    fi
   done
 
   # 設定已相同時，無需重複備份與重載
@@ -215,7 +229,11 @@ _php_fpm_write_pool() {
   fi
 
   # 3. 寫回原檔（以原子化方式置換並繼承原檔的權限與擁有者）
-  atomic_replace "$tmp_file" "$pool_file"
+  if ! atomic_replace "$tmp_file" "$pool_file"; then
+    log_error "$(_t "PHP_FPM_ERR_WRITE" "$pool_file")"
+    rm -rf "$work_dir"
+    return 1
+  fi
 
   # 4. 語法測試；失敗時以暫存的原檔還原
   local fpm_bin=""
@@ -249,25 +267,26 @@ _php_fpm_reload_or_defer() {
 
 # _php_fpm_set_directive <file> <key> <value>
 #   設定 pool 參數：容許 "key=value"、"key = value"、Tab 等各種空白寫法。
-#   有生效中的設定 → 改寫第一筆生效的設定（註解副本保持不動）；
+#   有生效中的設定 → 改寫最後一筆生效的設定（PHP-FPM 與 php_pm.py 都以最後一筆為準；註解副本保持不動）；
 #   只有註解的設定 → 解除第一筆註解；都沒有 → 附加至檔尾。
+#   <file> 位於 _php_fpm_write_pool 的私有暫存目錄，直接以 mv 置換即可；失敗時回傳 1。
 _php_fpm_set_directive() {
   local file="$1" key="$2" value="$3"
   local key_re="${key//./[.]}"   # 以 [.] 比對字面上的點，避免 awk -v 處理反斜線跳脫
   local out
-  out=$(mktemp)
+  out=$(mktemp "${file}.XXXXXX") || return 1
   awk -v key_re="$key_re" -v line="${key} = ${value}" '
     BEGIN { active_re = "^[ \t]*" key_re "[ \t]*="; comment_re = "^[ \t]*;[ \t]*" key_re "[ \t]*=" }
     { lines[NR] = $0 }
-    $0 ~ active_re && !a { a = NR }
+    $0 ~ active_re { a = NR }
     $0 ~ comment_re && !c { c = NR }
     END {
       target = a ? a : c
       for (i = 1; i <= NR; i++) print (i == target ? line : lines[i])
       if (!target) print line
-    }' "$file" > "$out"
-  atomic_replace "$out" "$file"
+    }' "$file" > "$out" && mv -f "$out" "$file" && return 0
   rm -f "$out"
+  return 1
 }
 
 _php_fpm_reload() {
@@ -343,8 +362,20 @@ optimize_all_php_fpm() {
   local sorted_sites
   sorted_sites=$(printf '%s\n' "${!site_targets[@]}" | sort)
 
+  local exclude_raw pat excluded
+  local -a ex_patterns=()
+  exclude_raw=$(opt_get "exclude" "")
+  [[ -n "$exclude_raw" ]] && IFS=',' read -ra ex_patterns <<< "$exclude_raw"
   while IFS= read -r site_name; do
     [[ -z "$site_name" ]] && continue
+    excluded=0
+    for pat in ${ex_patterns[@]+"${ex_patterns[@]}"}; do
+      if domain_matches_exclude "$site_name" "$pat"; then excluded=1; break; fi
+    done
+    if [[ "$excluded" -eq 1 ]]; then
+      log_info "$(_t "PHP_FPM_INFO_EXCLUDED" "$site_name")"
+      continue
+    fi
     local s_ver="${site_targets[$site_name]}"
 
     log_info "$(_t "PHP_FPM_INFO_PROCESSING_SITE" "$site_name" "$s_ver")"
@@ -606,6 +637,7 @@ php_fpm_handler() {
       fi
       php_fpm_resolve_settings || return 1
       log_info "$(_t "PHP_FPM_INFO_SETTINGS" "$PHP_FPM_SETTINGS_SOURCE")"
+      local PHP_FPM_DRY_RUN="$dry_run"
       if [[ "$all" -eq 0 ]]; then
         require_site_exists "$domain" "$(_t "PHP_FPM_STEP_OPTIMIZE_SINGLE" "$domain")" || return 1
         log_step "$(_t "PHP_FPM_STEP_OPTIMIZE_SINGLE" "$domain")"

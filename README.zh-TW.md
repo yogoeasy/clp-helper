@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.1.1 (建置時間 2026-10-23 14:02:24)`
+輸出範例：`CLP Helper v1.2.0 (建置時間 2026-10-25 16:05:18)`
 
 查看全域功能說明選單：
 
@@ -420,7 +420,7 @@ sudo clp site example.com -new -force-replace
 ```
 
 > [!TIP]
-> 執行 `-new` 建立網站時，詢問 WordPress 管理員帳號密碼若直接按 `Enter` 留空，系統將自動套用預設值（帳號預設 `wpadmin`，密碼自動產生高強度隨機密碼並存至 `/root/.clp/<網域>-wp-admin.txt`，Email 預設 `wpadmin@wp.com`）。
+> 執行 `-new` 建立網站時，詢問 WordPress 管理員帳號密碼若直接按 `Enter` 留空，系統將自動套用預設值（帳號預設 `wpadmin`，密碼自動產生高強度隨機密碼並存至 `/root/.clp/<網域>-wp-admin.txt`，管理員 Email 取自 `-email=`，沒有指定時在終端機中詢問（即使有 `-y`）；沒有終端機時必須加 `-email=`）。
 
 #### ③ SSL 憑證管理 (`clp site <domain> -ssl`)
 
@@ -452,6 +452,10 @@ sudo clp site example.com -ssl=on -http
 sudo clp site example.com -ssl=off
 ```
 
+網站會改回 CloudPanel 建立網站時的自簽憑證（從 CloudPanel 資料庫讀取；找不到時才產生新的），不會動到 `/etc/letsencrypt` 中的 Let's Encrypt 檔案。CloudPanel 後台的 SSL 頁面可能仍列出先前匯入的憑證。
+
+> **續期用的 Cloudflare 憑證檔**：token 來自 `clp.local`、環境變數或純 token 檔時，`-dns` 會把它寫入 `/root/.clp/cf-certbot/<網域>.ini`（只有 root 可讀，600），因為 certbot 每次續期都會再讀取這個檔案。更換 token 後，請對這些網站再執行一次 `-ssl=on -dns`（或直接修改該檔案）；刪除網站時不會刪除它。
+
 #### ④ 同機網站複製 (`clp site -clone-from`)
 
 基本複製 (目標站不存在將全自動建立)：
@@ -466,6 +470,8 @@ sudo clp site -clone-from=example.com new-example.com
 sudo clp site -clone-from=example.com new-example.com -force-replace
 ```
 
+使用 `-force-replace` 時，要等所有檢查（使用者名稱、PHP 版本）通過、來源資料庫匯出完成後，才會刪除既有網站。之後的步驟若失敗，舊網站不會自動復原，需要時請先備份。只有 `-force-replace` 會取代網站，`-force` 不會。
+
 自訂目標站使用者或 PHP 版本：
 
 ```bash
@@ -476,11 +482,12 @@ sudo clp site -clone-from=example.com new-example.com -user=newuser -php=8.4
   - 複製時優先申請 SSL，驗證失敗就提早停止 (Fail-Fast)，避免白白傳輸資料。
   - 自動偵測 Wordfence WAF 路徑並替換，若檔案遺失會自動處理，避免網站出現 500 錯誤。
   - 自動為 Redis 注入全站隨機 Salt（`WP_CACHE_KEY_SALT`），避免網站之間的快取互相干擾。
-  - WP-CLI 深度置換網址，並自動校正 `robots.txt` 內之 Sitemap 網址。
+  - WP-CLI 深度置換網址，並自動校正 `robots.txt` 內之 Sitemap 網址。只替換網址形式（`https://`、`http://`、`//`，以及 Elementor 使用的 JSON 跳脫寫法 `https:\/\/`，含或不含 `www.`）；`www.` 的網址換成不含 `www.` 的新網域，`http://` 的網址換成 `https://`。email、純文字中的網域與文章 GUID 不變。資料庫中的網站絕對路徑（例如外掛設定）也一併替換；同網域搬遷只替換路徑。
+  - 已知限制：以來源網域開頭的其他網域網址（例如複製 `example.com` 時的 `https://example.com.tw`）也會被替換；URL 編碼的連結（`https%3A%2F%2F…`）與大小寫不同的網址不會被替換。會執行約十次 `wp search-replace`，大多數找不到資料；392 MB 的測試資料庫比舊版多花約 15% 的時間。
 
 #### ⑤ 跨主機網站安全搬移 (`clp site -migrate`)
 
-同網域跨主機搬遷 (網域保持不變，略過 search-replace)：
+同網域跨主機搬遷 (網域保持不變，不替換網址，只替換網站路徑)：
 
 ```bash
 sudo clp site -migrate=remote-vps -from=example.com
@@ -497,6 +504,8 @@ sudo clp site -migrate=remote-vps -from=example.com new-site.com
 ```bash
 sudo clp site -migrate=remote-vps -all
 ```
+
+只搬移 WordPress（PHP）網站，遠端的其他類型網站會列為略過。取代本機網站時，會先下載並驗證遠端資料庫，再刪除本機網站。
 
 批次搬移並排除特定測試子網域：
 
@@ -545,6 +554,12 @@ sudo clp site delete example.com --force
 
 ```bash
 sudo clp site example.com -cf-waf
+```
+
+DNS 記錄若未經代理（灰雲），WAF 規則不會生效。在終端機中會詢問是否改為代理；使用 `-y` 或沒有終端機時維持原狀（改為代理可能中斷使用同一名稱的 SSH 或郵件）。要切換請加上 `-proxy=on`（或以 `-proxy=off` 維持）：
+
+```bash
+sudo clp site example.com -cf-waf -proxy=on -y
 ```
 
 模擬執行 (驗證 Token、解析 Zone ID 並輸出即將套用之規則 JSON，不實際變更)：
@@ -726,6 +741,25 @@ curl -sk -D- -o /dev/null --resolve example.com:443:127.0.0.1 https://example.co
   - 在同一分頁縮短快取時間（例如 1 天），降低表單驗證碼過期的機會。
   - 在 WordPress 後台的 CLP Varnish Cache 外掛或 CloudPanel 後台清除快取。
 
+#### ⑩ 把網站 vhost 更新為 CloudPanel 目前的範本 (`clp site <domain> -vhost=status|diff|update`)
+
+CloudPanel 建立網站時會把 vhost 範本複製到該網站，之後官方範本的更新（例如 2024 年 WordPress 範本加入的 `xmlrpc.php` 封鎖）不會套用到既有網站。`-vhost` 會把每個網站與 CloudPanel 目前的範本比較，並可更新。
+
+```bash
+sudo clp site -vhost=status -all                 # 所有網站：最新／舊版官方範本／有自訂修改
+sudo clp site example.com -vhost=diff            # 會改變的內容
+sudo clp site example.com -vhost=update          # 更新為目前的範本（先詢問；-y 不詢問）
+sudo clp site example.com -vhost=update -force   # 有自訂修改時也覆蓋
+sudo clp site example.com -vhost=update -template=WordPress   # 明確指定範本
+```
+
+- **狀態**：*最新*；*舊版官方範本*（與 clp 先前記錄過的某一版官方範本相同，可直接更新）；*有自訂修改*（與所有已知的官方版本都不同：在後台改過，或是 clp 開始記錄之前的官方版本；加 `-force` 才會覆蓋，會先備份）。比較時忽略換行字元、行尾空白與 `server_name` 那幾行。
+- clp 每天記錄 CloudPanel 的官方範本（`/etc/cron.d/clp-helper`，07:30，存在 `/root/.clp/vhost-templates/`）；安裝 clp 之前就已變更的版本無法辨識，會顯示為有自訂修改。
+- 2024-11 以前以 WordPress 範本建立的網站與目前的 WooCommerce 範本相同，會顯示為 WooCommerce；請加 `-template=WordPress` 更新。
+- **更新**：先把 CloudPanel 資料庫、網站範本與 vhost 備份到 `/root/.clp/vhost-backup/<時間>/<網域>/`，寫入新範本（保留網站自己的 `server_name`），再用 CloudPanel 自己的程式重新產生 vhost，與在後台 Vhost 分頁按儲存相同：Varnish、Cloudflare-only、Basic Auth 等設定依 CloudPanel 目前的設定產生（前端尚未經過 Varnish 的 Varnish 網站會開始經過 Varnish）。之後重新套用 clp httpauth 防護；這一步或 `nginx -t` 失敗時，範本與 vhost 都會還原。
+- clp 無法使用此 CloudPanel 版本的程式時，只更新資料庫中的範本，並請你到該網站的 Vhost 分頁按儲存。
+- 只支援 PHP 網站；已停用（`-off`）的網站要先啟用，因為重新產生 vhost 會讓它重新啟用。
+
 ---
 
 ### 2. 伺服器管理與安全加固 (`clp server`)
@@ -778,7 +812,7 @@ sudo clp server install --dry-run
 4. `ssh_hardening`：SSH 嚴格金鑰防反鎖檢測，停用密碼登入
 5. `fail2ban`：安裝並設定暴力破解自動封鎖規則
 6. `dns`：調整系統 DNS 解析器 (Google 8.8.8.8 與 Cloudflare 1.1.1.1)
-7. `sysctl`：Linux 核心最佳化 (`swappiness=10`, `file-max=500000`)
+7. `sysctl`：Linux 核心最佳化 (`swappiness=10`)
 8. `journald`：限制 Systemd 日誌上限為 500M，避免日誌占滿硬碟空間
 9. `unattended_upgrades`：啟用系統安全漏洞自動修補
 10. `snap_retention`：限制 Snap 歷史版本保留數為 2 份以節省空間
@@ -803,6 +837,12 @@ sudo clp server -harden
 
 ```bash
 sudo clp server -harden -y
+```
+
+只預覽每個步驟、不做任何變更：
+
+```bash
+sudo clp server -harden -dry-run
 ```
 
 #### ④ 輔助工具隨選安裝 (`sudo clp server -install=...`)
@@ -853,11 +893,25 @@ sudo clp server -ufw
 sudo clp server -ufw -allow=8080
 ```
 
+移除或封鎖連接埠（只接受單一數字埠號，例如 `8080` 或 `8080/tcp`；目前的 SSH 埠號會被拒絕）：
+
+```bash
+sudo clp server -ufw -deny=8080
+```
+
+啟用 UFW（偵測到的 SSH 埠號沒有規則時會先加入）：
+
+```bash
+sudo clp server -ufw=on
+```
+
 阻擋外網 Ping：
 
 ```bash
 sudo clp server -ufw -icmp=drop
 ```
+
+> **避免 SSH 鎖死**：SSH 埠號從 `sshd -T`、`ssh.socket` 與監聽中的連線收集，都抓不到時不會啟用 UFW；既有的 SSH 規則（包括只允許特定來源 IP 的規則）會保留。
 
 **SSH 維運與緊急復原**
 
@@ -872,6 +926,10 @@ sudo clp server -ssh
 ```bash
 sudo clp server -ssh -harden
 ```
+
+- 執行指令的帳號必須有可用的 SSH 金鑰（使用 sudo 時為 sudo 使用者自己的金鑰），否則 `-y` 會略過此步驟，互動模式會先詢問。
+- 既有較嚴格的 `PermitRootLogin no` 會保留；`Match` 區塊中的 `PasswordAuthentication yes` 保留並顯示警告。
+- 設定檢查失敗時，`sshd_config` 與 `sshd_config.d/` 會完整還原。
 
 緊急復原，暫時恢復密碼登入：
 
@@ -1054,7 +1112,9 @@ sudo clp restore example.com -file=example.com-full-20261005_153000.tar.gz -to=b
 - **只處理該類型自己的範圍**：
   - `full`：整個網站目錄。
   - `compact`：備份當年的 `uploads/<年份>/` 與網站其他檔案；不會動 uploads 中其他年份與非年份目錄、`shield`、`WPvivid_Uploads`。
-  - `archive`：只處理 `wp-content/uploads`（備份當年的目錄除外），以及備份中有的 `shield`、`WPvivid_Uploads`；網站其他檔案不會動。
+  - `archive`：只處理備份中有的 `wp-content/uploads` 項目（備份當年的目錄除外），以及備份中有的 `shield`、`WPvivid_Uploads`。比備份新的年份、備份中沒有的目錄與網站其他檔案都不會動。備份中有的目錄（例如 `uploads/elementor/`）會鏡像還原，備份之後才新增到該目錄的檔案會被刪除。
+- **以網站使用者身分寫入檔案**：備份先解壓到 root 專屬的暫存目錄，交給網站使用者後，再以網站使用者身分複製到網站（封裝中的裝置檔、FIFO 會被移除）。網站中有屬於其他使用者（例如 root）的項目時，會在任何變更之前停止並列出，請先修正擁有者。
+- **拒絕其他網站的封裝**：`.tar.gz` 最上層沒有這個網站的 `<網域>/` 目錄時，在任何變更之前就拒絕。要把網站複製到其他網域，請使用 `clp site -clone-from` 或 `-migrate`。
   - `db`：只匯入資料庫，不涉及檔案。
 - **年份以備份當時為準**：從檔名的時間戳記判斷，不是還原當天的年份。
 - **一律保護**：目前的 `wp-config.php`（備份中的版本另存到快照目錄）、上方列出的快取與備份外掛目錄。
@@ -1076,6 +1136,19 @@ sudo clp restore example.com -type=compact -no-snapshot
 
 ```bash
 sudo clp restore example.com -type=compact -keep-extra
+```
+
+#### 資料庫存取（`-db-root`）
+
+`backup` 與 `restore` 只用網站自己的權限存取資料庫：先以網站使用者身分執行 WP-CLI，再用 `wp-config.php` 中的資料庫帳密。
+
+- **不會自動改用 MySQL root**：兩者都失敗時直接報錯。還原會在建立快照之前先確認資料庫可以存取：會匯入資料庫的還原（`.sql`、`full`）在這裡停止，尚未變更任何內容；只還原檔案（`compact`、`archive`）時顯示警告後繼續，快照不包含資料庫。
+- **`-db-root`**：允許最後改用 MySQL root 帳號。一律連 CloudPanel 的 MySQL master（`clpctl db:show:master-credentials` 提供的主機與埠號，不使用 `wp-config.php` 的 `DB_HOST`），資料庫名稱只能包含英數字、`_` 與 `-`。
+- **以 `-` 開頭的資料庫名稱**：不會交給 `mysql`／`mysqldump`（WP-CLI 以網站使用者身分執行，不受影響）。
+
+```bash
+sudo clp backup example.com -type=db -db-root
+sudo clp restore example.com -file=example.com-db-20260921_120000.sql.gz -db-root
 ```
 
 #### ⑤ 用 compact + db + archive 還原完整網站
@@ -1110,11 +1183,7 @@ sudo clp restore example.com -type=archive -to=google
 sudo clp httpauth example.com -add
 ```
 
-指令指定帳號與密碼新增（注意：密碼會留在 shell 歷史紀錄中，建議使用互動模式）：
-
-```bash
-sudo clp httpauth example.com -add=[admin,StrongPassword123!]
-```
+使用者名稱與密碼一律以互動方式輸入，密碼不會留在 shell 歷史紀錄或行程清單中；`-add` 必須在終端機中執行。
 
 刪除指定使用者：
 
@@ -1167,6 +1236,8 @@ sudo clp httpauth example.com -path=/staging
 #### ④ IP / 網段免密碼白名單 (`-whitelist`)
 
 設定固定 IP 或公司網段免密碼直接通行（Nginx `satisfy any` 機制）：
+
+> **防止偽造**：CloudPanel 的 `/etc/nginx/nginx.conf` 設有 `set_real_ip_from 0.0.0.0/0`，任何人帶上 `X-Real-IP: <白名單 IP>` 就能略過密碼。指令會寫入白名單時（`-whitelist=<ip>`，或網站已有白名單時的 `-wp-admin`／`-path`），CLP Helper 會說明並把這一行註解掉（先詢問，預設是；`-y` 直接處理；非互動模式沒有 `-y` 時在任何變更前停止）。這會影響伺服器上所有網站，127.0.0.1 與私有網段仍受信任；備份在 `/root/.clp/httpauth-backup/<時間>/`。該行仍生效時，`-list=protected` 會顯示警告。
 
 追加 IP 至白名單 (支援 CIDR)：
 
@@ -1293,7 +1364,7 @@ sudo clp php-pm -fix -all -exclude="test.,dev."
 數字的來源：
 
 - **peak**：PHP-FPM 啟動以來，同時執行的最多 worker 數（pool status 頁面的 `max active processes`）；**days** 是這段統計的天數。
-- **reached**：碰到 `pm.max_children` 上限的次數，來自 status 頁面與近 7 天的 PHP-FPM log。
+- **reached**：碰到 `pm.max_children` 上限的次數，來自 status 頁面與近 7 天的 PHP-FPM log（log 中在較低的舊上限時發生的不計入）。
 - **記憶體上限**：總記憶體扣除 MySQL／MariaDB、Varnish（`malloc` 大小）、Redis 與保留的 512MB 後，除以每個 PHP worker 的記憶體（取忙碌中的 worker 實測，樣本太少時以 100MB 計算）。
 
 建議值的算法：
@@ -1340,7 +1411,7 @@ CLP Helper 提供專屬的全域設定管理模組 (`clp config`)，用來保存
 | `cf-default-mode` | `-cf-waf=on` 套用的 Cloudflare SSL 模式 | `off`、`flexible`、`full`、`strict`；預設 `strict` |
 | `cf-always-https` | `-cf-waf=on` 套用的 Cloudflare「Always Use HTTPS」 | `on`、`off`；預設 `on` |
 | `cf-min-tls` | `-cf-waf=on` 套用的 Cloudflare 最低 TLS 版本 | `1.0`～`1.3`；預設 `1.2` |
-| `backup-dir` | 未指定 `-path` 時，`clp backup` / `clp restore` 使用的本機目錄；`clp site -clone` / `-migrate` 留存的資料庫也寫在這裡。改過之後，舊的備份仍在原處，`clp restore` 會提示用 `-path` 指定 | `/home` 以外的絕對路徑；預設 `/root/clpBackup` |
+| `backup-dir` | 未指定 `-path` 時，`clp backup` / `clp restore` 使用的本機目錄；`clp site -clone` / `-migrate` 留存的資料庫也寫在這裡。改過之後，舊的備份仍在原處，`clp restore` 會提示用 `-path` 指定 | `/home` 以外的絕對路徑，不可在 `/tmp`、`/var/tmp`、`/dev`、`/run`、`/proc`、`/sys` 之下，也不可是系統目錄本身（`/etc`、`/usr`、`/var` 等）；`-path` 套用相同規則；預設 `/root/clpBackup` |
 | `backup-remote-dir` | 未指定 `-path` 時，rclone 遠端上的目錄（實際為 `<值>/<網域>`） | 相對路徑；預設 `clpBackup` |
 | `backup-type` | 未指定 `-type` 時的備份類型 | `db`、`full`、`compact`、`archive`；預設 `full` |
 | `backup-to` | 未指定 `-to` 時的儲存目標（`clp restore` 的來源也相同） | `local` 或 rclone 遠端名稱；預設 `local` |

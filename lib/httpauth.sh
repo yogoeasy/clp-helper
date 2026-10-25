@@ -107,9 +107,28 @@ httpauth_validate_username() {
   [[ "$1" =~ ^[A-Za-z0-9._@-]+$ ]]
 }
 
+# httpauth_read_htpasswd <file>：透過 clp_fileops 讀取（不跟隨 symlink、拒絕 FIFO 等非一般檔案）；
+#   檔案位於網站使用者家目錄，網站使用者可以把它換成指向其他檔案的 symlink。不存在或無法讀取時輸出空字串
+httpauth_read_htpasswd() {
+  local file="$1"
+  local cmd=(python3 -I "${CLP_LIB_DIR}/clp_fileops.py" read "$file")
+  [[ "$file" =~ ^/home/([^/]+)/ ]] && cmd+=(--user "${BASH_REMATCH[1]}")
+  if ! "${cmd[@]}" 2>/dev/null; then
+    if [[ -e "$file" || -L "$file" ]]; then
+      log_warn >&2 "$(_t "HTTPAUTH_WARN_HTPASSWD_UNREADABLE" "$file")"
+    fi
+  fi
+  return 0
+}
+
+# httpauth_count_users <file>：計算有效的使用者行數
+httpauth_count_users() {
+  httpauth_read_htpasswd "$1" | awk -F':' 'NF > 1 && $1 !~ /^[[:space:]]*#/ && $1 != "" { n++ } END { print n + 0 }'
+}
+
 httpauth_user_exists() {
   local file="$1" user="$2"
-  [[ -f "$file" ]] && awk -F':' -v u="$user" '$1 == u { found = 1 } END { exit !found }' "$file"
+  [[ -f "$file" ]] && httpauth_read_htpasswd "$file" | awk -F':' -v u="$user" '$1 == u { found = 1 } END { exit !found }'
 }
 
 httpauth_remove_user_line() {
@@ -121,6 +140,102 @@ httpauth_remove_user_line() {
   local cmd=(python3 -I "${CLP_LIB_DIR}/clp_fileops.py" htpasswd-del "$file" "$user")
   [[ -n "$site_user" ]] && cmd+=(--user "$site_user")
   "${cmd[@]}"
+}
+
+# httpauth_will_write_whitelist <domain>：本次指令是否會把 IP 白名單（satisfy any + allow）寫進 vhost
+#   -whitelist 的新增／取代，或網站已有白名單時開啟 -wp-admin、-path 防護
+httpauth_will_write_whitelist() {
+  local domain="$1" v
+  if has_opt "whitelist"; then
+    v=$(opt_get "whitelist" "")
+    if ! has_opt "delete-all" && ! has_opt "delete_all" && ! has_opt "delete" && ! has_opt "del" && \
+       ! has_opt "remove" && ! has_opt "off" && [[ -n "$v" && "$v" != "true" && "$v" != "off" && "$v" != "clear" && "$v" != "none" ]]; then
+      return 0
+    fi
+  fi
+  # 以下判斷與 httpauth_handler 的 -wp-admin、-path 分支一致
+  httpauth_has_whitelist "$domain" || return 1
+  if has_opt "wp_admin" || has_opt "wp-admin"; then
+    v=$(opt_get "wp_admin" "$(opt_get "wp-admin" "on")")
+    if ! has_opt "off" && [[ "$v" != "off" ]]; then
+      return 0
+    fi
+  fi
+  if has_opt "path" && ! has_opt "delete-all" && ! has_opt "delete_all"; then
+    v=$(opt_get "path" "")
+    if [[ -n "$v" && "$v" != "true" ]] && ! has_opt "off" && ! has_opt "delete" && ! has_opt "del" && ! has_opt "remove"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# httpauth_realip_disable：白名單生效後呼叫；set_real_ip_from 0.0.0.0/0 仍生效時說明並詢問（預設 yes），
+#   -y 直接處理；讀到 EOF 或回答否時只警告。nginx.conf 備份到 /root/.clp/httpauth-backup/<時間>/
+httpauth_realip_disable() {
+  [[ "$(clp_realip_state)" == "active" ]] || return 0
+  local conf="$CLP_REALIP_NGINX_CONF"
+  log_warn "$(_t "HTTPAUTH_REALIP_EXPLAIN" "$conf")"
+  if ! has_opt "y" && ! has_opt "yes" && [[ "${CLP_AUTO_YES:-false}" != "true" ]]; then
+    local ans=""
+    if ! read -r -p "$(_t "SITE_CF_ONLY_REALIP_PROMPT")" ans; then
+      ans="n"
+    fi
+    if [[ -n "$ans" && "$ans" != "y" && "$ans" != "Y" && "$ans" != "yes" ]]; then
+      log_warn "$(_t "HTTPAUTH_REALIP_WARN_KEPT" "$conf")"
+      return 0
+    fi
+  fi
+  local backup_dir
+  backup_dir="/root/.clp/httpauth-backup/$(date +%Y%m%d_%H%M%S)"
+  if ( umask 077; mkdir -p "$backup_dir" ) && clp_realip_write disable "$backup_dir"; then
+    log_success "$(_t "SITE_CF_ONLY_REALIP_DONE" "$conf" "${backup_dir}/nginx.conf")"
+  else
+    log_warn "$(_t "HTTPAUTH_REALIP_WARN_KEPT" "$conf")"
+  fi
+  return 0
+}
+
+# _httpauth_nginx_active_workers <master_pid>：仍在接受新連線的 worker PID（不含 reload 後正在結束的舊 worker）
+_httpauth_nginx_active_workers() {
+  local master="$1" pid title
+  for pid in $(pgrep -P "$master" 2>/dev/null || true); do
+    title=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null) || continue
+    if [[ "$title" == *"worker process"* && "$title" != *"shutting down"* ]]; then
+      echo "$pid"
+    fi
+  done
+}
+
+# httpauth_reload_nginx：套用設定；reload 失敗時報錯（vhost 已更新但尚未生效），不可顯示成功
+#   reload 只是送信號給 nginx 主行程，新設定要等新的 worker 啟動、舊的 worker 進入結束狀態才生效
+#   （實測約 2 秒）：等到舊 worker 都不再接受新連線才回傳，最多 15 秒；逾時表示 nginx 沒有載入新設定
+httpauth_reload_nginx() {
+  local master="" old="" pid title i pending
+  master=$(cat /run/nginx.pid 2>/dev/null || true)
+  if [[ "$master" =~ ^[0-9]+$ && -d "/proc/${master}" ]]; then
+    old=$(_httpauth_nginx_active_workers "$master")
+  fi
+  if ! systemctl reload nginx 2>/dev/null && ! nginx -s reload 2>/dev/null; then
+    log_error "$(_t "HTTPAUTH_ERR_RELOAD")"
+    return 1
+  fi
+  # 找不到主行程或 worker 時無法判斷，沿用原本的行為
+  [[ -n "$old" ]] || return 0
+  for ((i = 0; i < 75; i++)); do
+    pending=0
+    for pid in $old; do
+      title=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null) || continue
+      if [[ -n "$title" && "$title" != *"shutting down"* ]]; then
+        pending=1
+        break
+      fi
+    done
+    [[ "$pending" -eq 0 ]] && return 0
+    sleep 0.2
+  done
+  log_error "$(_t "HTTPAUTH_ERR_RELOAD")"
+  return 1
 }
 
 httpauth_has_whitelist() {
@@ -166,7 +281,11 @@ httpauth_add_user() {
   # If not provided, prompt interactively
   if [[ -z "$username" ]]; then
     echo -e "$(_t "HTTPAUTH_ADD_USER_1" "${C_CYAN}" "${C_BOLD}" "${domain}" "${C_NC}")"
-    read -r -p "$(_t "HTTPAUTH_ADD_USER_2")" username
+    if ! read -r -p "$(_t "HTTPAUTH_ADD_USER_2")" username; then
+      echo ""
+      log_info "$(_t "CORE_PROMPT_CANCELLED")"
+      return 1
+    fi
     username=$(echo "$username" | tr -d '[:space:]')
   fi
 
@@ -180,13 +299,22 @@ httpauth_add_user() {
   fi
 
   if [[ -z "$password" ]]; then
-    read -r -s -p "$(_t "HTTPAUTH_ADD_USER_5")" password
+    if ! read -r -s -p "$(_t "HTTPAUTH_ADD_USER_5")" password; then
+      echo ""
+      log_info "$(_t "CORE_PROMPT_CANCELLED")"
+      return 1
+    fi
     echo ""
     if [[ -z "$password" ]]; then
       log_error "$(_t "HTTPAUTH_ADD_USER_6")"
       return 1
     fi
-    read -r -s -p "$(_t "HTTPAUTH_ADD_USER_7")" password_confirm
+    local password_confirm=""
+    if ! read -r -s -p "$(_t "HTTPAUTH_ADD_USER_7")" password_confirm; then
+      echo ""
+      log_info "$(_t "CORE_PROMPT_CANCELLED")"
+      return 1
+    fi
     echo ""
     if [[ "$password" != "$password_confirm" ]]; then
       log_error "$(_t "HTTPAUTH_ADD_USER_8")"
@@ -297,7 +425,7 @@ httpauth_del_user() {
   # 檢查是否為最後一位使用者且網站仍有啟用中的 HTTP Auth 防護
   local user_count=0
   if [[ -f "$htpasswd_file" ]]; then
-    user_count=$(awk -F':' 'NF > 1 && $1 !~ /^[[:space:]]*#/ && $1 != "" { n++ } END { print n + 0 }' "$htpasswd_file")
+    user_count=$(httpauth_count_users "$htpasswd_file")
   fi
 
   if [[ "$user_count" -le 1 ]]; then
@@ -373,7 +501,9 @@ httpauth_list_users() {
   echo -e "$(_t "HTTPAUTH_LIST_USERS_2" "${C_YELLOW}" "${htpasswd_file}" "${C_NC}")"
   echo ""
 
-  if [[ ! -f "$htpasswd_file" || ! -s "$htpasswd_file" ]]; then
+  local htpasswd_content=""
+  [[ -f "$htpasswd_file" ]] && htpasswd_content=$(httpauth_read_htpasswd "$htpasswd_file")
+  if [[ -z "$htpasswd_content" ]]; then
     echo -e "$(_t "HTTPAUTH_LIST_USERS_3")"
     echo -e "$(_t "HTTPAUTH_LIST_USERS_4" "${C_CYAN}" "${domain}" "${C_NC}")"
     echo ""
@@ -387,7 +517,7 @@ httpauth_list_users() {
     [[ -z "$u" || "$u" =~ ^# ]] && continue
     printf "%-6s %-30s\n" "$idx" "$u"
     idx=$((idx + 1))
-  done < "$htpasswd_file"
+  done <<< "$htpasswd_content"
   echo "--------------------------------------------------"
   echo -e "$(_t "HTTPAUTH_LIST_USERS_5" "${C_BOLD}" "$((idx-1))" "${C_NC}")"
   echo ""
@@ -413,9 +543,12 @@ httpauth_list_protected() {
   # 1. 密碼檔與使用者統計
   local user_count=0
   if [[ -f "$htpasswd_file" ]]; then
-    user_count=$(awk -F':' 'NF > 1 && $1 !~ /^[[:space:]]*#/ && $1 != "" { n++ } END { print n + 0 }' "$htpasswd_file")
+    user_count=$(httpauth_count_users "$htpasswd_file")
   fi
   echo -e "$(_t "HTTPAUTH_LIST_PROTECTED_2" "${C_YELLOW}" "${htpasswd_file}" "${C_NC}" "${user_count}")"
+  if httpauth_has_whitelist "$domain" && [[ "$(clp_realip_state)" == "active" ]]; then
+    log_warn "$(_t "HTTPAUTH_REALIP_WARN_LIST" "$CLP_REALIP_NGINX_CONF" "$domain")"
+  fi
 
   # 2. 檢查 WordPress 後台防護
   local wpadmin_status="$(_t "HTTPAUTH_LIST_PROTECTED_3")"
@@ -489,7 +622,7 @@ httpauth_set_wp_admin() {
         return 1
       fi
       log_warn "$(_t "HTTPAUTH_SET_WP_ADMIN_2")"
-      read -p "$(_t "HTTPAUTH_SET_WP_ADMIN_3")" create_u
+      read -r -p "$(_t "HTTPAUTH_SET_WP_ADMIN_3")" create_u || create_u=""
       if [[ "$create_u" =~ ^[Yy]$ ]]; then
         httpauth_add_user "$domain"
       else
@@ -520,7 +653,7 @@ httpauth_set_wp_admin() {
 
     if nginx -t >/dev/null 2>&1; then
       rm -f "${vhost}.clpbak"
-      systemctl reload nginx 2>/dev/null || true
+      httpauth_reload_nginx || return 1
       log_success "$(_t "HTTPAUTH_SET_WP_ADMIN_7")"
       return 0
     else
@@ -542,7 +675,7 @@ httpauth_set_wp_admin() {
 
     if nginx -t >/dev/null 2>&1; then
       rm -f "${vhost}.clpbak"
-      systemctl reload nginx 2>/dev/null || true
+      httpauth_reload_nginx || return 1
       log_success "$(_t "HTTPAUTH_SET_WP_ADMIN_11")"
       return 0
     else
@@ -590,7 +723,7 @@ httpauth_set_path() {
         return 1
       fi
       log_warn "$(_t "HTTPAUTH_SET_WP_ADMIN_2")"
-      read -p "$(_t "HTTPAUTH_SET_PATH_2")" create_u
+      read -r -p "$(_t "HTTPAUTH_SET_PATH_2")" create_u || create_u=""
       if [[ "$create_u" =~ ^[Yy]$ ]]; then
         httpauth_add_user "$domain"
       else
@@ -621,7 +754,7 @@ httpauth_set_path() {
 
     if nginx -t >/dev/null 2>&1; then
       rm -f "${vhost}.clpbak"
-      systemctl reload nginx 2>/dev/null || true
+      httpauth_reload_nginx || return 1
       log_success "$(_t "HTTPAUTH_SET_PATH_6" "${target_path}")"
       return 0
     else
@@ -643,7 +776,7 @@ httpauth_set_path() {
 
     if nginx -t >/dev/null 2>&1; then
       rm -f "${vhost}.clpbak"
-      systemctl reload nginx 2>/dev/null || true
+      httpauth_reload_nginx || return 1
       log_success "$(_t "HTTPAUTH_SET_PATH_8" "${target_path}")"
       return 0
     else
@@ -664,9 +797,16 @@ httpauth_commit_whitelist_change() {
   local wl_bak="$3"
   local had_wl="$4"
 
-  if httpauth_refresh_active_blocks "$domain"; then
+  local refresh_rc=0
+  httpauth_refresh_active_blocks "$domain" || refresh_rc=$?
+  if [[ "$refresh_rc" -eq 0 ]]; then
     rm -f "$wl_bak"
     return 0
+  fi
+  if [[ "$refresh_rc" -eq 2 ]]; then
+    # vhost 已寫入新的白名單，只是尚未 reload：保留新的白名單檔，與 vhost 一致
+    rm -f "$wl_bak"
+    return 1
   fi
 
   if [[ "$had_wl" -eq 1 ]]; then
@@ -850,7 +990,7 @@ httpauth_clear_all_paths() {
 
   if nginx -t >/dev/null 2>&1; then
     rm -f "${vhost}.clpbak"
-    systemctl reload nginx 2>/dev/null || true
+    httpauth_reload_nginx || return 1
     log_success "$(_t "HTTPAUTH_CLEAR_ALL_PATHS_1" "${domain}")"
     return 0
   else
@@ -886,7 +1026,8 @@ httpauth_refresh_active_blocks() {
 
   if nginx -t >/dev/null 2>&1; then
     rm -f "${vhost}.clpbak"
-    systemctl reload nginx 2>/dev/null || true
+    # 回傳 2：vhost 已更新但 reload 失敗（呼叫端不可再還原白名單檔，否則與 vhost 不一致）
+    httpauth_reload_nginx || return 2
     return 0
   else
     log_error "$(_t "HTTPAUTH_SET_WP_ADMIN_8")"
@@ -937,7 +1078,6 @@ httpauth_handler() {
     log_error "$(_t "HTTPAUTH_HANDLER_1")"
     echo -e "$(_t "HTTPAUTH_HANDLER_2")"
     echo -e "  sudo clp httpauth example.com -add"
-    echo -e "  sudo clp httpauth example.com -add=[user,pass]"
     echo -e "  sudo clp httpauth example.com -delete=user"
     echo -e "  sudo clp httpauth example.com -list"
     echo -e "  sudo clp httpauth example.com -list=protected"
@@ -958,32 +1098,31 @@ httpauth_handler() {
 
   require_site_exists "$domain" "$(_t "HTTPAUTH_HANDLER_3")" || return 1
 
-  local action_performed=0
+  # 會寫入 IP 白名單、且 nginx.conf 的 set_real_ip_from 0.0.0.0/0 仍生效時，結束前要詢問是否註解掉；
+  # 非 TTY 又沒有 -y 時在任何修改之前報錯
+  local realip_fix=0
+  if httpauth_will_write_whitelist "$domain" && [[ "$(clp_realip_state)" == "active" ]]; then
+    if ! has_opt "y" && ! has_opt "yes" && [[ "${CLP_AUTO_YES:-false}" != "true" && ! -t 0 ]]; then
+      log_error "$(_t "HTTPAUTH_REALIP_ERR_NON_TTY")"
+      return 1
+    fi
+    realip_fix=1
+  fi
 
-  # 1. 處理 -add
+  local action_performed=0 handler_rc=0 skip_rest=0
+
+  # 1. 處理 -add：只接受互動輸入（密碼不可出現在命令列，會被 ps 看到）
   if has_opt "add"; then
     action_performed=1
-    local add_val
-    add_val=$(opt_get "add" "")
-    local username=""
-    local password=""
-
-    if [[ "$add_val" != "true" && -n "$add_val" ]]; then
-      # Strip brackets [ ]
-      add_val=$(echo "$add_val" | sed -e 's/^\[//' -e 's/\]$//')
-      if [[ "$add_val" == *,* ]]; then
-        username=$(echo "$add_val" | cut -d',' -f1)
-        password=$(echo "$add_val" | cut -d',' -f2-)
-      else
-        username="$add_val"
-        password=$(opt_get "pass" "$(opt_get "password" "")")
-      fi
-    else
-      username=$(opt_get "user" "$(opt_get "username" "")")
-      password=$(opt_get "pass" "$(opt_get "password" "")")
+    if [[ "$(opt_get "add" "")" != "true" ]] || has_opt "pass" || has_opt "password" || has_opt "user" || has_opt "username"; then
+      log_error "$(_t "HTTPAUTH_ERR_ADD_NO_INLINE")"
+      return 1
     fi
-
-    httpauth_add_user "$domain" "$username" "$password"
+    if [[ ! -t 0 ]]; then
+      log_error "$(_t "HTTPAUTH_ERR_ADD_NEEDS_TTY")"
+      return 1
+    fi
+    httpauth_add_user "$domain" || handler_rc=$?
   fi
 
   # 2. 處理 -delete (使用者刪除，僅在非 whitelist / 非 path 刪除時觸發)
@@ -1053,18 +1192,17 @@ httpauth_handler() {
     path_val=$(opt_get "path" "")
 
     # -path -delete-all：清除所有自訂路徑保護（不需要指定路徑）
+    #   不提早 return：同一指令可能已寫入白名單，結尾仍要處理 real-ip
     if has_opt "delete-all" || has_opt "delete_all"; then
       log_step "$(_t "HTTPAUTH_HANDLER_5" "${domain}")"
-      httpauth_clear_all_paths "$domain"
-      return $?
-    fi
-
-    if [[ -z "$path_val" || "$path_val" == "true" ]]; then
+      httpauth_clear_all_paths "$domain" || handler_rc=$?
+      skip_rest=1
+    elif [[ -z "$path_val" || "$path_val" == "true" ]]; then
       log_error "$(_t "HTTPAUTH_HANDLER_6")"
       log_info "$(_t "HTTPAUTH_HANDLER_7" "${domain}")"
-      return 1
-    fi
-    if has_opt "off" || has_opt "delete"; then
+      handler_rc=1
+      skip_rest=1
+    elif has_opt "off" || has_opt "delete" || has_opt "del" || has_opt "remove"; then
       httpauth_set_path "$domain" "$path_val" "off"
     else
       httpauth_set_path "$domain" "$path_val" "on"
@@ -1072,7 +1210,7 @@ httpauth_handler() {
   fi
 
   # 6. 處理 -list
-  if has_opt "list"; then
+  if [[ "$skip_rest" -eq 0 ]] && has_opt "list"; then
     action_performed=1
     local list_val
     list_val=$(opt_get "list" "")
@@ -1083,11 +1221,15 @@ httpauth_handler() {
     fi
   fi
 
-  if [[ "$action_performed" -eq 0 ]]; then
+  if [[ "$skip_rest" -eq 0 && "$action_performed" -eq 0 ]]; then
     # 若未帶特定動作，預設列出防護狀態與使用者
     httpauth_list_protected "$domain"
     httpauth_list_users "$domain"
   fi
 
-  return 0
+  if [[ "$realip_fix" -eq 1 ]] && httpauth_has_whitelist "$domain"; then
+    httpauth_realip_disable
+  fi
+
+  return "$handler_rc"
 }

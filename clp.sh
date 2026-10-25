@@ -6,9 +6,9 @@
 
 set -euo pipefail
 
-CLP_VERSION="1.1.1"
-CLP_BUILD_DATE="2026-10-23"
-CLP_BUILD_TIME="2026-10-23 14:02:24"
+CLP_VERSION="1.2.0"
+CLP_BUILD_DATE="2026-10-25"
+CLP_BUILD_TIME="2026-10-25 16:05:18"
 CLP_TIMESTAMP="${CLP_BUILD_TIME}"
 export CLP_VERSION CLP_BUILD_DATE CLP_BUILD_TIME CLP_TIMESTAMP
 # 解析軟連結，取得腳本真實所在目錄
@@ -78,6 +78,7 @@ show_help() {
   echo -e "               -cf-waf       $(_t "HELP_OPT_SITE_CF_WAF")"
   echo -e "               -cf-only      $(_t "HELP_OPT_SITE_CF_ONLY")"
   echo -e "               -varnish      $(_t "HELP_OPT_SITE_VARNISH")"
+  echo -e "               -vhost        $(_t "HELP_OPT_SITE_VHOST")"
   echo -e "               -clone-from   $(_t "HELP_OPT_SITE_CLONE_FROM")"
   echo -e "               -migrate      $(_t "HELP_OPT_SITE_MIGRATE")"
   echo -e "               delete        $(_t "HELP_OPT_SITE_DELETE")"

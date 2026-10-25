@@ -16,7 +16,10 @@ Where the numbers come from:
     address): "max active processes" and "max children reached" since PHP-FPM started.
     A reload or restart resets them, so "days" tells how much history they cover.
   - The PHP-FPM error log of the last LOG_DAYS days (rotated files included):
-    "[pool <domain>] server reached pm.max_children".
+    "[pool <domain>] server reached max_children setting (N)" (ondemand pools; dynamic
+    pools write "pm.max_children"). Only hits with
+    N >= the current pm.max_children count: a hit under a lower, older limit says
+    nothing about the current one. A line without "setting (N)" is counted.
   - Memory: MemTotal minus MySQL/MariaDB and Redis RSS, Varnish's malloc size and
     RESERVE_MB is the budget for PHP; one worker is the average PSS of the busy
     php-fpm workers seen in WORKER_SNAPSHOTS one-second snapshots
@@ -167,7 +170,8 @@ def fpm_status(listen, status_path, timeout=5):
 
 
 # ------------------------------------------------------------------ error log
-LOG_LINE_RE = re.compile(r'^\[(\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2})\].*\[pool ([^\]]+)\] server reached pm\.max_children')
+LOG_LINE_RE = re.compile(r'^\[(\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2})\].*\[pool ([^\]]+)\] server reached (?:pm\.)?max_children'
+                         r'(?: setting \((\d+)\))?')
 
 
 def fpm_log_files(ver):
@@ -183,7 +187,7 @@ def fpm_log_files(ver):
 
 
 def reached_in_logs(versions):
-    """{pool: count} of 'reached pm.max_children' in the last LOG_DAYS days."""
+    """{pool: [setting N or None, ...]} of 'reached [pm.]max_children' in the last LOG_DAYS days."""
     since = datetime.datetime.now() - datetime.timedelta(days=LOG_DAYS)
     counts = {}
     for ver in versions:
@@ -194,7 +198,7 @@ def reached_in_logs(versions):
                 opener = gzip.open if path.endswith(".gz") else open
                 with opener(path, "rt", encoding="utf-8", errors="replace") as f:
                     for line in f:
-                        if "reached pm.max_children" not in line:
+                        if "max_children" not in line:
                             continue
                         m = LOG_LINE_RE.match(line)
                         if not m:
@@ -204,10 +208,17 @@ def reached_in_logs(versions):
                         except ValueError:
                             continue
                         if ts >= since:
-                            counts[m.group(2)] = counts.get(m.group(2), 0) + 1
+                            counts.setdefault(m.group(2), []).append(int(m.group(3)) if m.group(3) else None)
             except (OSError, EOFError):
                 continue
     return counts
+
+
+def count_reached(settings, current):
+    """Hits that apply to the current limit: setting N >= current (or N unknown)."""
+    if current is None:
+        return len(settings)
+    return sum(1 for n in settings if n is None or n >= current)
 
 
 # ------------------------------------------------------------------ memory
@@ -358,7 +369,7 @@ def cmd_status(domain=None):
                 days = since / 86400.0 if since is not None else None
                 max_active = _int(st.get("max active processes"))
                 reached_status = _int(st.get("max children reached"))
-        reached_log = logs.get(name, 0)
+        reached_log = count_reached(logs.get(name, []), current)
         if pm != "ondemand":
             value, conclusion, tight = None, "not-ondemand", False
         elif current is None:

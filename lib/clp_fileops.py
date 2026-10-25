@@ -249,6 +249,8 @@ def safe_atomic_write(target_path, content, user=None, allow_create=False, owner
 def read_file_nofollow(path, user=None):
     """
     Reads all lines from path preventing symlink traversal via O_NOFOLLOW.
+    Opens with O_NONBLOCK and refuses anything but a regular file, so a FIFO or
+    device planted by the site user cannot block or feed root.
     """
     path = os.path.abspath(path)
     if not os.path.exists(path):
@@ -272,7 +274,7 @@ def read_file_nofollow(path, user=None):
     if home_user_dir and os.path.isdir(home_user_dir):
         target_fd, open_fds = open_dir_tree_nofollow(home_user_dir, target_dir)
         try:
-            flags = os.O_RDONLY
+            flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             fd = os.open(base_name, flags, dir_fd=target_fd)
@@ -283,16 +285,16 @@ def read_file_nofollow(path, user=None):
                 except OSError:
                     pass
     else:
-        flags = os.O_RDONLY
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         fd = os.open(path, flags)
 
-    try:
-        with open(fd, "r", encoding="utf-8", errors="replace", closefd=True) as f:
-            return f.readlines()
-    except Exception:
-        raise
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"Security violation: refusing to read non-regular file '{path}'")
+    with open(fd, "r", encoding="utf-8", errors="replace", closefd=True) as f:
+        return f.readlines()
 
 
 def read_text_nofollow(path, user=None):
@@ -438,7 +440,9 @@ def htpasswd_set(file_path, username, new_line, owner=None, mode=0o640, user=Non
         lines = read_file_nofollow(file_path, user=user)
 
     prefix = f"{username}:"
-    filtered = [l for l in lines if not l.startswith(prefix) and l.strip()]
+    # 最後一行若沒有換行，補上，避免新的一行接在它後面
+    filtered = [l if l.endswith("\n") else l + "\n"
+                for l in lines if not l.startswith(prefix) and l.strip()]
 
     new_line = new_line.strip()
     if not new_line.startswith(prefix):
@@ -504,6 +508,11 @@ def main():
     p_write.add_argument("--mode", help="Octal file mode for new file (e.g. 640)", default=None)
     p_write.add_argument("--allow-create", action="store_true", help="Allow creating file if not existing")
 
+    # Subcommand: read
+    p_read = subparsers.add_parser("read", help="Print a file without following symlinks (empty if missing)")
+    p_read.add_argument("path", help="File path")
+    p_read.add_argument("--user", help="Require path inside /home/<user>/", default=None)
+
     # Subcommand: htpasswd-set
     p_hset = subparsers.add_parser("htpasswd-set", help="Add or update user in htpasswd file")
     p_hset.add_argument("path", help="Path to .htpasswd file")
@@ -538,6 +547,8 @@ def main():
                 owner=args.owner,
                 mode=args.mode
             )
+        elif args.subcommand == "read":
+            sys.stdout.write(read_text_nofollow(args.path, user=args.user))
         elif args.subcommand == "htpasswd-set":
             line = sys.stdin.read().strip()
             if not line:
