@@ -120,6 +120,8 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 
 安裝完成後，可以刪除 `clp-helper` 目錄。
 
+**來源目錄檢查**：安裝程式會以 root 執行並安裝來源中的檔案，所以其他帳號能修改或替換它們時會停止。來源目錄與其上每一層目錄、以及要安裝的每個檔案，擁有者都必須是 root 或執行 `sudo` 的使用者；不可讓其他使用者寫入（root 擁有且有 sticky 的目錄如 `/tmp` 沒有問題）；群組可寫只限擁有者自己的私人群組；也不可包含 symlink。上面三種方式都會通過；請不要解壓縮或 clone 到其他帳號的目錄（例如 CloudPanel 網站使用者的家目錄）再從那裡安裝。
+
 **指定介面語言**：在任一種方式的最後加上 `--lang=zh_TW`（或 `--lang=en_US`），例如 `sudo bash clp-get.sh --lang=zh_TW`。
 
 安裝程式會自動完成：
@@ -139,7 +141,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.3.1 (建置時間 2026-10-26 09:45:57)`
+輸出範例：`CLP Helper v1.3.2 (建置時間 2026-10-26 22:20:39)`
 
 查看全域功能說明選單：
 
@@ -484,6 +486,8 @@ sudo clp site -clone-from=example.com new-example.com -user=newuser -php=8.4
   - 自動為 Redis 注入全站隨機 Salt（`WP_CACHE_KEY_SALT`），避免網站之間的快取互相干擾。
   - WP-CLI 深度置換網址，並自動校正 `robots.txt` 內之 Sitemap 網址。只替換網址形式（`https://`、`http://`、`//`，以及 Elementor 使用的 JSON 跳脫寫法 `https:\/\/`，含或不含 `www.`）；`www.` 的網址換成不含 `www.` 的新網域，`http://` 的網址換成 `https://`。email、純文字中的網域與文章 GUID 不變。資料庫中的網站絕對路徑（例如外掛設定）也一併替換；同網域搬遷只替換路徑。
   - 已知限制：以來源網域開頭的其他網域網址（例如複製 `example.com` 時的 `https://example.com.tw`）也會被替換；URL 編碼的連結（`https%3A%2F%2F…`）與大小寫不同的網址不會被替換。會執行約十次 `wp search-replace`，大多數找不到資料；392 MB 的測試資料庫比舊版多花約 15% 的時間。
+  - 以來源網站使用者身分讀取、新網站使用者身分寫入，只會複製來源網站使用者讀得到的檔案。來源目錄是符號連結或擁有者不是網站使用者、有來源網站使用者讀不到的檔案，或複製後沒有 `wp-config.php` 時，會停止並移除新網站與資料庫。
+  - 存取防護不會自動複製。來源網站有 `clp httpauth` 防護、IP 白名單或 Cloudflare-only 時，會列出對應的指令並詢問是否套用到新網站（預設不套用；`-y` 時只列出指令）。套用時也會複製 Basic Auth 帳號。
 
 #### ⑤ 跨主機網站安全搬移 (`clp site -migrate`)
 
@@ -517,6 +521,8 @@ sudo clp site -migrate=remote-vps -all -exclude="test.,dev.,staging." -force-rep
   - **遠端唯讀存取**：資料庫以壓縮的 SSH 連線傳到本機，確認完整後再匯入；來源主機不會寫入任何檔案。
   - **心跳鎖定預警**：自動檢查來源網站在 10 分鐘內是否有人正在編輯文章（`_edit_lock`），避免蓋掉正在撰寫的文章。
   - **SSH 金鑰解鎖整合**：金鑰有設定密碼時，會自動載入 `ssh-agent`，只需要輸入一次。
+  - **遠端以網站使用者身分讀取**：遠端傳送檔案的那一端以遠端網站使用者身分執行（`sudo -u`），遠端主機需要有 `sudo`。網站目錄不可是符號連結，擁有者必須是該網站使用者。裝置檔、FIFO、socket 不會被複製。
+  - 存取防護（`clp httpauth`、IP 白名單、Cloudflare-only）不會一起搬移，需要在新主機重新設定。
 
 #### ⑥ 啟用、停用與刪除網站
 
@@ -639,6 +645,7 @@ sudo clp site -cf-only=off -all
 - **批次確認**：批次變更前會列出要處理與略過的網站，需輸入 `yes` 確認；使用 `-y` 時直接執行，非互動模式沒有 `-y` 會報錯。
 - **封住 `X-Real-IP` 繞過**：CloudPanel 預設的 `/etc/nginx/nginx.conf` 有 `set_real_ip_from 0.0.0.0/0;`，任何人直連主機並帶上 `X-Real-IP: <Cloudflare IP>` 標頭都能繞過這個設定。開啟時，clp 會先詢問，再把這一行註解掉（保留原行，並加上 `# disabled by CLP Helper (cf-only)`；`-y` 時直接處理）。這會影響伺服器上所有網站；`127.0.0.1` 與私有網段仍受信任，所以 Varnish 不受影響。檔案會備份到同一個備份資料夾，`nginx -t` 失敗時自動還原。關閉最後一個網站時，clp 會詢問是否恢復這一行（預設不恢復；`-y` 時維持註解）。
 - **有 `real_ip_header` 時拒絕開啟**：如果 `nginx.conf` 有未註解、且不是 `X-Real-IP` 的 `real_ip_header`（例如為了顯示訪客真實 IP 而設的 `X-Forwarded-For`），nginx 會在檢查 Cloudflare 允許清單之前換掉來源位址，所有訪客都會被擋，所以 clp 不會開啟。
+- **不要與 IP 白名單同時使用**：同一網站有 Basic Auth 的 IP 白名單時（clp 的 `httpauth -whitelist`，或 CloudPanel 後台 Basic Auth 的 Whitelisted IPs），nginx 會把白名單（`satisfy any`）與 Cloudflare 允許清單合在一起判斷：經 Cloudflare 的訪客一律要密碼（主機看到的是 Cloudflare 的 IP，白名單比對不到）；直連主機的人只要密碼正確或 IP 在白名單內就能進入。CloudPanel 內建的 Basic Auth 與仍寫在 vhost 中的舊格式 clp httpauth 防護也是如此。兩者同時設定時 clp 會警告；需要只允許 Cloudflare 時，請清除白名單。放在 nginx hook 檔（⑪）中的 clp httpauth 防護不使用 `satisfy any`：直連一律被擋，白名單只對 nginx 看到的位址免輸入密碼。
 - **防火牆檢查**：這個設定不涵蓋 8080（nginx 後端）與 6081（Varnish）埠。UFW 未啟用或開放了這兩個埠時，clp 會顯示警告。
 
 #### ⑨ Varnish 快取沒有作用？(`clp site <domain> -varnish=status|fix`)
@@ -756,9 +763,39 @@ sudo clp site example.com -vhost=update -template=WordPress   # 明確指定範�
 - **狀態**：*最新*；*舊版官方範本*（與 clp 先前記錄過的某一版官方範本相同，可直接更新）；*有自訂修改*（與所有已知的官方版本都不同：在後台改過，或是 clp 開始記錄之前的官方版本；加 `-force` 才會覆蓋，會先備份）。比較時忽略換行字元、行尾空白與 `server_name` 那幾行。
 - clp 每天記錄 CloudPanel 的官方範本（`/etc/cron.d/clp-helper`，07:30，存在 `/root/.clp/vhost-templates/`）；安裝 clp 之前就已變更的版本無法辨識，會顯示為有自訂修改。
 - 2024-11 以前以 WordPress 範本建立的網站與目前的 WooCommerce 範本相同，會顯示為 WooCommerce；請加 `-template=WordPress` 更新。
-- **更新**：先把 CloudPanel 資料庫、網站範本與 vhost 備份到 `/root/.clp/vhost-backup/<時間>/<網域>/`，寫入新範本（保留網站自己的 `server_name`），再用 CloudPanel 自己的程式重新產生 vhost，與在後台 Vhost 分頁按儲存相同：Varnish、Cloudflare-only、Basic Auth 等設定依 CloudPanel 目前的設定產生（前端尚未經過 Varnish 的 Varnish 網站會開始經過 Varnish）。之後重新套用 clp httpauth 防護；這一步或 `nginx -t` 失敗時，範本與 vhost 都會還原。
+- **更新**：先把 CloudPanel 資料庫、網站範本與 vhost 備份到 `/root/.clp/vhost-backup/<時間>/<網域>/`，寫入新範本（保留網站自己的 `server_name`），再用 CloudPanel 自己的程式重新產生 vhost，與在後台 Vhost 分頁按儲存相同：Varnish、Cloudflare-only、Basic Auth 等設定依 CloudPanel 目前的設定產生（前端尚未經過 Varnish 的 Varnish 網站會開始經過 Varnish）。新範本會保留 clp 的 nginx hook（見 ⑪），放在 hook 檔中的防護不受影響；寫在 vhost 中的舊格式 clp httpauth 防護會在之後重新套用。這一步或 `nginx -t` 失敗時，範本與 vhost 都會還原。
 - clp 無法使用此 CloudPanel 版本的程式時，只更新資料庫中的範本，並請你到該網站的 Vhost 分頁按儲存。
 - 只支援 PHP 網站；已停用（`-off`）的網站要先啟用，因為重新產生 vhost 會讓它重新啟用。
+
+#### ⑪ nginx hooks：在 CloudPanel 後台儲存 vhost 也不會消失的設定 (`-nginx-hooks`)
+
+CloudPanel 會依資料庫中網站的範本重新產生 vhost（例如在後台 Vhost 分頁按儲存），只寫在 vhost 檔中的內容都會消失。nginx hooks 在每個網站的範本**與** vhost 中加入 clp 的 include，clp 的設定放在被 include 的 `/etc/nginx/clp-helper/` 檔案中，CloudPanel 不會動到。`clp httpauth` 需要先啟用。
+
+```bash
+sudo clp server -nginx-hooks=on                 # 在所有 PHP 網站加入 hook（會先詢問；-y 略過）
+sudo clp server -nginx-hooks=status             # 所有網站的狀態：已加入／未加入／已消失…
+sudo clp site example.com -nginx-hooks          # 加入單一網站（例如在 CloudPanel 後台建立的網站）
+sudo clp site example.com -nginx-hooks=off      # 移除單一網站的 hook
+sudo clp server -nginx-hooks=off                # 移除所有網站的 hook
+```
+
+- 加入的內容（範本的其他部分，包含你自己的修改，都不變）：
+  ```nginx
+  # --- CLP HELPER HOOKS (http) START ---                          （檔案最上面）
+  include /etc/nginx/clp-helper/sites/example.com/http/*.conf;
+  # --- CLP HELPER HOOKS (http) END ---
+    root /home/...;                                                （HTTPS server 區塊的 root 之後）
+    # --- CLP HELPER HOOKS START ---
+    include /etc/nginx/clp-helper/*.conf;
+    include /etc/nginx/clp-helper/sites/example.com/*.conf;
+    # --- CLP HELPER HOOKS END ---
+  ```
+- 範本以 CloudPanel 自己的程式寫入（無法使用此版本的程式時直接寫入資料庫）；vhost 檔只插入這幾行、不重新產生，不會順便套用上次儲存後才改變的其他 CloudPanel 設定。備份（CloudPanel 資料庫、範本、vhost）放在 `/root/.clp/vhost-backup/<時間>/<網域>/`；`nginx -t` 失敗時兩者都會還原。
+- 舊版寫在 vhost 中的 clp httpauth 防護，會在同一步驟移到 hook 檔，過程中網站不會有沒有防護的時間。
+- clp 建立的網站（`-new`、`-clone-from`、`-migrate`）會立即加入。在 CloudPanel 後台建立的網站不會（後台的 WordPress 精靈無法選擇範本）：請用 `clp site <網域> -nginx-hooks` 加入；`clp site -list` 會列出尚未加入的網站。
+- 之後 hook 消失時（例如在修改之前就開著的 Vhost 分頁按了儲存），clp 不會自動補回：`clp site -list`、`-nginx-hooks=status` 與 `httpauth -list=protected` 會顯示，並附上修復指令。
+- 網站還有 hook 檔（例如 httpauth 防護）時，`-off` 會拒絕，因為移除 include 會讓它們在不知情下失效。
+- 只支援範本中有唯一 HTTPS server 區塊、其中只有一行 `root` 的 PHP 網站；停用中的網站會跳過。
 
 ---
 
@@ -1175,7 +1212,13 @@ sudo clp restore example.com -type=archive -to=google
 
 ### 5. HTTP Basic 認證防護模組 (`clp httpauth`)
 
-針對網站提供密碼防護與存取控制，密碼檔放在網站使用者的家目錄（`/home/<user>/.htpasswd`），不在網站根目錄中：
+針對網站提供密碼防護與存取控制，密碼檔放在網站使用者的家目錄（`/home/<user>/.htpasswd`），不在網站根目錄中。
+
+**需要先啟用 nginx hooks**（`sudo clp server -nginx-hooks=on`，見網站管理 ⑪）：防護放在 `/etc/nginx/clp-helper/sites/<網域>/httpauth.conf`（IP 白名單在 `http/httpauth.conf`），在 CloudPanel 後台儲存 vhost 不會再讓防護消失。舊版寫在 vhost 中的防護仍可列出與關閉；`-nginx-hooks` 會把它移到 hook 檔。
+
+- 不使用 `satisfy any`：被拒絕的位置（`.git`、`xmlrpc.php`）與在 CloudPanel 封鎖的 IP，對白名單 IP 與知道密碼的人都維持拒絕。
+- 路徑防護只加上密碼；路徑底下的請求仍由網站原本的 location 處理（靜態檔、wp-admin、被拒絕的位置）。
+- 不要與 CloudPanel 內建的 Basic Auth（網站 → Security）同時使用：它啟用時 clp 會拒絕開啟防護；之後才在後台啟用時，CloudPanel 的 `nginx -t` 會失敗。
 
 #### ① 帳號管理
 
@@ -1237,7 +1280,7 @@ sudo clp httpauth example.com -path=/staging
 
 #### ④ IP / 網段免密碼白名單 (`-whitelist`)
 
-設定固定 IP 或公司網段免密碼直接通行（Nginx `satisfy any` 機制）：
+設定固定 IP 或公司網段免密碼直接通行（nginx `geo` 清單；白名單 IP 只是免輸入密碼，被拒絕的位置仍然拒絕）：
 
 > **防止偽造**：CloudPanel 的 `/etc/nginx/nginx.conf` 設有 `set_real_ip_from 0.0.0.0/0`，任何人帶上 `X-Real-IP: <白名單 IP>` 就能略過密碼。指令會寫入白名單時（`-whitelist=<ip>`，或網站已有白名單時的 `-wp-admin`／`-path`），CLP Helper 會說明並把這一行註解掉（先詢問，預設是；`-y` 直接處理；非互動模式沒有 `-y` 時在任何變更前停止）。這會影響伺服器上所有網站，127.0.0.1 與私有網段仍受信任；備份在 `/root/.clp/httpauth-backup/<時間>/`。該行仍生效時，`-list=protected` 會顯示警告。
 
@@ -1540,8 +1583,10 @@ clp-helper/
 │   ├── config.sh            # 全域設定管理模組 (偏好設定與金鑰持久化)
 │   ├── core.sh              # 核心共用庫 (日誌、權限檢查、網域拼字建議、DB 存取)
 │   ├── httpauth.sh          # HTTP Basic 認證防護與 IP 白名單
-│   ├── httpauth_vhost.py    # Nginx vhost HTTP 認證設定注入與還原輔助模組
+│   ├── httpauth_hook.py     # httpauth 的 nginx hook 檔（防護、IP 白名單）
+│   ├── httpauth_vhost.py    # vhost 中舊格式的 HTTP 認證區塊（列出、移除、遷移）
 │   ├── i18n.sh              # 國際化多語系 (i18n) 執行引擎
+│   ├── nginx_hooks.sh       # CloudPanel vhost 範本中的 nginx hook（-nginx-hooks）
 │   ├── php_fpm.sh           # PHP-FPM 行程池動態偵測與調校
 │   ├── server.sh            # 伺服器維運、安全加固與 17 模組安裝器
 │   └── site.sh              # 網站管理模組 (建立、停啟用、複製、搬移、刪除)

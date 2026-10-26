@@ -17,10 +17,18 @@ Usage (root; the database is opened read-only, nothing is written to it):
   vhost_tpl.py current --domain D                     (stdin: export JSON) the site's template on stdout
   vhost_tpl.py backup-db --db DB --dest FILE          sqlite backup of the database (read-only source)
   vhost_tpl.py set-template --db DB --domain D        (stdin: template) fallback writer, run as the clp user
+  vhost_tpl.py hooks-add --domain D [--file F]        template (stdin: export JSON) or file F with the clp
+                                                      nginx hook lines (plan 51) on stdout
+  vhost_tpl.py hooks-remove --domain D [--file F]     the same without the hook lines
+  vhost_tpl.py hooks-state [--domain D] [--file F]    on | partial | none (export JSON: "<domain>\t<state>" lines)
+  vhost_tpl.py hooks-report --vhost-dir DIR [--domain D]  (stdin: export JSON) one line per site, tab separated:
+                                                      <domain> <php|other> <template state> <vhost state|disabled>
 
-Comparison ignores CR/LF differences, trailing whitespace and trailing blank lines, and treats every
-"server_name ...;" line as {{server_name}}. The template that is written is the official text itself.
-Exit status: 0 ok, 1 error, 2 usage / site not found, 3 server_name lines cannot be mapped
+Comparison ignores CR/LF differences, trailing whitespace, trailing blank lines and the clp hook lines,
+and treats every "server_name ...;" line as {{server_name}}. The template that is written is the official
+text itself (plus the hook lines when the site had them).
+Exit status: 0 ok, 1 error, 2 usage / site not found, 3 server_name lines cannot be mapped /
+             no place for the hook lines
 """
 import datetime
 import difflib
@@ -35,6 +43,16 @@ import tempfile
 SERVER_NAME_RE = re.compile(r'^(\s*)server_name\s+[^;{}]*;\s*$')
 PLACEHOLDER_RE = re.compile(r'^(\s*)\{\{server_name\}\}\s*$')
 SAFE_NAME_RE = re.compile(r'[^A-Za-z0-9._-]+')
+DOMAIN_RE = re.compile(r'^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$')
+
+# clp nginx hooks (plan 51): an http-level include at the top of the file and a server-level include
+# right after the root line of the HTTPS server block
+HOOK_DIR = '/etc/nginx/clp-helper'
+HOOK_HTTP_START = '# --- CLP HELPER HOOKS (http) START ---'
+HOOK_HTTP_END = '# --- CLP HELPER HOOKS (http) END ---'
+HOOK_START = '# --- CLP HELPER HOOKS START ---'
+HOOK_END = '# --- CLP HELPER HOOKS END ---'
+ROOT_LINE_RE = re.compile(r'^\s*(\{\{root\}\}|root\s+[^;{}]+;\s*(#.*)?)\s*$')
 
 
 def fail(msg, code=1):
@@ -52,7 +70,7 @@ def lines_of(text):
 
 def normalize(text):
     out = []
-    for line in lines_of(text):
+    for line in lines_of(strip_hooks(text)):
         m = SERVER_NAME_RE.match(line)
         out.append(m.group(1) + '{{server_name}}' if m else line)
     return out
@@ -125,8 +143,169 @@ def classify(site, templates, archive):
     return 'custom', best, changed_lines(norm, current[best]) if names else 0
 
 
+# ---------------------------------------------------------------------------
+# clp nginx hooks
+# ---------------------------------------------------------------------------
+def code_mask(text):
+    """text with quoted strings, # comments and {{placeholders}} blanked out (same length),
+    so that braces can be counted"""
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '{' and text.startswith('{{', i):
+            j = text.find('}}', i + 2)
+            if j != -1 and '\n' not in text[i:j]:
+                for k in range(i, j + 2):
+                    out[k] = ' '
+                i = j + 2
+                continue
+        if c in '"\'':
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == '\\' else 1
+            for k in range(i, min(j + 1, n)):
+                if out[k] != '\n':
+                    out[k] = ' '
+            i = j + 1
+            continue
+        if c == '#':
+            j = text.find('\n', i)
+            j = n if j == -1 else j
+            for k in range(i, j):
+                out[k] = ' '
+            i = j
+            continue
+        i += 1
+    return ''.join(out)
+
+
+def hook_blocks(lines):
+    """[(start, end, kind)] of the hook blocks in a list of lines (kind 'http' or 'server');
+    raises ValueError on an unterminated block"""
+    blocks = []
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if s in (HOOK_HTTP_START, HOOK_START):
+            end_marker = HOOK_HTTP_END if s == HOOK_HTTP_START else HOOK_END
+            j = i + 1
+            while j < len(lines) and lines[j].strip() != end_marker:
+                j += 1
+            if j >= len(lines):
+                raise ValueError("unterminated clp hook block")
+            blocks.append((i, j, 'http' if s == HOOK_HTTP_START else 'server'))
+            i = j + 1
+            continue
+        if s in (HOOK_HTTP_END, HOOK_END):
+            raise ValueError("clp hook end marker without start")
+        i += 1
+    return blocks
+
+
+def strip_hooks(text):
+    lines = text.splitlines(True)
+    try:
+        blocks = hook_blocks(lines)
+    except ValueError:
+        return text
+    for s, e, _ in reversed(blocks):
+        del lines[s:e + 1]
+    return ''.join(lines)
+
+
+def hooks_state(text):
+    try:
+        kinds = {k for _, _, k in hook_blocks(text.splitlines(True))}
+    except ValueError:
+        return 'partial'
+    if kinds == {'http', 'server'}:
+        return 'on'
+    return 'partial' if kinds else 'none'
+
+
+def https_root_line(text):
+    """Index (in text.splitlines(True)) of the root line of the one server block that listens on 443
+    and not on 8080; None when there is not exactly one such block or root line"""
+    mask = code_mask(text)
+    depth_at = []
+    depth = 0
+    for c in mask:
+        depth_at.append(depth)
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+    candidates = []
+    for m in re.finditer(r'(?<![\w$])server\s*\{', mask):
+        if depth_at[m.start()] != 0:
+            continue
+        open_idx = mask.index('{', m.start())
+        close_idx = open_idx + 1
+        while close_idx < len(mask) and not (mask[close_idx] == '}' and depth_at[close_idx] == 1):
+            close_idx += 1
+        if close_idx >= len(mask):
+            return None
+        top = ''.join(ch for k, ch in enumerate(mask[open_idx + 1:close_idx], open_idx + 1)
+                      if depth_at[k] == 1 and ch not in '{}')
+        listens = re.findall(r'(?:^|[;\s])listen\s+([^;]*);', top)
+        if any(re.search(r'(?<![\d.])443(?!\d)', l) for l in listens) and \
+                not any(re.search(r'(?<![\d.])8080(?!\d)', l) for l in listens):
+            candidates.append((open_idx, close_idx))
+    if len(candidates) != 1:
+        return None
+    open_idx, close_idx = candidates[0]
+    found = []
+    pos = 0
+    for idx, line in enumerate(text.splitlines(True)):
+        if open_idx < pos < close_idx and depth_at[pos] == 1 and ROOT_LINE_RE.match(line.rstrip('\r\n')):
+            found.append(idx)
+        pos += len(line)
+    return found[0] if len(found) == 1 else None
+
+
+def add_hooks(text, domain):
+    """text with the clp hook lines (existing ones are replaced); None when there is no place for them"""
+    if not DOMAIN_RE.match(domain):
+        raise ValueError("invalid domain")
+    # 標記不成對時 strip_hooks 不會改動，下面的檢查會拒絕
+    base = strip_hooks(text)
+    if hooks_state(base) != 'none':
+        return None
+    lines = base.splitlines(True)
+    idx = https_root_line(base)
+    if idx is None:
+        return None
+    eol = '\r\n' if lines[idx].endswith('\r\n') else '\n'
+    root = lines[idx]
+    if not root.endswith('\n'):
+        root += eol
+    indent = re.match(r'[ \t]*', root).group(0)
+    server = [indent + l + eol for l in (HOOK_START,
+                                         'include %s/*.conf;' % HOOK_DIR,
+                                         'include %s/sites/%s/*.conf;' % (HOOK_DIR, domain),
+                                         HOOK_END)]
+    lines[idx:idx + 1] = [root] + server
+    first_eol = '\r\n' if lines[0].endswith('\r\n') else '\n'
+    http = [l + first_eol for l in (HOOK_HTTP_START,
+                                    'include %s/sites/%s/http/*.conf;' % (HOOK_DIR, domain),
+                                    HOOK_HTTP_END)]
+    return ''.join(http + lines)
+
+
 def build(site, official):
-    """The official template with {{server_name}} replaced by the site's own server_name lines"""
+    """The official template with {{server_name}} replaced by the site's own server_name lines
+    (and the clp hook lines when the site has them)"""
+    text = build_plain(site, official)
+    if hooks_state(site.get('template', '')) != 'none':
+        hooked = add_hooks(text, site['domain'])
+        if hooked is None:
+            fail("no place for the clp hook lines in the template", 3)
+        return hooked
+    return text
+
+
+def build_plain(site, official):
     site_names = [l.strip() for l in lines_of(site.get('template', '')) if SERVER_NAME_RE.match(l)]
     out_lines = official.split('\n')
     slots = [i for i, l in enumerate(out_lines) if PLACEHOLDER_RE.match(l)]
@@ -253,13 +432,58 @@ def cmd_set_template(db, domain):
     print("ok")
 
 
+def hook_source(domain, path):
+    """Text of file F, or the site's template from the export JSON on stdin"""
+    if path:
+        with open(path, encoding='utf-8', errors='surrogateescape', newline='') as f:
+            return f.read()
+    return find_site(read_export(), domain).get('template', '')
+
+
+def cmd_hooks_report(vhost_dir, domain=None):
+    """<domain> <php|other> <template state> <vhost state|disabled> for each site (stdin: export JSON)"""
+    data = read_export()
+    sites = [find_site(data, domain)] if domain else data['sites']
+    for s in sites:
+        d = s.get('domain', '')
+        kind = 'php' if str(s.get('type', '')).lower() == 'php' else 'other'
+        vstate = 'disabled'
+        p = os.path.join(vhost_dir, d + '.conf')
+        if DOMAIN_RE.match(d) and os.path.isfile(p):
+            with open(p, encoding='utf-8', errors='surrogateescape', newline='') as f:
+                vstate = hooks_state(f.read())
+        print("%s\t%s\t%s\t%s" % (d, kind, hooks_state(s.get('template', '')), vstate))
+
+
+def cmd_hooks(cmd, domain, path):
+    if cmd == 'hooks-state':
+        if path or domain:
+            print(hooks_state(hook_source(domain, path)))
+        else:
+            for s in read_export()['sites']:
+                print("%s\t%s" % (s['domain'], hooks_state(s.get('template', ''))))
+        return
+    if not domain or not DOMAIN_RE.match(domain):
+        fail("invalid domain", 2)
+    text = hook_source(domain, path)
+    if cmd == 'hooks-remove':
+        if hooks_state(text) == 'partial' and strip_hooks(text) == text:
+            fail("unbalanced clp hook markers", 3)
+        out = strip_hooks(text)
+    else:
+        out = add_hooks(text, domain)
+        if out is None:
+            fail("no place for the clp hook lines (one HTTPS server block with one root line is required)", 3)
+    sys.stdout.buffer.write(out.encode('utf-8', 'surrogateescape'))
+
+
 def main(argv):
     args = {}
     cmd = argv[1] if len(argv) > 1 else ''
     rest = argv[2:]
     i = 0
     while i < len(rest):
-        if rest[i] in ('--db', '--state', '--domain', '--name', '--dest') and i + 1 < len(rest):
+        if rest[i] in ('--db', '--state', '--domain', '--name', '--dest', '--file', '--vhost-dir') and i + 1 < len(rest):
             args[rest[i][2:]] = rest[i + 1]
             i += 2
         else:
@@ -281,6 +505,10 @@ def main(argv):
             cmd_backup_db(args['db'], args['dest'])
         elif cmd == 'set-template' and 'db' in args and 'domain' in args:
             cmd_set_template(args['db'], args['domain'])
+        elif cmd == 'hooks-report' and 'vhost-dir' in args:
+            cmd_hooks_report(args['vhost-dir'], args.get('domain'))
+        elif cmd in ('hooks-add', 'hooks-remove', 'hooks-state'):
+            cmd_hooks(cmd, args.get('domain'), args.get('file'))
         else:
             fail(__doc__, 2)
     except (OSError, sqlite3.Error) as e:

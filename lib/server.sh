@@ -54,6 +54,8 @@ show_server_help() {
   echo -e "  ${C_GREEN}-timezone${C_NC}    $(_t "SERVER_HELP_DESC_TIMEZONE")"
   echo -e "  ${C_GREEN}-smtp${C_NC}        $(_t "SERVER_HELP_DESC_SMTP")"
   echo -e "  ${C_GREEN}-clean${C_NC}       $(_t "SERVER_HELP_DESC_CLEAN")"
+  echo -e "  ${C_GREEN}-nginx-hooks=on|off|status${C_NC}"
+  echo -e "               $(_t "SERVER_HELP_DESC_NGINX_HOOKS")"
   echo ""
   echo -e "${C_DIM}$(_t "SERVER_HELP_HINT_DASH")${C_NC}"
   echo ""
@@ -3955,6 +3957,7 @@ server_handler() {
       dns)      action="dns";      used_pos+=("${POSITIONAL[0]}") ;;
       timezone) action="timezone"; used_pos+=("${POSITIONAL[0]}") ;;
       smtp)     action="smtp";     used_pos+=("${POSITIONAL[0]}") ;;
+      nginx-hooks|nginx_hooks) action="nginx_hooks"; used_pos+=("${POSITIONAL[0]}") ;;
       *)        ;;
     esac
   fi
@@ -3990,6 +3993,8 @@ server_handler() {
       action="timezone"
     elif has_opt "smtp"; then
       action="smtp"
+    elif has_opt "nginx-hooks" || has_opt "nginx_hooks"; then
+      action="nginx_hooks"
     fi
   fi
 
@@ -3999,7 +4004,7 @@ server_handler() {
   fi
 
   # 4. 驗證位置參數是否有多餘項
-  reject_extra_positionals raw_args "install|harden|unharden|status|audit|clean|ufw|ssh|fail2ban|dns|timezone|smtp|y|yes|dry-run|force" "${used_pos[@]}" || return 1
+  reject_extra_positionals raw_args "install|harden|unharden|status|audit|clean|ufw|ssh|fail2ban|dns|timezone|smtp|nginx-hooks|nginx_hooks|y|yes|dry-run|force" "${used_pos[@]}" || return 1
 
   # 5. 前置權限檢查 (所有 server 指令皆須 root 身分)
   check_root
@@ -4042,6 +4047,18 @@ server_handler() {
       ;;
     smtp)
       server_smtp "$@"
+      ;;
+    nginx_hooks)
+      # nginx hooks（計畫 51）：在所有網站的 vhost 範本與 vhost 加入／移除 clp 的 include
+      local nh_val
+      nh_val=$(opt_get "nginx-hooks" "$(opt_get "nginx_hooks" "status")")
+      [[ "$nh_val" == "true" ]] && nh_val="status"
+      nh_val=$(echo "$nh_val" | tr '[:upper:]' '[:lower:]')
+      if ! declare -F nginx_hooks_server_cmd >/dev/null; then
+        # shellcheck source=/dev/null
+        source "${CLP_LIB_DIR}/nginx_hooks.sh"
+      fi
+      nginx_hooks_server_cmd "$nh_val"
       ;;
     clean)
       server_clean "$@"

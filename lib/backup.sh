@@ -375,12 +375,13 @@ backup_db_load() {
   local db_creds="$1" sql_file="$2" who
   local reader=(cat "$sql_file")
   [[ "$sql_file" == *.gz ]] && reader=(gunzip -c "$sql_file")
+  mysql_no_cmds_opt
   for who in site root; do
     [[ "$who" == "root" ]] && ! backup_db_root_allowed && break
     local err_out=/dev/null
     [[ "$who" == "root" ]] && err_out=/dev/stderr
     if backup_db_conn "$db_creds" "$who" && \
-       "${reader[@]}" | MYSQL_PWD="$BACKUP_DB_PASS" mysql "${BACKUP_DB_ARGS[@]}" "$BACKUP_DB_NAME" 2>"$err_out"; then
+       "${reader[@]}" | MYSQL_PWD="$BACKUP_DB_PASS" mysql "${BACKUP_DB_ARGS[@]}" "$CLP_MYSQL_NO_CMDS_OPT" "$BACKUP_DB_NAME" 2>"$err_out"; then
       return 0
     fi
   done
@@ -396,8 +397,9 @@ backup_db_drop_all_tables() {
     tables=$(MYSQL_PWD="$BACKUP_DB_PASS" mysql "${BACKUP_DB_ARGS[@]}" -N -B -e "SHOW TABLES" "$BACKUP_DB_NAME" 2>/dev/null) || continue
     [[ -z "$tables" ]] && return 0
     sql="SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS $(awk '{ gsub(/`/, "``"); printf "%s`%s`", (NR > 1 ? ", " : ""), $0 }' <<< "$tables");"
-    # 由 stdin 傳入（資料表很多時 -e 參數可能超過長度上限）
-    printf '%s\n' "$sql" | MYSQL_PWD="$BACKUP_DB_PASS" mysql "${BACKUP_DB_ARGS[@]}" "$BACKUP_DB_NAME" 2>/dev/null && return 0
+    # 由 stdin 傳入（資料表很多時 -e 參數可能超過長度上限）；資料表名稱由網站決定，同樣停用用戶端指令
+    mysql_no_cmds_opt
+    printf '%s\n' "$sql" | MYSQL_PWD="$BACKUP_DB_PASS" mysql "${BACKUP_DB_ARGS[@]}" "$CLP_MYSQL_NO_CMDS_OPT" "$BACKUP_DB_NAME" 2>/dev/null && return 0
   done
   return 1
 }

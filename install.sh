@@ -6,8 +6,8 @@
 
 set -euo pipefail
 
-CLP_VERSION="1.3.1"
-CLP_BUILD_TIME="2026-10-26 09:45:57"
+CLP_VERSION="1.3.2"
+CLP_BUILD_TIME="2026-10-26 22:20:39"
 
 # Colors
 C_RED=$'\033[0;31m'
@@ -17,7 +17,8 @@ C_CYAN=$'\033[0;36m'
 C_BOLD=$'\033[1m'
 C_NC=$'\033[0m'
 
-CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 實體路徑：來源檢查（第 7.1 節）與之後的執行、複製都用同一個路徑，不經過 symlink
+CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TARGET_DIR="/usr/local/lib/clp-helper"
 LEGACY_TARGET_DIR="/home/clp/clp"
 
@@ -166,6 +167,12 @@ if [[ "$LANG_CODE" == "zh_TW" ]]; then
   MSG_UNINSTALL_LEFTOVERS="以下資料未刪除（可能包含 Cloudflare API Token 等機密），若不再需要請手動移除："
   MSG_SRC_ERR_TITLE="[ERROR] 在目前目錄 (%s) 找不到 clp.sh、lib 或 locales 目錄！\n"
   MSG_SRC_ERR_DESC="請確認您是在完整解壓縮的 CLP Helper 專案目錄內執行安裝程式: sudo bash install.sh\n"
+  MSG_SRC_UNSAFE_TITLE="[ERROR] 安裝來源不安全，已停止：%s（%s）\n"
+  MSG_SRC_UNSAFE_DESC="安裝程式會以 root 執行並安裝這個目錄中的檔案；其他帳號能修改或替換它時，就能以 root 執行程式。\n請改用一行安裝（get.sh），或把專案放到 root 或您自己擁有的目錄（例如 /root）後再執行 sudo bash install.sh。\n"
+  MSG_SRC_UNSAFE_OWNER="擁有者不是 root 或執行 sudo 的使用者"
+  MSG_SRC_UNSAFE_OTHER_W="其他使用者可寫入"
+  MSG_SRC_UNSAFE_GROUP_W="非擁有者私人群組的群組可寫入"
+  MSG_SRC_UNSAFE_SYMLINK="是 symlink"
   MSG_BANNER_TITLE="          CLP Helper (clp) 安裝程式"
   MSG_SOURCE_DIR="安裝來源目錄: %s\n"
   MSG_TARGET_DIR="安裝目標目錄: %s\n"
@@ -202,6 +209,12 @@ else
   MSG_UNINSTALL_LEFTOVERS="The following data was kept (it may contain secrets such as the Cloudflare API token). Remove it manually if no longer needed:"
   MSG_SRC_ERR_TITLE="[ERROR] clp.sh, lib, or locales directory not found in current directory (%s)!\n"
   MSG_SRC_ERR_DESC="Please ensure you are running the installer from the extracted CLP Helper project directory: sudo bash install.sh\n"
+  MSG_SRC_UNSAFE_TITLE="[ERROR] Unsafe installation source, stopping: %s (%s)\n"
+  MSG_SRC_UNSAFE_DESC="The installer runs and installs the files in this directory as root; any account that can modify or replace them could run code as root.\nUse the one-line install (get.sh), or move the project to a directory owned by root or by you (for example /root) and run sudo bash install.sh again.\n"
+  MSG_SRC_UNSAFE_OWNER="not owned by root or by the sudo user"
+  MSG_SRC_UNSAFE_OTHER_W="writable by other users"
+  MSG_SRC_UNSAFE_GROUP_W="writable by a group other than the owner's private group"
+  MSG_SRC_UNSAFE_SYMLINK="is a symlink"
   MSG_BANNER_TITLE="          CLP Helper (clp) Installer"
   MSG_SOURCE_DIR="Installation source: %s\n"
   MSG_TARGET_DIR="Installation target: %s\n"
@@ -301,6 +314,70 @@ if [[ "${CURRENT_DIR}" != "${TARGET_DIR}" ]]; then
     exit 1
   fi
 fi
+
+# ------------------------------------------------------------------------------
+# 7.1 Check Source Tree Ownership
+#     安裝程式以 root 執行來源中的 lib/conf_install.sh，並把來源複製到 TARGET_DIR：
+#     其他帳號能修改或替換來源（例如放在網站使用者的家目錄）時，就能以 root 執行程式。
+#     來源目錄到 / 的每一層、以及要複製的每個項目：擁有者為 root 或 SUDO_UID；不可 other 可寫
+#     （root 擁有且有 sticky 的目錄如 /tmp 例外）；group 可寫只限擁有者的私人群組；不可有 symlink。
+#     GitHub tarball 為 uid 0、664／775；一般使用者（umask 002）的 git clone／tar 為自己擁有＋私人群組，都會通過。
+# ------------------------------------------------------------------------------
+declare -A src_private_gid=()
+src_reason=""
+# src_check_entry <path>：不安全時設定 src_reason
+src_check_entry() {
+  local p="$1" s_uid s_gid s_mode mode
+  src_reason=""
+  if [[ -L "$p" ]]; then
+    src_reason="$MSG_SRC_UNSAFE_SYMLINK"
+    return 0
+  fi
+  if ! read -r s_uid s_gid s_mode < <(stat -c '%u %g %a' -- "$p" 2>/dev/null); then
+    src_reason="$MSG_SRC_UNSAFE_OWNER"
+    return 0
+  fi
+  mode=$((8#$s_mode))
+  if [[ "$s_uid" != "0" && "$s_uid" != "${SUDO_UID:-0}" ]]; then
+    src_reason="$MSG_SRC_UNSAFE_OWNER"
+  elif (( mode & 8#0002 )) && ! { [[ -d "$p" && "$s_uid" == "0" ]] && (( mode & 8#1000 )); }; then
+    src_reason="$MSG_SRC_UNSAFE_OTHER_W"
+  elif (( mode & 8#0020 )); then
+    if [[ -z "${src_private_gid[$s_uid]+set}" ]]; then
+      local pw owner_name owner_gid group_name
+      pw="$(getent passwd "$s_uid" || true)"
+      owner_name="${pw%%:*}"
+      owner_gid="$(cut -d: -f4 <<< "$pw")"
+      group_name="$(getent group "$owner_gid" | cut -d: -f1 || true)"
+      src_private_gid[$s_uid]=""
+      [[ -n "$owner_name" && "$group_name" == "$owner_name" ]] && src_private_gid[$s_uid]="$owner_gid"
+    fi
+    if [[ -z "${src_private_gid[$s_uid]}" || "$s_gid" != "${src_private_gid[$s_uid]}" ]]; then
+      src_reason="$MSG_SRC_UNSAFE_GROUP_W"
+    fi
+  fi
+  return 0
+}
+src_unsafe() {
+  echo -e "${C_RED}$(printf "${MSG_SRC_UNSAFE_TITLE}" "$1" "$src_reason")${C_NC}" >&2
+  echo -e "$(printf "${MSG_SRC_UNSAFE_DESC}")" >&2
+  exit 1
+}
+src_path="$CURRENT_DIR"
+while :; do
+  src_check_entry "$src_path"
+  [[ -n "$src_reason" ]] && src_unsafe "$src_path"
+  [[ "$src_path" == "/" ]] && break
+  src_path="$(dirname "$src_path")"
+done
+src_items=()
+for src_item in clp.sh install.sh README*.md LICENSE lib templates locales; do
+  [[ -e "${CURRENT_DIR}/${src_item}" || -L "${CURRENT_DIR}/${src_item}" ]] && src_items+=("${CURRENT_DIR}/${src_item}")
+done
+while IFS= read -r -d '' src_path; do
+  src_check_entry "$src_path"
+  [[ -n "$src_reason" ]] && src_unsafe "$src_path"
+done < <(find "${src_items[@]}" -print0)
 
 # ------------------------------------------------------------------------------
 # 8. Display Installer Header

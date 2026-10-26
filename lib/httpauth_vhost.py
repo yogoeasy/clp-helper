@@ -9,6 +9,7 @@ Usage:
   httpauth_vhost.py path-off    <vhost> <path>
   httpauth_vhost.py clear-paths <vhost>
   httpauth_vhost.py refresh     <vhost> <htpasswd> <whitelist_directives>
+  httpauth_vhost.py strip-legacy <vhost> <siteuser>   vhost without CLP HTTPAUTH blocks on stdout
 
 Block layout managed by CLP:
   - WPADMIN: auth directives between "# --- CLP HTTPAUTH WPADMIN START/END ---"
@@ -31,10 +32,10 @@ import sys
 import tempfile
 import textwrap
 
-ROOT_RE = re.compile(r'(?:^[ \t]*\n)?^[ \t]*# --- CLP HTTPAUTH ROOT START ---.*?# --- CLP HTTPAUTH ROOT END ---[ \t]*\n',
+ROOT_RE = re.compile(r'(?:^[ \t]*\r?\n)?^[ \t]*# --- CLP HTTPAUTH ROOT START ---.*?# --- CLP HTTPAUTH ROOT END ---[ \t]*\r?\n',
                      re.DOTALL | re.MULTILINE)
-WPADMIN_RE = re.compile(r'[ \t]*# --- CLP HTTPAUTH WPADMIN START ---.*?# --- CLP HTTPAUTH WPADMIN END ---[ \t]*\n', re.DOTALL)
-AUTH_RE = re.compile(r'[ \t]*# --- CLP HTTPAUTH AUTH START ---.*?# --- CLP HTTPAUTH AUTH END ---[ \t]*\n', re.DOTALL)
+WPADMIN_RE = re.compile(r'[ \t]*# --- CLP HTTPAUTH WPADMIN START ---.*?# --- CLP HTTPAUTH WPADMIN END ---[ \t]*\r?\n', re.DOTALL)
+AUTH_RE = re.compile(r'[ \t]*# --- CLP HTTPAUTH AUTH START ---.*?# --- CLP HTTPAUTH AUTH END ---[ \t]*\r?\n', re.DOTALL)
 # 只移除「整行」的存取控制指令 (B-7)：避免切斷 add_header ... "no-auth_basic" 之類的指令
 ACCESS_LINE_RE = re.compile(r'^\s*(auth_basic(_user_file)?|satisfy|allow|deny)\b[^;{}]*;\s*(#.*)?$')
 # 同時比對 wp-admin 與 wp-login 的 regex location（含自訂寫法），避免另外新增一個排在後面而無效的 location；
@@ -323,7 +324,7 @@ def path_block(path, htpasswd, wl, pass_dirs):
 
 def path_region_re(path):
     p = re.escape(path)
-    return re.compile(rf'[ \t]*# --- CLP HTTPAUTH PATH: {p} START ---.*?# --- CLP HTTPAUTH PATH: {p} END ---[ \t]*\n(?:[ \t]*\n)?',
+    return re.compile(rf'[ \t]*# --- CLP HTTPAUTH PATH: {p} START ---.*?# --- CLP HTTPAUTH PATH: {p} END ---[ \t]*\r?\n(?:[ \t]*\r?\n)?',
                       re.DOTALL)
 
 
@@ -356,17 +357,22 @@ def cmd_wpadmin_on(vhost, htpasswd, wl):
     return 0
 
 
-def cmd_wpadmin_off(vhost, siteuser):
-    content = read(vhost)
-    default_comment = (f'    #auth_basic "Restricted Area";\n'
-                       f'    #auth_basic_user_file /home/{siteuser}/.htpasswd;\n')
+def remove_wpadmin_block(content, siteuser):
+    """Remove the WPADMIN block; put back the template's commented auth lines when they are gone"""
+    nl = '\r\n' if '\r\n' in content else '\n'
+    default_comment = (f'    #auth_basic "Restricted Area";{nl}'
+                       f'    #auth_basic_user_file /home/{siteuser}/.htpasswd;{nl}')
 
     def replace_block(m):
         # 若同一 location 內仍保有範本原本的註解行（新版啟用時不會移除），只需移除 CLP 區塊
         after = content[m.end():m.end() + 300]
         return '' if re.match(r'\s*#\s*auth_basic\b', after) else default_comment
 
-    content = WPADMIN_RE.sub(replace_block, content)
+    return WPADMIN_RE.sub(replace_block, content)
+
+
+def cmd_wpadmin_off(vhost, siteuser):
+    content = remove_wpadmin_block(read(vhost), siteuser)
     # Comment out any remaining active auth lines inside the wp-admin location
     m = search_wpadmin_loc(content)
     if m:
@@ -417,7 +423,7 @@ def cmd_path_off(vhost, path):
 
 def cmd_clear_paths(vhost):
     content = read(vhost)
-    content = re.sub(r'[ \t]*# --- CLP HTTPAUTH PATH: (?!ROOT|WPADMIN)(.*?) START ---.*?# --- CLP HTTPAUTH PATH: \1 END ---[ \t]*\n(?:[ \t]*\n)?',
+    content = re.sub(r'[ \t]*# --- CLP HTTPAUTH PATH: (?!ROOT|WPADMIN)(.*?) START ---.*?# --- CLP HTTPAUTH PATH: \1 END ---[ \t]*\r?\n(?:[ \t]*\r?\n)?',
                      '', content, flags=re.DOTALL)
     write(vhost, content)
     return 0
@@ -477,6 +483,22 @@ def cmd_refresh(vhost, htpasswd, wl):
     return 0
 
 
+def cmd_strip_legacy(vhost, siteuser):
+    """Write the vhost without any CLP HTTPAUTH block to stdout (migration to the hook files, plan 51).
+    Line endings are kept; the 'auth_basic off;' lines added to deny-all locations are left alone."""
+    with open(vhost, 'r', encoding='utf-8', errors='surrogateescape', newline='') as f:
+        content = f.read()
+    content = ROOT_RE.sub('', content)
+    for path in re.findall(r'# --- CLP HTTPAUTH PATH: (.*?) START ---', content):
+        content = path_region_re(path).sub('', content)
+    content = remove_wpadmin_block(content, siteuser)
+    if '# --- CLP HTTPAUTH ' in content:
+        sys.stderr.write('httpauth_vhost.py strip-legacy: unrecognised CLP HTTPAUTH markers left\n')
+        return 1
+    sys.stdout.buffer.write(content.encode('utf-8', 'surrogateescape'))
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
         sys.stderr.write(__doc__)
@@ -489,6 +511,7 @@ def main(argv):
         'path-off': (cmd_path_off, 2),
         'clear-paths': (cmd_clear_paths, 1),
         'refresh': (cmd_refresh, 3),
+        'strip-legacy': (cmd_strip_legacy, 2),
     }
     if cmd not in handlers or len(args) != handlers[cmd][1]:
         sys.stderr.write(__doc__)

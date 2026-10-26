@@ -122,6 +122,8 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 
 You can delete the `clp-helper` directory after installation.
 
+**Source directory check**: the installer runs and installs the source files as root, so it stops if another account could modify or replace them. The source directory and every directory above it, as well as every installed file, must be owned by root or by the user running `sudo`; they must not be writable by other users (root-owned sticky directories such as `/tmp` are fine), may be group-writable only for the owner's own private group, and must not include symlinks. All three methods above pass; do not extract or clone into another account's directory (for example a CloudPanel site user's home) and install from there.
+
 **Interface language**: append `--lang=en_US` (or `--lang=zh_TW`) to any of the commands above, e.g. `sudo bash clp-get.sh --lang=zh_TW`.
 
 The installer will automatically:
@@ -141,7 +143,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.3.1 (build 2026-10-26 09:45:57)`
+Output example:`CLP Helper v1.3.2 (build 2026-10-26 22:20:39)`
 
 Display global help menu:
 
@@ -476,6 +478,8 @@ sudo clp site -clone-from=example.com new-example.com -user=newuser -php=8.4
   - Automatically injects unique random salt (`WP_CACHE_KEY_SALT`) for Redis cache to prevent cross-site cache poisoning.
   - WP-CLI deep URL replacement and automatic correction of Sitemap URLs in `robots.txt`. Only URLs are replaced (`https://`, `http://`, `//` and the JSON-escaped `https:\/\/` used by Elementor, with or without `www.`); `www.` URLs become the new domain without `www.`, and `http://` URLs become `https://`. E-mail addresses, plain-text domain names and post GUIDs are not changed. The site's absolute path in the database (for example plugin settings) is replaced as well; for a same-domain migration only the path is replaced.
   - Known limits: a URL of another domain that starts with the source domain (for example `https://example.com.tw` when cloning `example.com`) is also changed; URL-encoded links (`https%3A%2F%2F…`) and URLs written in a different letter case are not changed. It runs `wp search-replace` about ten times; most runs find nothing, and on a 392 MB test database it took about 15% longer than before.
+  - Files are read as the source site user and written as the new site user, so the copy contains only what the source site user can read. A source directory that is a symbolic link or not owned by its site user, a file the source site user cannot read, or a copy without `wp-config.php` stops the clone and removes the new site and database.
+  - Access protection is not copied automatically. If the source site has `clp httpauth` protection, an IP whitelist or Cloudflare-only, the clone lists the matching commands and asks whether to apply them to the new site (default: no; with `-y` they are only listed). Applying them also copies the basic auth accounts.
 
 #### ⑤ Zero-Write Cross-Server Migration (`clp site -migrate`)
 
@@ -509,6 +513,8 @@ sudo clp site -migrate=remote-vps -all -exclude="test.,dev.,staging." -force-rep
   - **Read-Only on Remote**: Database is transferred via compressed SSH stream to the target host and verified before import; zero files written to source server.
   - **Edit-Lock Detection**: Automatically detects active post editing locks (`_edit_lock`) within the last 10 minutes to prevent overwriting unsaved work.
   - **SSH Agent Integration**: Detects key passphrases and loads them into `ssh-agent` for seamless passwordless streaming.
+  - **Site-user read on the remote**: the remote side of the file transfer runs as the remote site user (`sudo -u`), so the remote host needs `sudo`. The site directory must not be a symbolic link and must be owned by that user. Device files, FIFOs and sockets are not copied.
+  - Access protection (`clp httpauth`, IP whitelist, Cloudflare-only) is not migrated; set it up again on the new host.
 
 #### ⑥ Site State Management
 
@@ -631,6 +637,7 @@ sudo clp site -cf-only=off -all
 - **Batch confirmation**: before a batch change, the sites to change and to skip are listed and you must type `yes`; `-y` proceeds directly, and non-interactive mode without `-y` is refused.
 - **`X-Real-IP` bypass is closed**: CloudPanel's default `/etc/nginx/nginx.conf` contains `set_real_ip_from 0.0.0.0/0;`, so anyone who connects directly with an `X-Real-IP: <Cloudflare IP>` header could bypass this setting. When you turn it on, clp comments out that line (it is kept, marked `# disabled by CLP Helper (cf-only)`) after asking (`-y` applies it directly). This applies to every site on the server; `127.0.0.1` and private ranges stay trusted, so Varnish is not affected. The file is backed up to the same backup folder and restored if `nginx -t` fails. When the last site is turned off, clp asks whether to restore the line (default: no; with `-y` it is left commented out).
 - **Refused with `real_ip_header`**: if `nginx.conf` has an active `real_ip_header` other than `X-Real-IP` (for example `X-Forwarded-For`, used to show visitors' real IPs), nginx replaces the client address before the Cloudflare allow list is checked and every visitor would be blocked, so clp refuses to turn it on.
+- **Not combined with an IP whitelist**: with a Basic Auth IP whitelist on the same site (clp `httpauth -whitelist`, or Whitelisted IPs under CloudPanel's Basic Auth), nginx combines the whitelist (`satisfy any`) with the Cloudflare allow list. Visitors through Cloudflare always need the password (the server sees a Cloudflare IP, so the whitelist never matches), while anyone connecting directly gets in with the right password or a whitelisted IP. CloudPanel's own Basic Auth and clp httpauth protection still written in the vhost (old format) behave the same way. clp warns when both are set; clear the whitelist if you need Cloudflare only. clp httpauth protection kept in nginx hook files (⑪) does not use `satisfy any`: direct connections stay blocked, and the whitelist only skips the password for visitors whose address nginx sees.
 - **Firewall check**: ports 8080 (nginx backend) and 6081 (Varnish) are not covered by this setting. clp warns when UFW is not active or allows those ports.
 
 #### ⑨ Varnish Not Caching? (`clp site <domain> -varnish=status|fix`)
@@ -748,9 +755,39 @@ sudo clp site example.com -vhost=update -template=WordPress   # choose the templ
 - **Status**: *up to date*; *older official version* (identical to an official version clp recorded earlier, safe to update); *customised* (differs from every known official version: edited in the panel, or an official version from before clp started recording; `-force` replaces it, a backup is kept). Line endings, trailing spaces and the `server_name` lines are ignored in the comparison.
 - clp records CloudPanel's official templates every day (`/etc/cron.d/clp-helper`, 07:30, in `/root/.clp/vhost-templates/`); a version that changed before clp was installed cannot be recognised and shows as customised.
 - A site created from the WordPress template before 2024-11 is identical to the current WooCommerce template and shows as WooCommerce; use `-template=WordPress` to update it.
-- **Update**: backs up the CloudPanel database, the site's template and its vhost to `/root/.clp/vhost-backup/<time>/<domain>/`, writes the new template (keeping the site's own `server_name` lines) and regenerates the vhost with CloudPanel's own code, exactly as clicking Save in the Vhost tab: settings such as Varnish, Cloudflare-only and Basic Auth follow what is set in CloudPanel (a Varnish site whose front end still bypasses Varnish starts using it). clp httpauth protection is applied again afterwards; if that or `nginx -t` fails, the template and vhost are restored.
+- **Update**: backs up the CloudPanel database, the site's template and its vhost to `/root/.clp/vhost-backup/<time>/<domain>/`, writes the new template (keeping the site's own `server_name` lines) and regenerates the vhost with CloudPanel's own code, exactly as clicking Save in the Vhost tab: settings such as Varnish, Cloudflare-only and Basic Auth follow what is set in CloudPanel (a Varnish site whose front end still bypasses Varnish starts using it). The clp nginx hook lines (see ⑪) are kept in the new template, so protection kept in hook files is not affected; old-format clp httpauth protection written in the vhost is applied again afterwards. If that or `nginx -t` fails, the template and vhost are restored.
 - If clp cannot use this CloudPanel version's code, only the template in the database is updated and you are asked to click Save in the site's Vhost tab.
 - Only PHP sites; a disabled site (`-off`) must be enabled first, because regenerating the vhost enables it.
+
+#### ⑪ nginx Hooks: Settings That Survive Saving the Vhost in CloudPanel (`-nginx-hooks`)
+
+CloudPanel rebuilds a site's vhost from the site's template stored in its database (for example when you click Save in the Vhost tab), so anything written only into the vhost file disappears. nginx hooks add clp include lines to the template **and** the vhost of each site; clp keeps its settings in the included files under `/etc/nginx/clp-helper/`, which CloudPanel never touches. `clp httpauth` requires them.
+
+```bash
+sudo clp server -nginx-hooks=on                 # add the hook lines to every PHP site (asks first; -y skips)
+sudo clp server -nginx-hooks=status             # every site: on / not added / missing ...
+sudo clp site example.com -nginx-hooks          # add them to one site (e.g. a site created in CloudPanel)
+sudo clp site example.com -nginx-hooks=off      # remove them from one site
+sudo clp server -nginx-hooks=off                # remove them from every site
+```
+
+- The lines added (the rest of the template, including your own changes, stays as it is):
+  ```nginx
+  # --- CLP HELPER HOOKS (http) START ---                          (top of the file)
+  include /etc/nginx/clp-helper/sites/example.com/http/*.conf;
+  # --- CLP HELPER HOOKS (http) END ---
+    root /home/...;                                                (HTTPS server block, after root)
+    # --- CLP HELPER HOOKS START ---
+    include /etc/nginx/clp-helper/*.conf;
+    include /etc/nginx/clp-helper/sites/example.com/*.conf;
+    # --- CLP HELPER HOOKS END ---
+  ```
+- The template is written with CloudPanel's own code (directly to the database if this CloudPanel version cannot be used); the vhost file only gets these lines inserted and is not regenerated, so other CloudPanel settings that changed since the last save are not applied by the way. Backups (CloudPanel database, template, vhost) go to `/root/.clp/vhost-backup/<time>/<domain>/`; if `nginx -t` fails, both are restored.
+- Existing clp httpauth protection written in the vhost (older versions) is moved into the hook files in the same step, without a moment where the site is unprotected.
+- Sites created by clp (`-new`, `-clone-from`, `-migrate`) get the lines right away. Sites created in CloudPanel do not (its WordPress wizard cannot choose a template): add them with `clp site <domain> -nginx-hooks`. `clp site -list` lists the sites without them.
+- If the lines disappear later (for example when a Vhost tab opened before the change is saved), clp does not add them back by itself: `clp site -list`, `-nginx-hooks=status` and `httpauth -list=protected` show it, with the command to fix it.
+- `-off` refuses while a site still has hook files (e.g. httpauth protection), because removing the lines would silently turn them off.
+- Only PHP sites whose template has one HTTPS server block with one `root` line; disabled sites are skipped.
 
 ---
 
@@ -1167,7 +1204,13 @@ Note: every restore takes a full site snapshot first, so three restores create t
 
 ### 5. HTTP Basic Authentication (`clp httpauth`)
 
-Password protection and access control for sites. Password files are stored securely outside document roots at `/home/<user>/.htpasswd`:
+Password protection and access control for sites. Password files are stored securely outside document roots at `/home/<user>/.htpasswd`.
+
+**Requires nginx hooks** (`sudo clp server -nginx-hooks=on`, see Site Management ⑪): the protection is kept in `/etc/nginx/clp-helper/sites/<domain>/httpauth.conf` (and `http/httpauth.conf` for the IP whitelist), so saving the vhost in CloudPanel no longer removes it. Protection written into the vhost by older versions can still be listed and turned off; `-nginx-hooks` moves it into the hook files.
+
+- No `satisfy any`: denied locations (`.git`, `xmlrpc.php`) and IPs blocked in CloudPanel stay denied for whitelisted IPs and for users with the password.
+- Path protection only adds the password; requests below the path are still handled by the site's normal locations (static files, the wp-admin location, the denied locations).
+- Do not combine with CloudPanel's own Basic Auth (site → Security): clp refuses to turn protection on while it is enabled, and enabling it later in CloudPanel makes its `nginx -t` fail.
 
 #### ① User Management
 
@@ -1229,7 +1272,7 @@ sudo clp httpauth example.com -path=/staging
 
 #### ④ IP / CIDR Whitelisting (`-whitelist`)
 
-Allow specified IP addresses or office subnets direct access without passwords (Nginx `satisfy any` mechanism):
+Allow specified IP addresses or office subnets direct access without passwords (an nginx `geo` list; whitelisted IPs skip only the password, denied locations stay denied):
 
 > **Spoofing protection**: CloudPanel's `/etc/nginx/nginx.conf` has `set_real_ip_from 0.0.0.0/0`, which lets anyone send `X-Real-IP: <a whitelisted IP>` and skip the password. When a command writes a whitelist (`-whitelist=<ip>`, or `-wp-admin` / `-path` on a site that already has one), CLP Helper explains this and comments that line out (asks first, default yes; `-y` applies it directly; non-interactive without `-y` stops before changing anything). It applies to every site on the server; 127.0.0.1 and private ranges stay trusted. The backup goes to `/root/.clp/httpauth-backup/<time>/`. `-list=protected` warns if the line is still active.
 
@@ -1528,8 +1571,10 @@ clp-helper/
 │   ├── config.sh            # Global configuration management (clp config)
 │   ├── core.sh              # Core utilities (logging, checks, DB access, typos)
 │   ├── httpauth.sh          # HTTP Basic auth & IP whitelisting
-│   ├── httpauth_vhost.py    # Nginx vhost HTTP auth injector helper
+│   ├── httpauth_hook.py     # httpauth nginx hook files (protection, IP whitelist)
+│   ├── httpauth_vhost.py    # Old-format vhost HTTP auth blocks (list, remove, migrate)
 │   ├── i18n.sh              # Internationalization (i18n) runtime engine
+│   ├── nginx_hooks.sh       # nginx hook lines in CloudPanel vhost templates (-nginx-hooks)
 │   ├── php_fpm.sh           # Dynamic PHP-FPM detection and tuning
 │   ├── server.sh            # Server ops, hardening & 17-module installer
 │   └── site.sh              # Site management (create, clone, migrate, delete)

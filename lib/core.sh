@@ -178,6 +178,21 @@ get_mysql_master_host_port() {
     END { if (h != "") print h, (p != "" ? p : 3306) }' || true
 }
 
+# mysql_no_cmds_opt：設定 CLP_MYSQL_NO_CMDS_OPT，匯入不可信任的 SQL 時讓 mysql 用戶端不執行 \!（system）、tee、source 等用戶端指令
+#   clp 以 root 執行 mysql 用戶端：SQL 中的 \! 會以 root 身分執行 shell 指令（與使用哪個 DB 帳號無關）
+#   用戶端支援 --sandbox（MariaDB）就用它；否則用 --binary-mode（MySQL 與 MariaDB 都支援，非互動模式下只保留 \C 與 DELIMITER）
+#   不在 $(...) 中呼叫（快取會留在子 shell）
+mysql_no_cmds_opt() {
+  [[ -n "${CLP_MYSQL_NO_CMDS_OPT:-}" ]] && return 0
+  local help_out
+  help_out=$(mysql --no-defaults --help 2>/dev/null || true)
+  if [[ "$help_out" == *"--sandbox"* ]]; then
+    CLP_MYSQL_NO_CMDS_OPT="--sandbox"
+  else
+    CLP_MYSQL_NO_CMDS_OPT="--binary-mode"
+  fi
+}
+
 # ------------------------------------------------------------------------------
 # nginx real-ip：CloudPanel 的 nginx.conf 預設有 set_real_ip_from 0.0.0.0/0（http 層級、讀 X-Real-IP），
 #   任何 IPv4 用戶端都能以偽造的 X-Real-IP 換掉 $remote_addr，依 IP 判斷的 allow
@@ -197,6 +212,23 @@ clp_realip_state() {
   else
     echo "none"
   fi
+}
+
+# clp_warn_cf_only_whitelist <domain> [skip-realip]：vhost 同時有 cf-only 的 include 與 satisfy any
+#   （clp httpauth 或 CloudPanel Basic Auth 的 IP 白名單）時警告，不改設定：
+#   經 Cloudflare 時 $remote_addr 是 Cloudflare 節點，白名單比對不到（一律要密碼）；
+#   直連主機的人只要密碼正確或 IP 在白名單內，就能繞過 cf-only（satisfy any 的 allow／deny 與 cf-only 的清單合在一起判斷）
+#   skip-realip：呼叫端之後才處理 set_real_ip_from 0.0.0.0/0（cf-only），不顯示 real-ip 的補充警告
+clp_warn_cf_only_whitelist() {
+  local domain="$1" vhost="/etc/nginx/sites-enabled/${1}.conf"
+  [[ -f "$vhost" ]] || return 0
+  grep -Eq '^[[:space:]]*include[[:space:]]+/etc/nginx/cloudflare/ips;' "$vhost" || return 0
+  grep -Eq '^[[:space:]]*satisfy[[:space:]]+any;' "$vhost" || return 0
+  log_warn "$(_t "CORE_WARN_CF_ONLY_WHITELIST" "$domain" "$domain")"
+  if [[ "${2:-}" != "skip-realip" && "$(clp_realip_state)" == "active" ]]; then
+    log_warn "$(_t "CORE_WARN_CF_ONLY_WHITELIST_REALIP")"
+  fi
+  return 0
 }
 
 # clp_realip_whitelists_exist：是否有網站設定 httpauth IP 白名單（非空的 /etc/nginx/security/*.whitelist）
@@ -1048,33 +1080,38 @@ find_site_user() {
     fi
   fi
 
-  # 2. Check directory ownership in /home/*/htdocs/<domain>
-  for htdocs_dir in /home/*/htdocs/"$domain"; do
-    if [[ -d "$htdocs_dir" ]]; then
-      local user
-      user=$(stat -c '%U' "$htdocs_dir" 2>/dev/null || stat -f '%Su' "$htdocs_dir" 2>/dev/null || true)
-      if [[ -n "$user" && "$user" != "root" ]]; then
-        echo "$user"
-        return 0
-      fi
-    fi
-  done
-
-  # 3. Check Nginx vhost config
+  # 2. Check Nginx vhost config（root 擁有，優先於網站使用者可以自行建立的目錄）
   local conf_file="/etc/nginx/sites-enabled/${domain}.conf"
   [[ ! -f "$conf_file" ]] && conf_file="/etc/nginx/sites-available/${domain}.conf"
   if [[ -f "$conf_file" ]]; then
     local user
-    user=$(grep -E 'root /home/[^/]+/htdocs/' "$conf_file" | head -n 1 | awk -F'/' '{print $3}')
+    user=$(grep -E 'root /home/[^/]+/htdocs/' "$conf_file" | head -n 1 | awk -F'/' '{print $3}' || true)
     if [[ -n "$user" ]]; then
       echo "$user"
       return 0
     fi
   fi
 
+  # 3. Check directory ownership in /home/*/htdocs/<domain>
+  #    任何網站使用者都能在自己的家目錄建立同名目錄：只接受擁有者就是該家目錄使用者的目錄
+  for htdocs_dir in /home/*/htdocs/"$domain"; do
+    if [[ -d "$htdocs_dir" ]]; then
+      local user home_user
+      home_user="${htdocs_dir#/home/}"
+      home_user="${home_user%%/*}"
+      user=$(stat -c '%U' "$htdocs_dir" 2>/dev/null || stat -f '%Su' "$htdocs_dir" 2>/dev/null || true)
+      if [[ -n "$user" && "$user" != "root" && "$user" == "$home_user" ]]; then
+        echo "$user"
+        return 0
+      fi
+    fi
+  done
+
   return 1
 }
 
+# find_site_root：只回傳 find_site_user 解析出的使用者底下的目錄
+#   不可改用其他 /home/*/htdocs/<網域>：那可能是其他網站使用者建立的，會讓 backup／restore 以本站使用者身分執行對方的程式
 find_site_root() {
   local domain
   domain=$(clean_domain "$1")
@@ -1085,14 +1122,6 @@ find_site_root() {
     echo "/home/$user/htdocs/$domain"
     return 0
   fi
-
-  # Fallback search
-  for path in /home/*/htdocs/"$domain"; do
-    if [[ -d "$path" ]]; then
-      echo "$path"
-      return 0
-    fi
-  done
   return 1
 }
 

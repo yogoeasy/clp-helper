@@ -17,6 +17,12 @@ fi
 # ------------------------------------------------------------------------------
 # Nginx vhost 編輯邏輯集中於同目錄的 httpauth_vhost.py（區塊插入、refresh、舊格式遷移）
 HTTPAUTH_VHOST_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/httpauth_vhost.py"
+# 計畫 51：防護寫在 nginx hook 檔（/etc/nginx/clp-helper/sites/<domain>/httpauth.conf），由 httpauth_hook.py 產生
+HTTPAUTH_HOOK_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/httpauth_hook.py"
+if ! declare -F nh_site_dir >/dev/null; then
+  # shellcheck source=/dev/null
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nginx_hooks.sh"
+fi
 
 httpauth_get_siteuser() {
   local domain="$1"
@@ -271,6 +277,132 @@ _httpauth_fileops_user_args() {
 }
 
 # ------------------------------------------------------------------------------
+# nginx hook 檔（計畫 51）
+#   開啟防護需要網站已加入 nginx hook（clp server -nginx-hooks=on、clp site <domain> -nginx-hooks）；
+#   vhost 中舊格式的區塊（httpauth_vhost.py）只保留關閉、列出與白名單／帳號變更時的 refresh
+# ------------------------------------------------------------------------------
+httpauth_hook_file() {
+  echo "$(nh_site_dir "$1")/httpauth.conf"
+}
+
+# httpauth_protect_state <domain>：目前的防護，每行一項：wpadmin、path <路徑>
+#   有 hook 檔時以它為準，沒有時讀 vhost 中舊格式的區塊
+httpauth_protect_state() {
+  local domain="$1" f vhost
+  f=$(httpauth_hook_file "$domain")
+  if [[ -f "$f" ]]; then
+    python3 -I "$HTTPAUTH_HOOK_PY" state "$f"
+    return 0
+  fi
+  vhost=$(find_nginx_vhost "$domain" 2>/dev/null || true)
+  [[ -n "$vhost" && -f "$vhost" ]] || return 0
+  grep -q '# --- CLP HTTPAUTH WPADMIN START ---' "$vhost" && echo "wpadmin"
+  grep -q '# --- CLP HTTPAUTH ROOT START ---' "$vhost" && echo "path /"
+  sed -n 's/^[[:space:]]*# --- CLP HTTPAUTH PATH: \(.*\) START ---[[:space:]]*$/path \1/p' "$vhost"
+  return 0
+}
+
+# httpauth_hook_render <domain> <dir>（stdin：防護清單）：產生 <dir>/server.conf 與（有白名單時）<dir>/http.conf
+httpauth_hook_render() {
+  local domain="$1" dir="$2" out="" line rc=0
+  out=$(python3 -I "$HTTPAUTH_HOOK_PY" render --domain "$domain" \
+          --htpasswd "$(httpauth_get_htpasswd_file "$domain")" \
+          --whitelist "$(httpauth_get_whitelist_file "$domain")" --out "$dir") || rc=$?
+  while IFS= read -r line; do
+    if [[ "$line" == INVALID$'\t'* ]]; then
+      log_warn >&2 "$(_t "HTTPAUTH_READ_WHITELIST_DIRECTIVES_1" "${line#INVALID$'\t'}")"
+    fi
+  done <<< "$out"
+  return "$rc"
+}
+
+# httpauth_hook_ready <domain>：網站的範本與 vhost 都已加入 hook（開啟防護的前提）；
+#   否則報錯並提示要執行的指令。HTTPAUTH_LEGACY_OK=1（vhost 更新後重新套用舊格式防護）時回傳 2
+httpauth_hook_ready() {
+  local domain="$1" state
+  state=$(nh_site_state "$domain")
+  [[ "$state" == "on" ]] && return 0
+  [[ "${HTTPAUTH_LEGACY_OK:-0}" == "1" ]] && return 2
+  if ! nh_enabled; then
+    log_error "$(_t "HTTPAUTH_ERR_HOOKS_NOT_ENABLED")"
+  else
+    log_error "$(_t "HTTPAUTH_ERR_HOOKS_SITE" "$domain" "$(nh_state_label "$state")" "$domain")"
+  fi
+  return 1
+}
+
+# httpauth_cp_basic_auth_check <domain>：CloudPanel 內建的 Basic Auth 也啟用時拒絕（server 層會有兩個 auth_basic）
+httpauth_cp_basic_auth_check() {
+  local domain="$1"
+  [[ -f "$NH_DB" ]] || return 0
+  if [[ "$(python3 -I "$HTTPAUTH_HOOK_PY" basic-auth --db "$NH_DB" --domain "$domain" 2>/dev/null || echo 0)" == "1" ]]; then
+    log_error "$(_t "HTTPAUTH_ERR_CP_BASIC_AUTH" "$domain")"
+    return 1
+  fi
+  return 0
+}
+
+# httpauth_hook_apply <domain> <wpadmin-on|wpadmin-off|path-on|path-off|clear-paths|refresh> [<path>]
+#   依新的防護清單重新產生 hook 檔，nginx -t 失敗時還原；回傳 0 成功、1 失敗（已還原）、2 已寫入但 reload 失敗
+httpauth_hook_apply() {
+  local domain="$1" op="$2" arg="${3:-}"
+  local dir file http_file cur new tmpd rc=0
+  dir=$(nh_site_dir "$domain")
+  file="${dir}/httpauth.conf"
+  http_file="${dir}/http/httpauth.conf"
+  cur=$(python3 -I "$HTTPAUTH_HOOK_PY" state "$file") || return 1
+  case "$op" in
+    wpadmin-on) new=$(printf '%s\nwpadmin\n' "$cur") ;;
+    wpadmin-off) new=$(grep -vx 'wpadmin' <<< "$cur" || true) ;;
+    path-on) new=$(printf '%s\npath %s\n' "$cur" "$arg") ;;
+    path-off) new=$(grep -vxF "path ${arg}" <<< "$cur" || true) ;;
+    clear-paths) new=$(grep -vE '^path /.+' <<< "$cur" || true) ;;  # 全站（path /）不在 -delete-all 的範圍
+    refresh) new="$cur" ;;
+    *) return 1 ;;
+  esac
+  new=$(sed '/^[[:space:]]*$/d' <<< "$new" | sort -u)
+
+  tmpd=$(mktemp -d) || return 1
+  chmod 755 "$tmpd"
+  if [[ -n "$new" ]] && ! httpauth_hook_render "$domain" "$tmpd" <<< "$new"; then
+    rm -rf "$tmpd"
+    log_error "$(_t "HTTPAUTH_ERR_HOOK_RENDER" "$domain")"
+    return 1
+  fi
+  [[ -f "$file" ]] && cp -p "$file" "${tmpd}/old.server"
+  [[ -f "$http_file" ]] && cp -p "$http_file" "${tmpd}/old.http"
+
+  if ! _nh_mkdirs "$domain"; then
+    rm -rf "$tmpd"
+    log_error "$(_t "NH_ERR_WRITE" "$dir")"
+    return 1
+  fi
+  if [[ -n "$new" ]]; then
+    _nh_install "${tmpd}/server.conf" "$file" || rc=1
+    if [[ "$rc" -eq 0 && -f "${tmpd}/http.conf" ]]; then
+      _nh_install "${tmpd}/http.conf" "$http_file" || rc=1
+    elif [[ "$rc" -eq 0 ]]; then
+      rm -f "$http_file"
+    fi
+  else
+    rm -f "$file" "$http_file"
+  fi
+  if [[ "$rc" -ne 0 ]] || ! nginx -t >/dev/null 2>&1; then
+    log_error "$(_t "HTTPAUTH_SET_WP_ADMIN_8")"
+    if [[ -f "${tmpd}/old.server" ]]; then cp -p "${tmpd}/old.server" "$file"; else rm -f "$file"; fi
+    if [[ -f "${tmpd}/old.http" ]]; then cp -p "${tmpd}/old.http" "$http_file"; else rm -f "$http_file"; fi
+    rm -rf "$tmpd"
+    return 1
+  fi
+  rm -rf "$tmpd"
+  if [[ "$(nh_site_state "$domain")" != "on" && -f "$file" ]]; then
+    log_warn "$(_t "HTTPAUTH_WARN_HOOK_INACTIVE" "$domain")"
+  fi
+  httpauth_reload_nginx || return 2
+  return 0
+}
+
+# ------------------------------------------------------------------------------
 # 1. Add User (Interactive or Inline)
 # ------------------------------------------------------------------------------
 httpauth_add_user() {
@@ -447,22 +579,18 @@ httpauth_del_user() {
     vhost=$(find_nginx_vhost "$domain" 2>/dev/null || true)
     local wpadmin_active=false
     local -a active_paths=()
+    local kind arg
 
-    if [[ -n "$vhost" && -f "$vhost" ]]; then
-      if grep -q "CLP HTTPAUTH WPADMIN START" "$vhost" 2>/dev/null; then
-        wpadmin_active=true
-      elif grep -A 8 -E 'location\s*~\*?\s*[\^/]*\s*\(wp-admin/\|wp-login\.php\)' "$vhost" 2>/dev/null | grep -E -q '^[[:space:]]*auth_basic[[:space:]]+"'; then
-        wpadmin_active=true
-      fi
-
-      if grep -q "CLP HTTPAUTH ROOT START" "$vhost" 2>/dev/null; then
-        active_paths+=("/")
-      fi
-      while IFS= read -r line; do
-        if [[ "$line" =~ CLP\ HTTPAUTH\ PATH:\ (.*)\ START ]]; then
-          active_paths+=("${BASH_REMATCH[1]}")
-        fi
-      done < <(grep "CLP HTTPAUTH PATH: " "$vhost" 2>/dev/null || true)
+    while read -r kind arg; do
+      case "$kind" in
+        wpadmin) wpadmin_active=true ;;
+        path) active_paths+=("$arg") ;;
+      esac
+    done < <(httpauth_protect_state "$domain")
+    # 使用者在 CloudPanel 後台自行取消註解的 wp-admin 認證
+    if [[ "$wpadmin_active" == "false" && -n "$vhost" && -f "$vhost" ]] && \
+       grep -A 8 -E 'location\s*~\*?\s*[\^/]*\s*\(wp-admin/\|wp-login\.php\)' "$vhost" 2>/dev/null | grep -E -q '^[[:space:]]*auth_basic[[:space:]]+"'; then
+      wpadmin_active=true
     fi
 
     if [[ "$wpadmin_active" == "true" || ${#active_paths[@]} -gt 0 ]]; then
@@ -564,33 +692,42 @@ httpauth_list_protected() {
     log_warn "$(_t "HTTPAUTH_REALIP_WARN_LIST" "$CLP_REALIP_NGINX_CONF" "$domain")"
   fi
 
+  # 防護清單：hook 檔或 vhost 中舊格式的區塊
+  local state kind arg
+  state=$(httpauth_protect_state "$domain")
+  if [[ -n "$state" ]]; then
+    if [[ -f "$(httpauth_hook_file "$domain")" ]]; then
+      if [[ "$(nh_site_state "$domain")" != "on" ]]; then
+        log_error "$(_t "HTTPAUTH_WARN_HOOK_INACTIVE" "$domain")"
+        log_info "$(_t "NH_INFO_FIX_CMD" "$domain")"
+      fi
+    else
+      log_warn "$(_t "HTTPAUTH_WARN_LEGACY" "$domain" "$domain")"
+    fi
+  fi
+
   # 2. 檢查 WordPress 後台防護
   local wpadmin_status="$(_t "HTTPAUTH_LIST_PROTECTED_3")"
-  if [[ -n "$vhost" && -f "$vhost" ]]; then
-    if grep -q "CLP HTTPAUTH WPADMIN START" "$vhost" 2>/dev/null; then
-      wpadmin_status="$(_t "HTTPAUTH_LIST_PROTECTED_4" "${C_GREEN}" "${C_NC}")"
-    elif grep -A 8 -E 'location\s*~\*?\s*[\^/]*\s*\(wp-admin/\|wp-login\.php\)' "$vhost" 2>/dev/null | grep -E -q '^[[:space:]]*auth_basic[[:space:]]+"'; then
-      wpadmin_status="$(_t "HTTPAUTH_LIST_PROTECTED_4" "${C_GREEN}" "${C_NC}")"
-    fi
+  if grep -qx 'wpadmin' <<< "$state"; then
+    wpadmin_status="$(_t "HTTPAUTH_LIST_PROTECTED_4" "${C_GREEN}" "${C_NC}")"
+  elif [[ -n "$vhost" && -f "$vhost" ]] && \
+       grep -A 8 -E 'location\s*~\*?\s*[\^/]*\s*\(wp-admin/\|wp-login\.php\)' "$vhost" 2>/dev/null | grep -E -q '^[[:space:]]*auth_basic[[:space:]]+"'; then
+    wpadmin_status="$(_t "HTTPAUTH_LIST_PROTECTED_4" "${C_GREEN}" "${C_NC}")"
   fi
   echo -e "$(_t "HTTPAUTH_LIST_PROTECTED_5" "${wpadmin_status}")"
 
   # 3. 檢查受保護路徑
   echo -e "$(_t "HTTPAUTH_LIST_PROTECTED_6")"
   local found_paths=0
-  if [[ -n "$vhost" && -f "$vhost" ]]; then
-    if grep -q "CLP HTTPAUTH ROOT START" "$vhost" 2>/dev/null; then
+  while read -r kind arg; do
+    [[ "$kind" == "path" ]] || continue
+    if [[ "$arg" == "/" ]]; then
       echo -e "$(_t "HTTPAUTH_LIST_PROTECTED_7" "${C_GREEN}" "${C_NC}")"
-      found_paths=1
+    else
+      echo -e "  - ${C_GREEN}${arg}${C_NC}"
     fi
-    while IFS= read -r line; do
-      if [[ "$line" =~ CLP\ HTTPAUTH\ PATH:\ (.*)\ START ]]; then
-        local p="${BASH_REMATCH[1]}"
-        echo -e "  - ${C_GREEN}${p}${C_NC}"
-        found_paths=1
-      fi
-    done < <(grep "CLP HTTPAUTH PATH: " "$vhost" 2>/dev/null || true)
-  fi
+    found_paths=1
+  done <<< "$state"
   if [[ "$found_paths" -eq 0 ]]; then
     echo -e "$(_t "HTTPAUTH_LIST_PROTECTED_8" "${C_DIM}" "${C_NC}")"
   fi
@@ -629,6 +766,17 @@ httpauth_set_wp_admin() {
   siteuser=$(httpauth_get_siteuser "$domain")
 
   if [[ "$action" == "on" ]]; then
+    # 開啟防護需要網站已加入 nginx hook（計畫 51）
+    local use_hook=1 hrc=0
+    httpauth_hook_ready "$domain" || hrc=$?
+    if [[ "$hrc" -eq 2 ]]; then
+      use_hook=0
+    elif [[ "$hrc" -ne 0 ]]; then
+      return 1
+    fi
+    if [[ "$use_hook" -eq 1 ]]; then
+      httpauth_cp_basic_auth_check "$domain" || return 1
+    fi
     # 若尚無使用者或為 symlink，提示新增或檢查
     if [[ -L "$htpasswd_file" || ! -f "$htpasswd_file" || ! -s "$htpasswd_file" ]]; then
       if has_opt "y" || has_opt "yes" || [[ ! -t 0 ]]; then
@@ -654,6 +802,11 @@ httpauth_set_wp_admin() {
     fi
 
     log_step "$(_t "HTTPAUTH_SET_WP_ADMIN_5" "${domain}")"
+    if [[ "$use_hook" -eq 1 ]]; then
+      httpauth_hook_apply "$domain" wpadmin-on || return 1
+      log_success "$(_t "HTTPAUTH_SET_WP_ADMIN_7")"
+      return 0
+    fi
     local wl_directives
     wl_directives=$(httpauth_read_whitelist_directives "$domain")
 
@@ -679,6 +832,11 @@ httpauth_set_wp_admin() {
   else
     # Turn off wp-admin protection
     log_step "$(_t "HTTPAUTH_SET_WP_ADMIN_9" "${domain}")"
+    if [[ -f "$(httpauth_hook_file "$domain")" ]]; then
+      httpauth_hook_apply "$domain" wpadmin-off || return 1
+      log_success "$(_t "HTTPAUTH_SET_WP_ADMIN_11")"
+      return 0
+    fi
     cp -p "$vhost" "${vhost}.clpbak"
 
     python3 -I "$HTTPAUTH_VHOST_PY" wpadmin-off "$vhost" "$siteuser" || {
@@ -724,12 +882,23 @@ httpauth_set_path() {
   [[ "$target_path" != /* ]] && target_path="/${target_path}"
 
   # Reject characters that would break or inject into the Nginx config
-  if [[ "$target_path" =~ [[:space:]\\\{\}\;\#\'\"] ]]; then
+  if [[ "$target_path" =~ [[:space:]\\\{\}\;\#\'\"\$] ]]; then
     log_error "$(_t "HTTPAUTH_SET_PATH_1" "${target_path}")"
     return 1
   fi
 
   if [[ "$action" == "on" ]]; then
+    # 開啟防護需要網站已加入 nginx hook（計畫 51）
+    local use_hook=1 hrc=0
+    httpauth_hook_ready "$domain" || hrc=$?
+    if [[ "$hrc" -eq 2 ]]; then
+      use_hook=0
+    elif [[ "$hrc" -ne 0 ]]; then
+      return 1
+    fi
+    if [[ "$use_hook" -eq 1 ]]; then
+      httpauth_cp_basic_auth_check "$domain" || return 1
+    fi
     # 若尚無使用者或為 symlink，提示新增或檢查
     if [[ -L "$htpasswd_file" || ! -f "$htpasswd_file" || ! -s "$htpasswd_file" ]]; then
       if has_opt "y" || has_opt "yes" || [[ ! -t 0 ]]; then
@@ -755,6 +924,11 @@ httpauth_set_path() {
     fi
 
     log_step "$(_t "HTTPAUTH_SET_PATH_4" "${domain}" "${target_path}")"
+    if [[ "$use_hook" -eq 1 ]]; then
+      httpauth_hook_apply "$domain" path-on "$target_path" || return 1
+      log_success "$(_t "HTTPAUTH_SET_PATH_6" "${target_path}")"
+      return 0
+    fi
     local wl_directives
     wl_directives=$(httpauth_read_whitelist_directives "$domain")
 
@@ -780,6 +954,11 @@ httpauth_set_path() {
   else
     # Turn off path protection
     log_step "$(_t "HTTPAUTH_SET_PATH_7" "${domain}" "${target_path}")"
+    if [[ -f "$(httpauth_hook_file "$domain")" ]]; then
+      httpauth_hook_apply "$domain" path-off "$target_path" || return 1
+      log_success "$(_t "HTTPAUTH_SET_PATH_8" "${target_path}")"
+      return 0
+    fi
     cp -p "$vhost" "${vhost}.clpbak"
 
     python3 -I "$HTTPAUTH_VHOST_PY" path-off "$vhost" "$target_path" || {
@@ -994,6 +1173,12 @@ httpauth_clear_all_paths() {
     return 1
   fi
 
+  if [[ -f "$(httpauth_hook_file "$domain")" ]]; then
+    httpauth_hook_apply "$domain" clear-paths || return 1
+    log_success "$(_t "HTTPAUTH_CLEAR_ALL_PATHS_1" "${domain}")"
+    return 0
+  fi
+
   cp -p "$vhost" "${vhost}.clpbak"
 
   python3 -I "$HTTPAUTH_VHOST_PY" clear-paths "$vhost" || {
@@ -1019,6 +1204,11 @@ httpauth_clear_all_paths() {
 # ------------------------------------------------------------------------------
 httpauth_refresh_active_blocks() {
   local domain="$1"
+  if [[ -f "$(httpauth_hook_file "$domain")" ]]; then
+    local arc=0
+    httpauth_hook_apply "$domain" refresh || arc=$?
+    return "$arc"
+  fi
   local vhost
   vhost=$(find_nginx_vhost "$domain" 2>/dev/null || true)
   if [[ -z "$vhost" || ! -f "$vhost" ]]; then
@@ -1245,5 +1435,6 @@ httpauth_handler() {
     httpauth_realip_disable
   fi
 
+  clp_warn_cf_only_whitelist "$domain"
   return "$handler_rc"
 }

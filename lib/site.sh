@@ -17,6 +17,9 @@ if [[ -f "${CLP_ROOT_DIR}/lib/cloudflare.sh" ]]; then
   # shellcheck source=/dev/null
   source "${CLP_ROOT_DIR}/lib/cloudflare.sh"
 fi
+# nginx hooks（計畫 51）：建站後加入 hook、-nginx-hooks 指令
+# shellcheck source=/dev/null
+source "${CLP_ROOT_DIR}/lib/nginx_hooks.sh"
 
 # ------------------------------------------------------------------------------
 # 1. Site Listing (clp site -list)
@@ -250,6 +253,8 @@ site_list() {
     echo -e "${C_BOLD}$(_t "SITE_LIST_SUMMARY_ALL" "${#site_map[@]}" "${C_GREEN}${enabled_count}${C_NC}" "${C_RED}${disabled_count}${C_NC}")${C_NC}"
   fi
   echo ""
+  # 已啟用 nginx hooks 時，列出 hook 消失或尚未加入的網站
+  nh_list_warnings
 }
 
 # ------------------------------------------------------------------------------
@@ -421,6 +426,8 @@ site_delete() {
     rm -f "$pool" 2>/dev/null || true
   done
   # 僅刪除此網域的憑證檔（萬用字元 ${domain}.* 會誤刪 example.com.au 等其他網域的憑證）
+  # -ssl=dns 的憑證檔是指向 /etc/letsencrypt/live/<domain>/ 的連結：rm -f 只解除連結，不動 certbot 的檔案；
+  # 連結已斷（certbot 憑證先被刪除，nginx -t 會失敗）時也一樣會清掉（2026-10-26 jkorc2 實測）
   rm -f "/etc/nginx/ssl-certificates/${domain}.crt" "/etc/nginx/ssl-certificates/${domain}.key" 2>/dev/null || true
 
   # 清理網站 Nginx 日誌目錄與 httpauth 安全設定
@@ -435,6 +442,10 @@ site_delete() {
   # 清理 httpauth 相關設定
   rm -f "/etc/nginx/security/.htpasswd-${domain}" \
         "/etc/nginx/security/${domain}.whitelist" 2>/dev/null || true
+  # nginx hook 目錄（httpauth 等設定檔；網域已驗證，不含 /）
+  if [[ -n "$domain" && "$domain" != */* && -d "$(nh_site_dir "$domain")" ]]; then
+    rm -rf -- "$(nh_site_dir "$domain")" 2>/dev/null || true
+  fi
 
   # 4. 重載服務
   nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
@@ -1683,6 +1694,26 @@ site_new() {
     return 1
   fi
 
+  # 6c. 詢問管理員帳密 (若直接 Enter 預設為 wpadmin / 自動產生之強密碼)
+  #     在建立網站之前詢問：wp config create 之後到 wp core install 之前，任何人都能從 install.php 搶先安裝
+  #     （CloudPanel 的 WordPress vhost 不擋），這段期間不可等待輸入
+  # 非互動模式 (-y 或無 TTY) 不詢問，直接採用預設值，避免 read 遇到 EOF 在 set -e 下中止
+  echo ""
+  log_step "$(_t "SITE_NEW_STEP_ADMIN_SETUP")"
+  local input_admin_user="" input_admin_pass=""
+  if [[ "$non_interactive" != "true" ]]; then
+    read -r -p "$(_t "SITE_NEW_PROMPT_ADMIN_USER")" input_admin_user || true
+  fi
+  local wp_admin_user="${input_admin_user:-wpadmin}"
+
+  local default_admin_pass="Clp_$(openssl rand -hex 8)!9"
+  if [[ "$non_interactive" != "true" ]]; then
+    echo -n "$(_t "SITE_NEW_PROMPT_ADMIN_PASS")"
+    read -s -r input_admin_pass || true
+    echo ""
+  fi
+  local wp_admin_pass="${input_admin_pass:-$default_admin_pass}"
+
   # 7. 建立資料庫名稱與密碼 (MySQL 32 字元限制處理)
   local dbname
   dbname=$(domain_to_dbname "$domain")
@@ -1716,6 +1747,8 @@ site_new() {
       return 1
   fi
   log_success "$(_t "SITE_NEW_SUCCESS_CREATE_DB")"
+  # 已啟用 nginx hooks 時，新網站立即加入 hook
+  nginx_hooks_after_create "$domain"
 
   # 9. SSL 憑證配置
   local CLP_INTERNAL_SSL_CALL=1
@@ -1763,25 +1796,7 @@ site_new() {
       return 1
     }
 
-  # 詢問管理員帳密 (若直接 Enter 預設為 wpadmin / 自動產生之強密碼)
-  # 非互動模式 (-y 或無 TTY) 不詢問，直接採用預設值，避免 read 遇到 EOF 在 set -e 下中止
-  echo ""
-  log_step "$(_t "SITE_NEW_STEP_ADMIN_SETUP")"
-  local input_admin_user="" input_admin_pass=""
-  if [[ "$non_interactive" != "true" ]]; then
-    read -r -p "$(_t "SITE_NEW_PROMPT_ADMIN_USER")" input_admin_user || true
-  fi
-  local wp_admin_user="${input_admin_user:-wpadmin}"
-
-  local default_admin_pass="Clp_$(openssl rand -hex 8)!9"
-  if [[ "$non_interactive" != "true" ]]; then
-    echo -n "$(_t "SITE_NEW_PROMPT_ADMIN_PASS")"
-    read -s -r input_admin_pass || true
-    echo ""
-  fi
-  local wp_admin_pass="${input_admin_pass:-$default_admin_pass}"
-
-  # wp_admin_email 已在建立網站之前決定（-email= 或詢問）
+  # wp_admin_user／wp_admin_pass／wp_admin_email 已在建立網站之前決定
 
   # CloudPanel 的 vhost 一律將 http 轉址到 https（未申請憑證時使用自簽憑證），
   # 因此網站網址固定使用 https；改用 http 只會讓每個連結多一次轉址（已實機驗證）
@@ -1941,6 +1956,12 @@ update_cloned_wpconfig() {
   local target_wpconfig="${target_root}/wp-config.php"
 
   if [[ ! -f "$target_wpconfig" ]]; then
+    # clone／migrate：來源已確認是 WordPress（匯出過資料庫），複製後沒有設定檔就不可讓網站上線
+    #（否則任何人都能進入 WordPress 安裝精靈）；由呼叫端刪除新網站與資料庫
+    if [[ "$mode" == "clone" ]]; then
+      log_error "$(_t "SITE_ERR_CLONE_NO_WPCONFIG" "$target_wpconfig")"
+      return 1
+    fi
     return 0
   fi
 
@@ -2693,6 +2714,121 @@ if ($editing_count > 0) {
 # ------------------------------------------------------------------------------
 # 6. Site Clone (clp site -clone-from=<domain1> <domain2>)
 # ------------------------------------------------------------------------------
+# site_clone_offer_protection <source_domain> <target_domain>：來源網站有 clp httpauth、IP 白名單或 cf-only 時，
+#   列出並詢問是否在新網站套用相同設定（預設不套用）；-y 或非 TTY 時不套用，只列出手動指令
+site_clone_offer_protection() {
+  local src="$1" dst="$2"
+  local src_vhost="/etc/nginx/sites-enabled/${src}.conf"
+  [[ -f "$src_vhost" ]] || return 0
+  local state="" has_wl=0 has_cf=0 kind arg
+  if ! declare -F httpauth_has_whitelist >/dev/null; then
+    # shellcheck source=/dev/null
+    source "${CLP_LIB_DIR}/httpauth.sh" || return 0
+  fi
+  state=$(httpauth_protect_state "$src")
+  httpauth_has_whitelist "$src" && has_wl=1
+  [[ "$(cf_only_py db-get "$CF_ONLY_DB" "$src" 2>/dev/null | cut -f2)" == "1" ]] && has_cf=1
+  [[ -z "$state" && "$has_wl" -eq 0 && "$has_cf" -eq 0 ]] && return 0
+
+  # 對應的手動指令（不翻譯）
+  local -a cmds=()
+  local wl_list=""
+  if [[ "$has_wl" -eq 1 ]]; then
+    wl_list=$(grep -v '^[[:space:]]*\(#\|$\)' "$(httpauth_get_whitelist_file "$src")" | tr -d ' \t\r' | paste -sd, - || true)
+    [[ -n "$wl_list" ]] && cmds+=("clp httpauth ${dst} -whitelist=${wl_list}")
+  fi
+  while read -r kind arg; do
+    case "$kind" in
+      wpadmin) cmds+=("clp httpauth ${dst} -wp-admin") ;;
+      path) cmds+=("clp httpauth ${dst} -path=${arg}") ;;
+    esac
+  done <<< "$state"
+  [[ "$has_cf" -eq 1 ]] && cmds+=("clp site ${dst} -cf-only")
+
+  echo ""
+  log_info "$(_t "SITE_CLONE_PROTECT_FOUND" "$src")"
+  [[ -n "$state" ]] && log_info "$(_t "SITE_CLONE_PROTECT_HTPASSWD_NOTE" "$src" "$dst")"
+  local c
+  for c in "${cmds[@]}"; do printf '  %s\n' "$c"; done
+
+  if clp_auto_yes || [[ ! -t 0 ]] || ! prompt_confirm "$(_t "SITE_CLONE_PROTECT_PROMPT" "$dst")" "n"; then
+    log_info "$(_t "SITE_CLONE_PROTECT_SKIPPED")"
+    return 0
+  fi
+
+  # 1. 帳號密碼：來源的 .htpasswd 複製到新網站（以檔案操作工具讀寫，不經過 root 路徑操作）
+  if [[ -n "$state" ]]; then
+    local src_pw dst_pw content
+    src_pw=$(httpauth_get_htpasswd_file "$src")
+    dst_pw=$(httpauth_get_htpasswd_file "$dst")
+    content=$(httpauth_read_htpasswd "$src_pw")
+    if [[ -n "$content" && "$(httpauth_count_users "$dst_pw" 2>/dev/null || echo 0)" == "0" ]]; then
+      local -a w_args=("$dst_pw" --allow-create --mode 640)
+      _httpauth_fileops_user_args "$dst_pw" "$(httpauth_get_siteuser "$dst")" >/dev/null
+      w_args+=("${HTTPAUTH_USER_ARGS[@]}")
+      if ! printf '%s\n' "$content" | python3 -I "${CLP_LIB_DIR}/clp_fileops.py" write "${w_args[@]}"; then
+        log_warn "$(_t "SITE_CLONE_PROTECT_FAILED")"
+        return 0
+      fi
+    fi
+  fi
+  # 2. 白名單要在防護區塊之前設定，區塊才會帶入白名單
+  if [[ -n "$wl_list" ]]; then
+    httpauth_set_whitelist "$dst" "$wl_list" "set" || { log_warn "$(_t "SITE_CLONE_PROTECT_FAILED")"; return 0; }
+  fi
+  # 3. httpauth 防護（與 vhost 重新產生後的重新套用相同）
+  if [[ -n "$state" ]]; then
+    local state_file rc=0
+    state_file=$(umask 077; mktemp) || { log_warn "$(_t "SITE_CLONE_PROTECT_FAILED")"; return 0; }
+    printf '%s\n' "$state" > "$state_file"
+    vhost_httpauth_reapply "$dst" "$state_file" || rc=$?
+    rm -f "$state_file"
+    [[ "$rc" -eq 0 ]] || { log_warn "$(_t "SITE_CLONE_PROTECT_FAILED")"; return 0; }
+  fi
+  # 4. cf-only
+  if [[ "$has_cf" -eq 1 ]]; then
+    cf_only_apply "$dst" on 0 0 || { log_warn "$(_t "SITE_CLONE_PROTECT_FAILED")"; return 0; }
+  fi
+  log_success "$(_t "SITE_CLONE_PROTECT_DONE" "$dst")"
+  return 0
+}
+
+# site_root_is_bound <dir> <user> <expected_path>：網站目錄不是 symlink、擁有者是該網站使用者、實際路徑等於預期路徑
+site_root_is_bound() {
+  local dir="$1" user="$2" expected="$3"
+  [[ -n "$dir" && -n "$user" && ! -L "$dir" && -d "$dir" ]] || return 1
+  [[ "$(stat -c '%U' -- "$dir" 2>/dev/null)" == "$user" ]] || return 1
+  [[ "$(realpath -e -- "$dir" 2>/dev/null)" == "$expected" ]]
+}
+
+# site_copy_tree_as_users <src_user> <src_dir> <dst_user> <dst_dir>：以來源使用者身分讀取、目標使用者身分寫入，
+#   複製網站目錄（排除快取與備份暫存檔）。root 不依路徑讀取使用者目錄，來源目錄被換成 symlink 時
+#   也只讀得到來源使用者本來就能讀的檔案；寫入的檔案直接屬於目標使用者，不需要 root chown -R。
+#   回傳 0 成功；1 有檔案在讀取時變動（其餘已複製）；2 失敗。SITE_COPY_STATUS 記錄讀取／寫入兩端的結束代碼。
+SITE_COPY_STATUS=""
+site_copy_tree_as_users() {
+  local src_user="$1" src="$2" dst_user="$3" dst="$4"
+  local -a st=()
+  local had_e=0
+  [[ "$-" == *e* ]] && had_e=1
+  set +e
+  ( cd / && sudo -H -u "$src_user" tar -C "$src" \
+      --exclude='./wp-content/cache' \
+      --exclude='./wp-content/updraft' \
+      --exclude='./wp-content/wpvividbackups' \
+      -cf - . ) \
+    | ( cd / && sudo -H -u "$dst_user" tar -C "$dst" -xpf - --no-same-owner )
+  st=("${PIPESTATUS[@]}")
+  [[ "$had_e" -eq 1 ]] && set -e
+  SITE_COPY_STATUS="${st[0]}/${st[1]}"
+  [[ "${st[1]}" -ne 0 ]] && return 2
+  case "${st[0]}" in
+    0) return 0 ;;
+    1) return 1 ;;   # GNU tar：file changed as we read it
+    *) return 2 ;;
+  esac
+}
+
 # _site_db_import <db_name> <db_pass> <sql_file> <root_msg_key>：clone／migrate 匯入資料庫
 #   SQL 內容由來源網站使用者（clone 以 wp db export 匯出，會載入其 wp-config.php）或遠端主機（migrate）決定，不可信任：
 #   預設只用新網站自己的 DB 帳號；加上 -db-root 才改用 MySQL root 重試（規則同 backup／restore 的 -db-root：
@@ -2703,7 +2839,8 @@ _site_db_import() {
   local db_name="$1" db_pass="$2" sql_file="$3" root_msg_key="$4"
   local err_file rc=0
   err_file=$(mktemp) || return 1
-  MYSQL_PWD="${db_pass}" mysql --no-defaults -h"127.0.0.1" -u"${db_name}" "${db_name}" < "$sql_file" 2>"$err_file" || rc=$?
+  mysql_no_cmds_opt
+  MYSQL_PWD="${db_pass}" mysql --no-defaults "$CLP_MYSQL_NO_CMDS_OPT" -h"127.0.0.1" -u"${db_name}" "${db_name}" < "$sql_file" 2>"$err_file" || rc=$?
   if [[ $rc -eq 0 ]]; then
     rm -f "$err_file"
     return 0
@@ -2729,7 +2866,7 @@ _site_db_import() {
   fi
   log_warn "$(_t "$root_msg_key")"
   rc=0
-  MYSQL_PWD="${master_pass}" mysql --no-defaults -h"${master_host}" -P"${master_port}" -uroot "${db_name}" < "$sql_file" 2>"$err_file" || rc=$?
+  MYSQL_PWD="${master_pass}" mysql --no-defaults "$CLP_MYSQL_NO_CMDS_OPT" -h"${master_host}" -P"${master_port}" -uroot "${db_name}" < "$sql_file" 2>"$err_file" || rc=$?
   [[ $rc -ne 0 ]] && _site_db_import_show_err "$err_file"
   rm -f "$err_file"
   return "$rc"
@@ -2979,6 +3116,8 @@ site_clone() {
       clpctl site:delete --domainName="$target_domain" --force >/dev/null 2>&1 || true
       return 1
   fi
+  # 已啟用 nginx hooks 時，新網站立即加入 hook
+  nginx_hooks_after_create "$target_domain"
 
   target_root="/home/${target_user}/htdocs/${target_domain}"
   mkdir -p "$target_root"
@@ -3013,24 +3152,28 @@ site_clone() {
   fi
   log_success "$(_t "SITE_CLONE_23")"
 
-  # 9. 同步網站檔案 (排除快取與備份暫存檔)
+  # 9. 複製網站檔案 (排除快取與備份暫存檔)
+  #   來源目錄由來源網站使用者擁有，可以隨時換成 symlink：複製前再確認一次，
+  #   並以來源使用者身分讀取、目標使用者身分寫入，root 不依路徑讀取使用者目錄
   log_step "$(_t "SITE_CLONE_24" "${source_domain}" "${target_domain}")"
-  local rsync_rc=0
-  rsync -a --delete \
-    --exclude='wp-content/cache' \
-    --exclude='wp-content/updraft' \
-    --exclude='wp-content/wpvividbackups' \
-    "${source_root}/" "${target_root}/" || rsync_rc=$?
-  # 24：同步時來源檔案消失（忙碌的網站常見），其餘檔案已複製；其他失敗則清除新網站
-  if [[ "$rsync_rc" -eq 24 ]]; then
-    log_warn "$(_t "SITE_CLONE_WARN_VANISHED")"
-  elif [[ "$rsync_rc" -ne 0 ]]; then
-    log_error "$(_t "SITE_ERR_RSYNC_FAILED" "$rsync_rc")"
+  if ! site_root_is_bound "$source_root" "$source_user" "/home/${source_user}/htdocs/${source_domain}"; then
+    log_error "$(_t "SITE_CLONE_ERR_SOURCE_UNSAFE" "$source_root" "$source_user")"
     clpctl site:delete --domainName="$target_domain" --force >/dev/null 2>&1 || true
     clpctl db:delete --databaseName="$target_dbname" 2>/dev/null || true
     return 1
   fi
-  chown -R "${target_user}:${target_user}" "$target_root"
+  chown -h "${target_user}:${target_user}" "$target_root"
+  local copy_rc=0
+  site_copy_tree_as_users "$source_user" "$source_root" "$target_user" "$target_root" || copy_rc=$?
+  # 1：有檔案在讀取時變動（忙碌的網站常見），其餘檔案已複製；其他失敗則清除新網站
+  if [[ "$copy_rc" -eq 1 ]]; then
+    log_warn "$(_t "SITE_CLONE_WARN_VANISHED")"
+  elif [[ "$copy_rc" -ne 0 ]]; then
+    log_error "$(_t "SITE_ERR_COPY_FAILED" "$SITE_COPY_STATUS")"
+    clpctl site:delete --domainName="$target_domain" --force >/dev/null 2>&1 || true
+    clpctl db:delete --databaseName="$target_dbname" 2>/dev/null || true
+    return 1
+  fi
   log_success "$(_t "SITE_CLONE_25")"
 
   # 10. 安全與環境絕對路徑修復 (.user.ini / Wordfence / 快取外掛)
@@ -3080,6 +3223,9 @@ site_clone() {
   if [[ -n "${CLP_CF_CREDENTIALS:-}" ]]; then
     prompt_cloudflare_dns "$target_domain" "$CLP_CF_CREDENTIALS"
   fi
+
+  # 來源網站的存取防護（httpauth、IP 白名單、cf-only）詢問是否沿用（預設不沿用）
+  site_clone_offer_protection "$source_domain" "$target_domain" || true
 
   return 0
 }
@@ -3225,7 +3371,20 @@ probe_remote_site() {
       fi
     fi
 
-    # 5. 回傳狀態
+    # 5. 網站目錄由網站使用者擁有，不可是 symlink、擁有者必須是該使用者；
+    #    以 /home/*/htdocs 找到的目錄還必須位在擁有者自己的家目錄下
+    if [ \$found -eq 1 ]; then
+      rowner=\$(stat -c '%U' \"\$rpath\" 2>/dev/null || true)
+      if [ -L \"\$rpath\" ] || [ \"\$rowner\" != \"\$ruser\" ]; then
+        echo \"UNSAFE|\$rpath|\$ruser\"
+        exit 0
+      fi
+      case \"\$rpath\" in
+        /home/*/htdocs/*) [ \"\${rpath#/home/\$ruser/htdocs/}\" != \"\$rpath\" ] || { echo \"UNSAFE|\$rpath|\$ruser\"; exit 0; } ;;
+      esac
+    fi
+
+    # 6. 回傳狀態
     if [ \$found -eq 1 ]; then
       echo \"FOUND|\$ruser|\$rpath|\$rphp\"
     else
@@ -3236,6 +3395,9 @@ probe_remote_site() {
   if [[ "$probe_out" == FOUND* ]]; then
     echo "$probe_out"
     return 0
+  elif [[ "$probe_out" == UNSAFE* ]]; then
+    log_error "$(_t "SITE_MIGRATE_ERR_REMOTE_UNSAFE" "$(strip_ctrl_chars "$(cut -d'|' -f2 <<< "$probe_out")")" "${remote_host}" "$(strip_ctrl_chars "$(cut -d'|' -f3 <<< "$probe_out")")")"
+    return 1
   else
     local all_sites=""
     all_sites=$(echo "$probe_out" | cut -d'|' -f2)
@@ -3591,6 +3753,11 @@ _migrate_single_site() {
   remote_root=$(echo "$remote_info" | cut -d'|' -f3)
   remote_php=$(echo "$remote_info" | cut -d'|' -f4)
   [[ -z "$remote_php" ]] && remote_php="$(get_default_php_version)"
+  # 遠端網站使用者會放進遠端指令（sudo -u）與本機的建站參數：只接受一般的使用者名稱
+  if [[ ! "$remote_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    log_error "$(_t "SITE_MIGRATE_ERR_REMOTE_USER" "$(strip_ctrl_chars "$remote_user")")"
+    return 1
+  fi
   log_info "$(_t "SITE__MIGRATE_SINGLE_SITE_1" "$(strip_ctrl_chars "$remote_user")" "$(strip_ctrl_chars "$remote_root")" "$(strip_ctrl_chars "$remote_php")")"
 
   # 檢查遠端來源站線上登入使用者狀態
@@ -3701,6 +3868,8 @@ _migrate_single_site() {
       rm -f "$sql_backup"
       return 1
   fi
+  # 已啟用 nginx hooks 時，新網站立即加入 hook
+  nginx_hooks_after_create "$target_domain"
 
   local target_root="/home/${target_user}/htdocs/${target_domain}"
   mkdir -p "$target_root"
@@ -3747,7 +3916,10 @@ _migrate_single_site() {
 
   # 網站檔案同步
   log_step "$(_t "SITE__MIGRATE_SINGLE_SITE_16")"
-  if ! rsync -avzP \
+  #   遠端：以遠端網站使用者身分讀取（不是 ssh 登入的 root），來源目錄被換成 symlink 時也讀不到其他檔案
+  #   本機：root 接收，但不建立裝置檔、特殊檔，也不沿用遠端的擁有者（之後再 chown 給網站使用者）
+  if ! rsync -avzP --no-devices --no-specials --no-owner --no-group \
+    --rsync-path="sudo -u ${remote_user} rsync" \
     --exclude='wp-content/cache' \
     --exclude='wp-content/updraft' \
     --exclude='wp-content/wpvividbackups' \
@@ -3812,6 +3984,9 @@ _migrate_single_site() {
   if [[ -n "${CLP_CF_CREDENTIALS:-}" ]]; then
     prompt_cloudflare_dns "$target_domain" "$CLP_CF_CREDENTIALS"
   fi
+
+  # 遠端來源的 httpauth、IP 白名單、cf-only 不會自動帶過來
+  log_info "$(_t "SITE_MIGRATE_INFO_PROTECT" "$target_domain")"
 
   return 0
 }
@@ -4274,6 +4449,7 @@ cf_only_apply() {
 
   if [[ "$vstate" == "$action" && "$db_val" == "$want_db" ]]; then
     log_info "$(_t "SITE_CF_ONLY_INFO_ALREADY" "$domain" "$action")"
+    [[ "$action" == "on" ]] && clp_warn_cf_only_whitelist "$domain" skip-realip
     CF_ONLY_RESULT="already"
     return 0
   fi
@@ -4354,6 +4530,7 @@ cf_only_apply() {
   fi
 
   log_success "$(_t "SITE_CF_ONLY_SUCCESS" "$domain" "$action")"
+  [[ "$action" == "on" ]] && clp_warn_cf_only_whitelist "$domain" skip-realip
   CF_ONLY_RESULT="changed"
   return 0
 }
@@ -5052,6 +5229,8 @@ vhost_httpauth_reapply() {
     # shellcheck source=/dev/null
     source "${CLP_LIB_DIR}/httpauth.sh" || return 1
   fi
+  # 舊格式（尚未加入 nginx hook）的網站：重新套用原本就有的防護，不受「開啟防護需先加入 hook」的限制
+  local HTTPAUTH_LEGACY_OK=1
   while read -r kind arg; do
     case "$kind" in
       wpadmin) httpauth_set_wp_admin "$domain" on || return 1 ;;
@@ -5078,6 +5257,38 @@ vhost_restore() {
     rc=1
   fi
   return "$rc"
+}
+
+# vhost_backup <domain> <bdir>：備份資料庫、網站目前的範本（${VHOST_STAGE}/export.json）與 vhost 檔
+vhost_backup() {
+  local domain="$1" bdir="$2" vhost="/etc/nginx/sites-enabled/${1}.conf"
+  ( umask 077; mkdir -p "$bdir" ) || return 1
+  ( umask 077; vhost_tpl_py backup-db --db "$VHOST_DB" --dest "${bdir}/db.sq3" ) \
+    && ( umask 077; vhost_tpl_py current --domain "$domain" < "${VHOST_STAGE}/export.json" > "${bdir}/site.tpl" ) \
+    && cp -p "$vhost" "${bdir}/vhost.conf"
+}
+
+# vhost_write_template <domain> <template_file> <bdir>：寫入網站範本；優先用 CloudPanel 自己的程式，
+#   版本不相容（4）時改以 clp 使用者直接寫入資料庫（VHOST_WRITER 記錄用了哪一種）。
+#   失敗時確認資料庫中的範本沒有被改到，已改到就還原
+vhost_write_template() {
+  local domain="$1" new_tpl="$2" bdir="$3" rc=0
+  VHOST_WRITER="php"
+  vhost_php set-template "$domain" < "$new_tpl" >/dev/null || rc=$?
+  if [[ "$rc" -eq 4 ]]; then
+    VHOST_WRITER="sqlite"
+    rc=0
+    ( cd / && sudo -H -u clp python3 -I "${VHOST_STAGE}/vhost_tpl.py" set-template --db "$VHOST_DB" --domain "$domain" \
+        < "$new_tpl" >/dev/null ) || rc=$?
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    log_error "$(_t "SITE_VHOST_ERR_WRITE" "$domain")"
+    if ! vhost_export || ! vhost_tpl_py current --domain "$domain" < "${VHOST_STAGE}/export.json" | cmp -s - "${bdir}/site.tpl"; then
+      log_warn "$(_t "SITE_VHOST_WARN_WRITE_PARTIAL" "$domain")"
+      vhost_restore "$domain" "$bdir" || log_error "$(_t "SITE_VHOST_ERR_RESTORE" "$bdir")"
+    fi
+    return 1
+  fi
 }
 
 # vhost_update_site <domain> <template_name|""> <force 0|1>
@@ -5126,10 +5337,7 @@ vhost_update_site() {
   # 備份：資料庫、網站目前的範本、vhost 檔
   local bdir
   bdir="${VHOST_BACKUP_BASE}/$(date +%Y%m%d_%H%M%S)/${domain}"
-  ( umask 077; mkdir -p "$bdir" ) || return 1
-  if ! ( umask 077; vhost_tpl_py backup-db --db "$VHOST_DB" --dest "${bdir}/db.sq3" ) \
-     || ! ( umask 077; vhost_tpl_py current --domain "$domain" < "${VHOST_STAGE}/export.json" > "${bdir}/site.tpl" ) \
-     || ! cp -p "$vhost" "${bdir}/vhost.conf"; then
+  if ! vhost_backup "$domain" "$bdir"; then
     log_error "$(_t "SITE_VHOST_ERR_BACKUP" "$bdir")"
     return 1
   fi
@@ -5143,27 +5351,10 @@ vhost_update_site() {
   fi
   log_info "$(_t "SITE_VHOST_INFO_BACKUP" "$bdir")"
 
-  # 寫入新範本：優先用 CloudPanel 自己的程式；版本不相容（4）時改以 clp 使用者直接寫入資料庫
-  local rc=0
-  VHOST_WRITER="php"
-  vhost_php set-template "$domain" < "$new_tpl" >/dev/null || rc=$?
-  if [[ "$rc" -eq 4 ]]; then
-    VHOST_WRITER="sqlite"
-    rc=0
-    ( cd / && sudo -H -u clp python3 -I "${VHOST_STAGE}/vhost_tpl.py" set-template --db "$VHOST_DB" --domain "$domain" \
-        < "$new_tpl" >/dev/null ) || rc=$?
-  fi
-  if [[ "$rc" -ne 0 ]]; then
-    log_error "$(_t "SITE_VHOST_ERR_WRITE" "$domain")"
-    # 確認資料庫中的範本沒有被改到；已改到（例如寫入後才失敗）就還原
-    if ! vhost_export || ! vhost_tpl_py current --domain "$domain" < "${VHOST_STAGE}/export.json" | cmp -s - "${bdir}/site.tpl"; then
-      log_warn "$(_t "SITE_VHOST_WARN_WRITE_PARTIAL" "$domain")"
-      vhost_restore "$domain" "$bdir" || log_error "$(_t "SITE_VHOST_ERR_RESTORE" "$bdir")"
-    fi
-    return 1
-  fi
+  vhost_write_template "$domain" "$new_tpl" "$bdir" || return 1
   # 從這裡開始到完成前被中斷（Ctrl-C、SSH 斷線）時，由 vhost_on_signal 還原
   VHOST_PENDING="${domain}|${bdir}"
+  local rc=0
 
   if [[ "$VHOST_WRITER" == "sqlite" ]]; then
     # 無法呼叫 CloudPanel 的程式：vhost 檔仍是舊的，請使用者到後台儲存
@@ -5336,7 +5527,7 @@ site_handler() {
   local -a used_pos=("site")
   [[ -n "$action" ]] && used_pos+=("$action")
   [[ -n "$target_domain" ]] && used_pos+=("$target_domain")
-  reject_extra_positionals raw_args "on|off|new|list|delete|del|ssl|dns|http|cf-waf|cf_waf|cf-only|cf_only|varnish|fix|all|status|check|exclude|clone-from|clone_from|migrate|db-root|db_root|y|yes|force-replace|force_replace|vhost|template|force" "${used_pos[@]}" || return 1
+  reject_extra_positionals raw_args "on|off|new|list|delete|del|ssl|dns|http|cf-waf|cf_waf|cf-only|cf_only|varnish|fix|all|status|check|exclude|clone-from|clone_from|migrate|db-root|db_root|y|yes|force-replace|force_replace|vhost|template|force|nginx-hooks|nginx_hooks" "${used_pos[@]}" || return 1
 
   # 檢查 options
   if has_opt "list" || [[ "$action" == "list" ]]; then
@@ -5352,6 +5543,20 @@ site_handler() {
   # Varnish 快取診斷與修正
   if has_opt "varnish"; then
     site_varnish "$target_domain"
+    return $?
+  fi
+
+  # nginx hooks（計畫 51）：單站加入／移除／查看
+  if has_opt "nginx-hooks" || has_opt "nginx_hooks"; then
+    local nh_val
+    nh_val=$(opt_get "nginx-hooks" "$(opt_get "nginx_hooks" "on")")
+    [[ "$nh_val" == "true" ]] && nh_val="on"
+    nh_val=$(echo "$nh_val" | tr '[:upper:]' '[:lower:]')
+    if [[ -n "$target_domain" ]]; then
+      target_domain=$(clean_domain "$target_domain")
+      require_site_exists "$target_domain" "-nginx-hooks" || return 1
+    fi
+    nginx_hooks_site_cmd "$target_domain" "$nh_val"
     return $?
   fi
 
