@@ -2551,25 +2551,39 @@ server_install() {
               fi
 
               # 刪除其他管理員前列出名單確認；任何一位刪除失敗都不可回報成功（db.sq3 已在建立新管理員前備份）
-
-              local old_admins_to_del
-              old_admins_to_del=$(sqlite3 -readonly "$clp_db_file" "SELECT user_name FROM user WHERE role = 'ROLE_ADMIN' AND user_name != '$new_admin_user';" 2>/dev/null || true)
-              if [[ -n "$old_admins_to_del" ]]; then
-                echo -e "${C_YELLOW}$(_t "SERVER_EXISTING_REPLACE_INFO_WILL_DELETE" "$(echo $old_admins_to_del)")${C_NC}"
+              # db.sq3 由 clp 帳號（CloudPanel 網頁程式）寫入：名稱逐行讀取，不符合管理員名稱格式的不刪除
+              #   （之後要放進 root 執行的 SQL），列為刪除失敗，請使用者到 CloudPanel 後台處理
+              local old_admins_raw old_adm
+              local -a old_admins_to_del=()
+              local del_failed=""
+              old_admins_raw=$(sqlite3 -readonly "$clp_db_file" "SELECT user_name FROM user WHERE role = 'ROLE_ADMIN' AND user_name != '$new_admin_user';" 2>/dev/null || true)
+              while IFS= read -r old_adm; do
+                [[ -z "$old_adm" ]] && continue
+                if [[ "$old_adm" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+                  old_admins_to_del+=("$old_adm")
+                else
+                  del_failed+="$(strip_ctrl_chars "$old_adm") "
+                fi
+              done <<< "$old_admins_raw"
+              if [[ -n "$del_failed" ]]; then
+                printf '%s\n' "${C_YELLOW}$(_t "SERVER_EXISTING_REPLACE_WARN_SKIP_INVALID" "${del_failed% }")${C_NC}"
+              fi
+              if [[ ${#old_admins_to_del[@]} -gt 0 ]]; then
+                echo -e "${C_YELLOW}$(_t "SERVER_EXISTING_REPLACE_INFO_WILL_DELETE" "${old_admins_to_del[*]}")${C_NC}"
                 if ! prompt_confirm "$(_t "SERVER_EXISTING_REPLACE_PROMPT_DELETE")" "y"; then
                   echo -e "${C_YELLOW}$(_t "SERVER_EXISTING_REPLACE_INFO_KEPT" "${new_admin_user}")${C_NC}"
-                  old_admins_to_del=""
+                  old_admins_to_del=()
+                  del_failed=""
                 fi
               fi
-              local del_failed=""
-              for old_adm in $old_admins_to_del; do
+              for old_adm in ${old_admins_to_del[@]+"${old_admins_to_del[@]}"}; do
                 if ! clpctl user:delete --userName="$old_adm" --force >/dev/null 2>&1 && \
                    ! sqlite3 "$clp_db_file" "PRAGMA foreign_keys=ON; DELETE FROM user WHERE user_name = '$old_adm' AND role = 'ROLE_ADMIN';" 2>/dev/null; then
                   del_failed+="${old_adm} "
                 fi
               done
               if [[ -n "$del_failed" ]]; then
-                echo -e "${C_RED}$(_t "SERVER_EXISTING_REPLACE_ERR_DELETE" "${del_failed% }" "${clp_db_backup}")${C_NC}"
+                printf '%s\n' "${C_RED}$(_t "SERVER_EXISTING_REPLACE_ERR_DELETE" "${del_failed% }" "${clp_db_backup}")${C_NC}"
               fi
 
               _clp_data_fix_perms /home/clp/htdocs/app/data

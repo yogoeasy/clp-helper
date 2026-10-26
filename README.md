@@ -141,7 +141,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.3.0 (build 2026-10-25 18:15:01)`
+Output example:`CLP Helper v1.3.1 (build 2026-10-26 09:45:57)`
 
 Display global help menu:
 
@@ -1137,10 +1137,12 @@ sudo clp restore example.com -type=compact -keep-extra
 - **No automatic MySQL root**: if both fail, the command stops with an error. A restore checks database access before the snapshot: if the restore imports a database (`.sql`, `full`), it stops there and nothing has been changed; a files-only restore (`compact`, `archive`) continues with a warning and the snapshot does not include the database.
 - **`-db-root`**: allows the MySQL root account as a last resort. It always connects to the CloudPanel MySQL master server from `clpctl db:show:master-credentials` (the `DB_HOST` in `wp-config.php` is ignored), and the database name may contain only letters, digits, `_` and `-`.
 - **Database names starting with `-`** are never passed to `mysql`／`mysqldump` (WP-CLI runs as the site user and is not affected).
+- **`site -clone-from` / `-migrate`** import the database with the new site's database user only. The SQL comes from the source site or the remote host, so a failed import does not fall back to MySQL root: the command stops with an error and removes the new site and database (with `-force-replace`, the replaced site has already been deleted). If you trust the source, run again with `-db-root`; the SQL then runs with MySQL root privileges.
 
 ```bash
 sudo clp backup example.com -type=db -db-root
 sudo clp restore example.com -file=example.com-db-20260921_120000.sql.gz -db-root
+sudo clp site -clone-from=example.com new-example.com -db-root
 ```
 
 #### ⑤ Restoring a Complete Site from compact + db + archive

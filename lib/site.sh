@@ -2646,7 +2646,7 @@ if ($editing_count > 0) {
     echo "$(_t "SITE_PROMPT_WP_ACTIVE_SESSIONS_5")"
     local idx=1 ri
     for ri in "${!roles[@]}"; do
-      echo "$(_t "SITE_PROMPT_WP_ACTIVE_SESSIONS_6" "$idx" "${roles[ri]}" "${role_counts[ri]}")"
+      echo "$(_t "SITE_PROMPT_WP_ACTIVE_SESSIONS_6" "$idx" "$(strip_ctrl_chars "${roles[ri]}")" "$(strip_ctrl_chars "${role_counts[ri]}")")"
       idx=$((idx + 1))
     done
     local all_idx=$idx
@@ -2677,7 +2677,7 @@ if ($editing_count > 0) {
         if [[ "$user_choice" =~ ^[0-9]+$ ]] && [[ "$user_choice" -ge 1 && "$user_choice" -lt "$all_idx" ]]; then
           local selected_role="${roles[$((user_choice - 1))]}"
           echo ""
-          echo -e "$(_t "SITE_PROMPT_WP_ACTIVE_SESSIONS_13" "${C_BOLD}" "${selected_role}" "${C_NC}")"
+          echo "$(_t "SITE_PROMPT_WP_ACTIVE_SESSIONS_13" "${C_BOLD}" "$(strip_ctrl_chars "$selected_role")" "${C_NC}")"
           render_wp_users_detail "$json_data" "$selected_role"
           echo ""
         else
@@ -2693,6 +2693,59 @@ if ($editing_count > 0) {
 # ------------------------------------------------------------------------------
 # 6. Site Clone (clp site -clone-from=<domain1> <domain2>)
 # ------------------------------------------------------------------------------
+# _site_db_import <db_name> <db_pass> <sql_file> <root_msg_key>：clone／migrate 匯入資料庫
+#   SQL 內容由來源網站使用者（clone 以 wp db export 匯出，會載入其 wp-config.php）或遠端主機（migrate）決定，不可信任：
+#   預設只用新網站自己的 DB 帳號；加上 -db-root 才改用 MySQL root 重試（規則同 backup／restore 的 -db-root：
+#   連 CloudPanel 的 MySQL master，名稱限英數字開頭、其後為英數字／底線／-）
+#   --no-defaults：不讀 /root/.my.cnf（其中的密碼優先於 MYSQL_PWD）
+#   mysql 的錯誤訊息會引用 SQL 片段（內容不可信任）：ERROR 行移除控制字元、截斷後以 log_warn 顯示並寫入 log
+_site_db_import() {
+  local db_name="$1" db_pass="$2" sql_file="$3" root_msg_key="$4"
+  local err_file rc=0
+  err_file=$(mktemp) || return 1
+  MYSQL_PWD="${db_pass}" mysql --no-defaults -h"127.0.0.1" -u"${db_name}" "${db_name}" < "$sql_file" 2>"$err_file" || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    rm -f "$err_file"
+    return 0
+  fi
+  _site_db_import_show_err "$err_file"
+  if ! has_opt "db-root" && ! has_opt "db_root"; then
+    rm -f "$err_file"
+    log_warn "$(_t "SITE_DB_IMPORT_HINT_ROOT")"
+    return 1
+  fi
+  local master_host master_port master_pass
+  if [[ "$db_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+    read -r master_host master_port <<< "$(get_mysql_master_host_port)"
+  fi
+  if ! [[ "${master_host:-}" =~ ^[A-Za-z0-9.:_-]+$ && "${master_port:-}" =~ ^[0-9]+$ ]]; then
+    rm -f "$err_file"
+    return 1
+  fi
+  master_pass=$(get_mysql_master_pass)
+  if [[ -z "$master_pass" ]]; then
+    rm -f "$err_file"
+    return 1
+  fi
+  log_warn "$(_t "$root_msg_key")"
+  rc=0
+  MYSQL_PWD="${master_pass}" mysql --no-defaults -h"${master_host}" -P"${master_port}" -uroot "${db_name}" < "$sql_file" 2>"$err_file" || rc=$?
+  [[ $rc -ne 0 ]] && _site_db_import_show_err "$err_file"
+  rm -f "$err_file"
+  return "$rc"
+}
+
+# _site_db_import_show_err <err_file>：顯示 mysql 的 ERROR 行（最後 3 行，每行最多 300 字元）
+#   MariaDB 會在 ERROR 前印出失敗的整段 SQL（可能含資料內容），不顯示也不寫入 log
+_site_db_import_show_err() {
+  local line
+  [[ -s "$1" ]] || return 0
+  while IFS= read -r line; do
+    line=$(strip_ctrl_chars "$line")
+    log_warn "$(_t "SITE_DB_IMPORT_ERR_LINE" "${line:0:300}")"
+  done < <(grep -E '^ERROR' "$1" | tail -n 3)
+}
+
 # _wp_replace_domain <site_user> <site_root> <source_domain> <target_domain> [<source_root>]
 #   以 WP-CLI 替換資料庫中的網址與網站路徑（規則參考 UpdraftPlus 的遷移，計畫 52）；任何一次失敗回傳 1
 #   - 只替換網址形式：http://、https://、//、JSON 跳脫的 \/\/，各含 www. 與不含 www.；裸網域與 email 不動
@@ -2952,16 +3005,11 @@ site_clone() {
 
   # 8. 匯入資料庫（來源已在步驟 4b 匯出到 $sql_backup）
   # 匯入至新資料庫 (使用 MYSQL_PWD 避免密碼洩漏至行程清單)
-  if ! MYSQL_PWD="${target_dbpass}" mysql -h"127.0.0.1" -u"${target_dbname}" "${target_dbname}" < "$sql_backup" 2>/dev/null; then
-    log_warn "$(_t "SITE_CLONE_21")"
-    local master_pass
-    master_pass=$(get_mysql_master_pass)
-    if ! MYSQL_PWD="${master_pass}" mysql -h"127.0.0.1" -uroot "${target_dbname}" < "$sql_backup"; then
-      log_error "$(_t "SITE_CLONE_22")"
-      clpctl site:delete --domainName="$target_domain" --force >/dev/null 2>&1 || true
-      clpctl db:delete --databaseName="$target_dbname" 2>/dev/null || true
-      return 1
-    fi
+  if ! _site_db_import "$target_dbname" "$target_dbpass" "$sql_backup" "SITE_CLONE_21"; then
+    log_error "$(_t "SITE_CLONE_22")"
+    clpctl site:delete --domainName="$target_domain" --force >/dev/null 2>&1 || true
+    clpctl db:delete --databaseName="$target_dbname" 2>/dev/null || true
+    return 1
   fi
   log_success "$(_t "SITE_CLONE_23")"
 
@@ -3196,9 +3244,9 @@ probe_remote_site() {
       log_info "$(_t "SITE_PROBE_REMOTE_SITE_2" "${remote_host}")"
       local -a all_sites_arr=()
       read -ra all_sites_arr <<< "$all_sites"
-      # 呼叫端以 $(...) 取得 stdout：清單寫到 stderr 才看得到
+      # 呼叫端以 $(...) 取得 stdout：清單寫到 stderr 才看得到；清單來自遠端主機，顯示前移除控制字元
       for s in "${all_sites_arr[@]}"; do
-        echo -e "  - ${C_CYAN}${s}${C_NC}" >&2
+        printf '  - %s%s%s\n' "$C_CYAN" "$(strip_ctrl_chars "$s")" "$C_NC" >&2
       done
     fi
     return 1
@@ -3255,7 +3303,7 @@ site_migrate_all() {
       if [[ "$r_type" == "php" && "${r_app,,}" == "wordpress" ]]; then
         wp_domains+="${r_dom}"$'\n'
       else
-        log_warn "$(_t "SITE_MIGRATE_ALL_SKIP_TYPE" "$r_dom" "${r_type}${r_app:+/${r_app}}")"
+        log_warn "$(_t "SITE_MIGRATE_ALL_SKIP_TYPE" "$(strip_ctrl_chars "$r_dom")" "$(strip_ctrl_chars "${r_type}${r_app:+/${r_app}}")")"
       fi
     done <<< "$remote_domains_raw"
     remote_domains_raw="${wp_domains%$'\n'}"
@@ -3290,6 +3338,11 @@ site_migrate_all() {
   declare -a domains_to_migrate=()
   while IFS= read -r dom; do
     [[ -z "$dom" ]] && continue
+    # 網域清單來自遠端主機：_migrate_single_site 會拒絕的名稱（例如含控制字元）不列入確認清單
+    if [[ "$(clean_domain "$dom")" != "$dom" ]] || ! is_valid_domain "$dom"; then
+      log_warn "$(_t "SITE_MIGRATE_ALL_SKIP_INVALID" "$(strip_ctrl_chars "$dom")")"
+      continue
+    fi
     local skip=0
     for pat in "${exclude_patterns[@]}"; do
       if domain_matches_exclude "$dom" "$pat"; then
@@ -3538,7 +3591,7 @@ _migrate_single_site() {
   remote_root=$(echo "$remote_info" | cut -d'|' -f3)
   remote_php=$(echo "$remote_info" | cut -d'|' -f4)
   [[ -z "$remote_php" ]] && remote_php="$(get_default_php_version)"
-  log_info "$(_t "SITE__MIGRATE_SINGLE_SITE_1" "${remote_user}" "${remote_root}" "${remote_php}")"
+  log_info "$(_t "SITE__MIGRATE_SINGLE_SITE_1" "$(strip_ctrl_chars "$remote_user")" "$(strip_ctrl_chars "$remote_root")" "$(strip_ctrl_chars "$remote_php")")"
 
   # 檢查遠端來源站線上登入使用者狀態
   prompt_wp_active_sessions "$remote_host" "$source_domain" "$remote_root" "$remote_user" || return 1
@@ -3672,22 +3725,17 @@ _migrate_single_site() {
     site_ssl "$target_domain" "$migrate_ssl_mode" || log_warn "$(_t "SITE_CLONE_17" "${target_domain}")"
   fi
 
-  # 匯入已下載的遠端資料庫；本地匯入失敗時可改用 root 重試
+  # 匯入已下載的遠端資料庫；本地帳號匯入失敗時，只有加上 -db-root 才改用 root 重試
   _migrate_abort_db() {
     clpctl site:delete --domainName="$target_domain" --force >/dev/null 2>&1 || true
     clpctl db:delete --databaseName="$target_dbname" 2>/dev/null || true
     rm -f "$sql_backup"
   }
 
-  if ! MYSQL_PWD="${target_dbpass}" mysql -h"127.0.0.1" -u"${target_dbname}" "${target_dbname}" < "$sql_backup" 2>/dev/null; then
-    log_warn "$(_t "SITE__MIGRATE_SINGLE_SITE_13")"
-    local master_pass
-    master_pass=$(get_mysql_master_pass)
-    if ! MYSQL_PWD="${master_pass}" mysql -h"127.0.0.1" -uroot "${target_dbname}" < "$sql_backup"; then
-      log_error "$(_t "SITE__MIGRATE_SINGLE_SITE_14")"
-      _migrate_abort_db
-      return 1
-    fi
+  if ! _site_db_import "$target_dbname" "$target_dbpass" "$sql_backup" "SITE__MIGRATE_SINGLE_SITE_13"; then
+    log_error "$(_t "SITE__MIGRATE_SINGLE_SITE_14")"
+    _migrate_abort_db
+    return 1
   fi
 
   chmod 600 "$sql_backup" 2>/dev/null || true
@@ -5288,7 +5336,7 @@ site_handler() {
   local -a used_pos=("site")
   [[ -n "$action" ]] && used_pos+=("$action")
   [[ -n "$target_domain" ]] && used_pos+=("$target_domain")
-  reject_extra_positionals raw_args "on|off|new|list|delete|del|ssl|dns|http|cf-waf|cf_waf|cf-only|cf_only|varnish|fix|all|status|check|exclude|clone-from|clone_from|migrate|y|yes|force-replace|force_replace|vhost|template|force" "${used_pos[@]}" || return 1
+  reject_extra_positionals raw_args "on|off|new|list|delete|del|ssl|dns|http|cf-waf|cf_waf|cf-only|cf_only|varnish|fix|all|status|check|exclude|clone-from|clone_from|migrate|db-root|db_root|y|yes|force-replace|force_replace|vhost|template|force" "${used_pos[@]}" || return 1
 
   # 檢查 options
   if has_opt "list" || [[ "$action" == "list" ]]; then

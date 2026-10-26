@@ -724,6 +724,15 @@ clean_domain() {
   echo "$dom"
 }
 
+# strip_ctrl_chars <字串>：移除終端機控制字元（C0、DEL、UTF-8 編碼的 C1），供顯示來自遠端主機或網站使用者的字串
+#   只用於顯示；不可用來「修正」之後還要拿去使用的值（會變成另一個名稱）
+strip_ctrl_chars() {
+  local LC_ALL=C s="$1"
+  s="${s//[$'\x01'-$'\x1f'$'\x7f']/}"
+  s="${s//$'\xc2'[$'\x80'-$'\x9f']/}"
+  printf '%s' "$s"
+}
+
 is_valid_domain() {
   local dom
   dom=$(clean_domain "$1")

@@ -139,7 +139,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.3.0 (建置時間 2026-10-25 18:15:01)`
+輸出範例：`CLP Helper v1.3.1 (建置時間 2026-10-26 09:45:57)`
 
 查看全域功能說明選單：
 
@@ -1145,10 +1145,12 @@ sudo clp restore example.com -type=compact -keep-extra
 - **不會自動改用 MySQL root**：兩者都失敗時直接報錯。還原會在建立快照之前先確認資料庫可以存取：會匯入資料庫的還原（`.sql`、`full`）在這裡停止，尚未變更任何內容；只還原檔案（`compact`、`archive`）時顯示警告後繼續，快照不包含資料庫。
 - **`-db-root`**：允許最後改用 MySQL root 帳號。一律連 CloudPanel 的 MySQL master（`clpctl db:show:master-credentials` 提供的主機與埠號，不使用 `wp-config.php` 的 `DB_HOST`），資料庫名稱只能包含英數字、`_` 與 `-`。
 - **以 `-` 開頭的資料庫名稱**：不會交給 `mysql`／`mysqldump`（WP-CLI 以網站使用者身分執行，不受影響）。
+- **`site -clone-from`／`-migrate`**：只用新網站的資料庫帳號匯入。匯入的 SQL 由來源網站或遠端主機決定，失敗時不會自動改用 MySQL root，而是報錯並移除新建的網站與資料庫（使用 `-force-replace` 時，被取代的舊網站已先刪除）。確定來源可信時，可加上 `-db-root` 重新執行，SQL 會以 MySQL root 權限執行。
 
 ```bash
 sudo clp backup example.com -type=db -db-root
 sudo clp restore example.com -file=example.com-db-20260921_120000.sql.gz -db-root
+sudo clp site -clone-from=example.com new-example.com -db-root
 ```
 
 #### ⑤ 用 compact + db + archive 還原完整網站
