@@ -18,7 +18,7 @@ Usage (root; the database is opened read-only, nothing is written to it):
   vhost_tpl.py backup-db --db DB --dest FILE          sqlite backup of the database (read-only source)
   vhost_tpl.py set-template --db DB --domain D        (stdin: template) fallback writer, run as the clp user
   vhost_tpl.py hooks-add --domain D [--file F]        template (stdin: export JSON) or file F with the clp
-                                                      nginx hook lines (plan 51) on stdout
+                                                      nginx hook lines on stdout
   vhost_tpl.py hooks-remove --domain D [--file F]     the same without the hook lines
   vhost_tpl.py hooks-state [--domain D] [--file F]    on | partial | none (export JSON: "<domain>\t<state>" lines)
   vhost_tpl.py hooks-report --vhost-dir DIR [--domain D]  (stdin: export JSON) one line per site, tab separated:
@@ -45,7 +45,7 @@ PLACEHOLDER_RE = re.compile(r'^(\s*)\{\{server_name\}\}\s*$')
 SAFE_NAME_RE = re.compile(r'[^A-Za-z0-9._-]+')
 DOMAIN_RE = re.compile(r'^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$')
 
-# clp nginx hooks (plan 51): an http-level include at the top of the file and a server-level include
+# clp nginx hooks: an http-level include at the top of the file and a server-level include
 # right after the root line of the HTTPS server block
 HOOK_DIR = '/etc/nginx/clp-helper'
 HOOK_HTTP_START = '# --- CLP HELPER HOOKS (http) START ---'

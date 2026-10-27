@@ -143,7 +143,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.3.2 (build 2026-10-26 22:20:39)`
+Output example:`CLP Helper v1.3.3 (build 2026-10-27 08:20:54)`
 
 Display global help menu:
 
@@ -446,7 +446,7 @@ Remove and disable SSL certificate:
 sudo clp site example.com -ssl=off
 ```
 
-The site goes back to the self-signed certificate CloudPanel created with it (read from the CloudPanel database; a new one is generated only if it is missing). Let's Encrypt files under `/etc/letsencrypt` are not touched. The CloudPanel SSL page may still list the previously imported certificate.
+The site goes back to the self-signed certificate CloudPanel created with it (read from the CloudPanel database; a new one is generated only if it is missing). Let's Encrypt files under `/etc/letsencrypt` are not touched. The self-signed certificate also becomes the active one in CloudPanel (as installing it on the site's SSL/TLS page does), so CloudPanel no longer renews and reinstalls a Let's Encrypt certificate issued with `-http`; if clp cannot use this CloudPanel version's code, it tells you to switch it on that page yourself. The vhost is not changed (it always uses `/etc/nginx/ssl-certificates/<domain>.crt`/`.key`), so HTTPS still answers, with a browser warning for the self-signed certificate (through Cloudflare: works with SSL mode Full, fails with Full (strict)). certbot's own renewal of a `-dns` certificate is not removed.
 
 > **Cloudflare credentials for renewal**: when the token comes from `clp.local`, an environment variable or a plain token file, `-dns` writes it to `/root/.clp/cf-certbot/<domain>.ini` (root only, 600), because certbot reads that file again on every renewal. After you rotate the token, run `-ssl=on -dns` again for each such site (or edit that file); deleting a site does not remove it.
 

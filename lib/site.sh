@@ -502,6 +502,28 @@ _certbot_credentials_file() {
   echo "$ini"
 }
 
+# site_ssl_off_cloudpanel_cert <domain>：-ssl=off 後，把 CloudPanel 使用中的憑證也切回建站時的自簽憑證（計畫 54）。
+#   否則資料庫仍以 Let's Encrypt 為使用中，CloudPanel 每天的續期（到期前 7 天）會把它裝回去，後台也顯示錯誤的憑證。
+#   以 clp 使用者執行 CloudPanel 自己的程式（與後台安裝憑證相同）；此時憑證檔已是一般檔案，不會寫到 certbot 的連結目標。
+#   失敗只警告（檔案已是自簽，網站本身已完成 -ssl=off）
+site_ssl_off_cloudpanel_cert() {
+  local domain="$1" out="" rc=0
+  [[ -f "$VHOST_DB" ]] || return 0
+  if ! vhost_stage_init; then
+    vhost_stage_cleanup
+    log_warn "$(_t "SITE_SSL_WARN_CP_CERT_MANUAL" "$domain")"
+    return 0
+  fi
+  out="$(vhost_php set-certificate "$domain" 2>/dev/null)" || rc=$?
+  vhost_stage_cleanup
+  if [[ "$rc" -ne 0 ]]; then
+    log_warn "$(_t "SITE_SSL_WARN_CP_CERT_MANUAL" "$domain")"
+  elif [[ "$out" == "ok" ]]; then
+    log_info "$(_t "SITE_SSL_INFO_CP_CERT_SWITCHED" "$domain")"
+  fi
+  return 0
+}
+
 site_ssl() {
   local domain
   domain=$(clean_domain "$1")
@@ -592,6 +614,7 @@ PYEOF
     rm -rf "$work_dir"
     systemctl reload nginx 2>/dev/null || true
     log_success "$(_t "SITE_SSL_SUCCESS_REMOVED" "${domain}")"
+    site_ssl_off_cloudpanel_cert "$domain"
     return 0
   fi
 

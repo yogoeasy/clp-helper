@@ -141,7 +141,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.3.2 (建置時間 2026-10-26 22:20:39)`
+輸出範例：`CLP Helper v1.3.3 (建置時間 2026-10-27 08:20:54)`
 
 查看全域功能說明選單：
 
@@ -454,7 +454,7 @@ sudo clp site example.com -ssl=on -http
 sudo clp site example.com -ssl=off
 ```
 
-網站會改回 CloudPanel 建立網站時的自簽憑證（從 CloudPanel 資料庫讀取；找不到時才產生新的），不會動到 `/etc/letsencrypt` 中的 Let's Encrypt 檔案。CloudPanel 後台的 SSL 頁面可能仍列出先前匯入的憑證。
+網站會改回 CloudPanel 建立網站時的自簽憑證（從 CloudPanel 資料庫讀取；找不到時才產生新的），不會動到 `/etc/letsencrypt` 中的 Let's Encrypt 檔案。CloudPanel 使用中的憑證也會切回這張自簽憑證（與在網站的 SSL/TLS 頁面安裝它相同），CloudPanel 不會再續期並裝回 `-http` 簽發的 Let's Encrypt 憑證；clp 無法使用此 CloudPanel 版本的程式時，會提示你到該頁面自行切換。vhost 不變（固定使用 `/etc/nginx/ssl-certificates/<網域>.crt`／`.key`），所以 HTTPS 仍可連線，但瀏覽器會因自簽憑證顯示警告（經 Cloudflare 時：SSL 模式 Full 可用，Full (strict) 會失敗）。`-dns` 憑證在 certbot 中的續期設定不會刪除。
 
 > **續期用的 Cloudflare 憑證檔**：token 來自 `clp.local`、環境變數或純 token 檔時，`-dns` 會把它寫入 `/root/.clp/cf-certbot/<網域>.ini`（只有 root 可讀，600），因為 certbot 每次續期都會再讀取這個檔案。更換 token 後，請對這些網站再執行一次 `-ssl=on -dns`（或直接修改該檔案）；刪除網站時不會刪除它。
 

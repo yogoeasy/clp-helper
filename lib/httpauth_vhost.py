@@ -484,7 +484,7 @@ def cmd_refresh(vhost, htpasswd, wl):
 
 
 def cmd_strip_legacy(vhost, siteuser):
-    """Write the vhost without any CLP HTTPAUTH block to stdout (migration to the hook files, plan 51).
+    """Write the vhost without any CLP HTTPAUTH block to stdout (migration to the hook files).
     Line endings are kept; the 'auth_basic off;' lines added to deny-all locations are left alone."""
     with open(vhost, 'r', encoding='utf-8', errors='surrogateescape', newline='') as f:
         content = f.read()

@@ -1780,3 +1780,7 @@ CLP_I18N_zh_TW_HTTPAUTH_ERR_CP_BASIC_AUTH="%s 已啟用 CloudPanel 內建的 Bas
 CLP_I18N_zh_TW_HTTPAUTH_ERR_HOOK_RENDER="無法產生 %s 的 httpauth hook 檔，沒有做任何修改。"
 CLP_I18N_zh_TW_HTTPAUTH_WARN_HOOK_INACTIVE="%s 的 httpauth hook 檔目前沒有生效：網站的 nginx hook 已消失。"
 CLP_I18N_zh_TW_HTTPAUTH_WARN_LEGACY="%s 的防護仍寫在 vhost 中（舊格式），在 CloudPanel 後台儲存 vhost 會讓它消失。移到 hook 檔：sudo clp site %s -nginx-hooks=on"
+
+# -ssl=off 與 CloudPanel 使用中的憑證（計畫 54）
+CLP_I18N_zh_TW_SITE_SSL_INFO_CP_CERT_SWITCHED="CloudPanel 使用中的 %s 憑證也已切回自簽（不會再續期先前的 Let's Encrypt 憑證）。"
+CLP_I18N_zh_TW_SITE_SSL_WARN_CP_CERT_MANUAL="CloudPanel 仍以 %s 先前的憑證為使用中；如果是 Let's Encrypt 憑證，CloudPanel 會在到期前把它重新裝回。請到 CloudPanel 該網站的 SSL/TLS 分頁切換成自簽憑證。"

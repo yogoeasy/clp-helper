@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CLP Helper - httpauth nginx hook files (plan 51; used by lib/httpauth.sh and lib/nginx_hooks.sh)
+CLP Helper - httpauth nginx hook files (used by lib/httpauth.sh and lib/nginx_hooks.sh)
 
 The protection of a site lives in clp's own files, included from the site's vhost through the clp
 hook lines (vhost_tpl.py hooks-add), so CloudPanel regenerating the vhost no longer removes it:

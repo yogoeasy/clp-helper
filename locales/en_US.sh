@@ -1732,7 +1732,7 @@ CLP_I18N_en_US_CORE_ERR_ATOMIC_DIR_NOT_ROOT="atomic_replace: directory '%s' is n
 CLP_I18N_en_US_CORE_ERR_MARKED_BLOCK_COUNT="remove_marked_block: start and end markers do not match in %s (%s: %s, %s: %s)."
 CLP_I18N_en_US_CORE_ERR_MARKED_BLOCK_PARSE="remove_marked_block: cannot parse the markers in %s (wrong order?)."
 
-# nginx hooks (plan 51)
+# nginx hooks
 CLP_I18N_en_US_HELP_OPT_SITE_NGINX_HOOKS="Add / remove / show the clp nginx include lines of the site (-nginx-hooks=on|off|status)"
 CLP_I18N_en_US_SERVER_HELP_DESC_NGINX_HOOKS="Add the clp nginx include lines to every site's vhost template (required by clp httpauth)"
 CLP_I18N_en_US_NH_ST_ON="on"
@@ -1780,3 +1780,7 @@ CLP_I18N_en_US_HTTPAUTH_ERR_CP_BASIC_AUTH="CloudPanel's own Basic Auth is enable
 CLP_I18N_en_US_HTTPAUTH_ERR_HOOK_RENDER="Cannot build the httpauth hook file of %s; nothing was changed."
 CLP_I18N_en_US_HTTPAUTH_WARN_HOOK_INACTIVE="The httpauth hook file of %s is NOT active: the site's nginx hook lines are missing."
 CLP_I18N_en_US_HTTPAUTH_WARN_LEGACY="The protection of %s is still written in the vhost (old format); saving the vhost in CloudPanel removes it. Move it into hook files with: sudo clp site %s -nginx-hooks=on"
+
+# -ssl=off and CloudPanel's active certificate
+CLP_I18N_en_US_SITE_SSL_INFO_CP_CERT_SWITCHED="CloudPanel now also uses the self-signed certificate of %s (it will not renew the previous Let's Encrypt certificate)."
+CLP_I18N_en_US_SITE_SSL_WARN_CP_CERT_MANUAL="CloudPanel still lists the previous certificate of %s as active; if it is a Let's Encrypt certificate, CloudPanel installs it again before it expires. Switch to the self-signed certificate in the site's SSL/TLS tab in CloudPanel."
