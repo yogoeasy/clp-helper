@@ -146,7 +146,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.3.4 (build 2026-10-27 18:08:06)`
+Output example:`CLP Helper v1.3.5 (build 2026-10-27 22:26:28)`
 
 Display global help menu:
 
@@ -182,7 +182,7 @@ sudo clp <module> [target_domain] [options...]
 | **`site`** | WordPress Site Management | `-new`, `-list`, `-on`, `-off`, `-ssl`, `-cf-waf`, `-cf-only`, `-varnish`, `-clone-from`, `-migrate`, `delete` |
 | **`server`** | Server Operations & Hardening | `(no args)`, `install`, `-harden`, `-ufw`, `-ssh`, `-fail2ban`, `-clean` |
 | **`backup`** | Site & Database Backup | `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
-| **`restore`** | Site & Database Restore | `[-file=<name>]`, `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}` |
+| **`restore`** | Site & Database Restore | `[-file=<name>[,...]]`, `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}` |
 | **`httpauth`** | HTTP Authentication & Whitelisting | `-add`, `-delete`, `-list`, `-wp-admin`, `-path`, `-whitelist` |
 | **`php-pm`** | PHP-FPM Pool Optimization | `<domain>`, `-all`, `-status`, `-fix`, `-max-children=`, `-idle-timeout=`, `-max-requests=` |
 | **`config`** | Global Preferences & Credentials | `-set <key>=<val>`, `-get <key>`, `-list`, `-unset <key>` |
@@ -1121,7 +1121,7 @@ Restore from Google Drive cloud backups list:
 sudo clp restore example.com -to=google
 ```
 
-The system will list all available snapshots. Select a number and confirm with `yes` to execute database restoration, file extraction, PHP-FPM reload, and WordPress cache flushing. Use `-type={db|full|compact|archive}` to list only one type.
+The system lists the available backups. If there are both full backups and db／compact／archive files, you first choose how to restore: **1) one complete backup (full)**, or **2) choose db + compact + archive yourself**, in three steps (database → site files → past years' uploads; press Enter to skip a step). In step 3, an archive older than the chosen compact is marked with the uploads year that neither file contains. After everything is downloaded and unpacked, you confirm once with `yes`. Use `-type={db|full|compact|archive}` to list only one type and pick one file.
 
 #### ② Exact Command Line Restore
 
@@ -1150,7 +1150,7 @@ By default, a file restore deletes files on the site that are not in the backup 
   - `db`: imports the database only; no files are touched.
 - **The year comes from the backup**: it is read from the timestamp in the file name, not the date of the restore.
 - **Always protected**: the current `wp-config.php` (the backup's copy is saved in the snapshot folder) and the cache and backup-plugin folders listed above.
-- **Confirmation**: in interactive mode, the number of items to be deleted and the first 20 are shown, and you must type `yes` to continue; with `-y` or `--force` it proceeds directly.
+- **Confirmation**: all files are downloaded and unpacked first; then, in interactive mode, the number of items each file will delete and the first 20 are shown, and you type `yes` once to continue (answering anything else changes nothing and leaves no snapshot). With `-y` or `--force` it proceeds directly.
 - **Previous behavior**: add `-keep-extra` to overwrite without deleting.
 - **Recoverable**: a snapshot is taken before every restore (`<backup-dir>/rollback/`, default `/root/clpBackup/rollback/`) and covers every file that can be deleted; a failed restore is rolled back automatically.
 
@@ -1187,21 +1187,17 @@ sudo clp site -clone-from=example.com new-example.com -db-root
 
 #### ⑤ Restoring a Complete Site from compact + db + archive
 
-`restore` handles one file at a time. Each type only touches its own scope, so restoring the three files one after another rebuilds the complete site. Recommended order: `db` → `compact` → `archive`:
+Give the three files in one `-file`, separated by commas (at most one of each type; a `full` backup is always restored on its own):
 
 ```bash
-sudo clp restore example.com -type=db -to=google
+sudo clp restore example.com -to=google -file=example.com-archive-20261001_030000.tar.gz,example.com-compact-20261025_030000.tar.gz,example.com-db-20261025_030000.sql.gz
 ```
 
-```bash
-sudo clp restore example.com -type=compact -to=google
-```
-
-```bash
-sudo clp restore example.com -type=archive -to=google
-```
-
-Note: every restore takes a full site snapshot first, so three restores create three snapshots. Make sure `/root/clpBackup` has enough free space.
+- **Prepared first**: every file is downloaded and unpacked, and the items to be deleted are worked out, before anything changes. If any file fails (download, unpacking, an archive from another site), the whole restore is cancelled.
+- **One confirmation, one snapshot**: you confirm once for all files, and a single snapshot is taken. The files are then applied as `archive` → `compact` → `db`; if any step fails, the site and database are rolled back from that one snapshot.
+- **compact wins its own year**: if the archive also contains the compact's year (for example a December compact with a January archive), that year is taken from the compact and the archive leaves it alone.
+- **Years in neither file**: if the archive is from an earlier year than the compact (for example a December archive with a January compact), the archive's year is in neither file; it is left as it is on the site now, and a warning is shown.
+- **Disk space**: all files are unpacked at the same time (in `/var/tmp`; remote files are downloaded there as well), plus one snapshot. If space is short, restore the files one at a time instead.
 
 ---
 

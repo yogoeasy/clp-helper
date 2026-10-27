@@ -1248,12 +1248,13 @@ backup_handler() {
   fi
 }
 
-# restore_build_rsync_rules <type> <backup_year> <extracted_root> <siteroot>
+# restore_build_rsync_rules <type> <backup_year> <extracted_root> <siteroot> [<skip_year>]
 #   設定 RESTORE_RSYNC_RULES：還原時 rsync 的 include/exclude 規則（以網站根目錄為傳輸根目錄）。
 #   預設會搭配 --delete 鏡像，所以規則必須把「該類型備份範圍以外」的路徑全部排除（被排除的路徑不會被刪除）。
 #   回傳 0：可安全使用 --delete；2：取不到備份年份；3：無法判斷類型（兩者都只能不帶 --delete 還原）。
 restore_build_rsync_rules() {
   local kind="$1" year="$2" src="$3" siteroot="$4"
+  local skip_year="${5:-}"  # archive：同時還原的 compact 年份，以 compact 為準，archive 不處理
   local rc=0
   backup_rsync_exclude_args
   RESTORE_RSYNC_RULES=(--exclude='/.clp_db_export.sql' "${BACKUP_RSYNC_EXCLUDES[@]}")
@@ -1287,7 +1288,8 @@ restore_build_rsync_rules() {
           [[ -e "$entry" || -L "$entry" ]] || continue
           name="${entry##*/}"
           [[ -n "$year" && "$name" == "$year" ]] && continue
-          if [[ "$name" == *[\*\?\[\\]* || "$name" == *$'\n'* ]]; then
+          [[ -n "$skip_year" && "$name" == "$skip_year" ]] && continue
+          if [[ "$name" == *[\*\?\[\\]*|| "$name" == *$'\n'* ]]; then
             log_warn "$(_t "BACKUP_RESTORE_WARN_SKIP_NAME" "$name")"
             continue
           fi
@@ -1329,10 +1331,60 @@ _restore_hint_old_dir() {
   return 0
 }
 
+# _restore_print_rows <index...>：列出選單（使用呼叫端 restore_site 的 avail_* 陣列與 RESTORE_MARKS）
+_restore_print_rows() {
+  local n=0 idx
+  printf "%-5s %-45s %-10s %-12s %-18s\n" "#" "$(_t "BACKUP_SITE_24")" "$(_t "BACKUP_SITE_25")" "$(_t "BACKUP_SITE_26")" "$(_t "BACKUP_SITE_27")"
+  echo "--------------------------------------------------------------------------------------------------------"
+  for idx in "$@"; do
+    n=$((n + 1))
+    printf "%-5s %-45s %-10s %-12s %-18s %s\n" "$n" "${avail_files[$idx]}" "${avail_types[$idx]}" "${avail_sizes[$idx]}" "${avail_dates[$idx]}" "${RESTORE_MARKS[$idx]:-}"
+  done
+  echo "--------------------------------------------------------------------------------------------------------"
+}
+
+# _restore_ask <count> <prompt>：讀取 1～count 的編號，設定 RESTORE_PICK（直接按 Enter 時為空字串）；
+#   輸入 q 或讀到 EOF 時回傳 1（取消）；無效的輸入重新詢問
+_restore_ask() {
+  local count="$1" prompt="$2" ans=""
+  while true; do
+    if ! read -r -p "$prompt" ans; then
+      echo ""
+      return 1
+    fi
+    ans="$(printf '%s' "$ans" | tr -d '[:space:]')"
+    [[ "$ans" =~ ^[Qq]$ ]] && return 1
+    if [[ -z "$ans" ]]; then
+      RESTORE_PICK=""
+      return 0
+    fi
+    # 以十進位解讀（010 不可被當成八進位的 8）
+    if [[ "$ans" =~ ^[0-9]{1,6}$ ]] && (( 10#$ans >= 1 && 10#$ans <= count )); then
+      RESTORE_PICK=$((10#$ans))
+      return 0
+    fi
+    log_warn "$(_t "BACKUP_SITE_30" "$ans")"
+  done
+}
+
+# 套用順序：archive → compact → full → db（compact 在 archive 之後，資料庫最後）
+_restore_kind_order() {
+  case "$1" in
+    archive) echo 1 ;;
+    compact) echo 2 ;;
+    db) echo 4 ;;
+    *) echo 3 ;;
+  esac
+}
+
+# restore_site <domain> [<file[,file...]>] [<type>] [<to>] [<path>] [<force>]
+#   一次可以還原多個檔案（db、compact、archive 各最多一個；full 只能單獨還原）。流程：
+#   1. 選擇檔案（-file 或選單）；2. 準備：下載、解壓、建立規則、算出要刪除的項目（任何失敗都還沒有變更）；
+#   3. 確認一次；4. 快照一次；5. 依 archive → compact → db 套用，任何一步失敗就用同一份快照回復。
 restore_site() {
   local domain="$1"
-  local r_file="${2:-}"     # specific backup filename
-  local r_type="${3:-}"     # db | full | compact filter
+  local r_file="${2:-}"     # backup filename(s), comma separated
+  local r_type="${3:-}"     # db | full | compact | archive filter for the menu
   local r_to="${4:-local}"  # local | <remote_name>
   local r_path="${5:-}"     # custom local dir or remote path
   local force_mode="${6:-0}"
@@ -1352,10 +1404,6 @@ restore_site() {
     return 1
   fi
 
-  # ----------------------------------------------------------------------------
-  # Step 1: Locate or Select Backup File
-  # ----------------------------------------------------------------------------
-  local selected_file="$r_file"
   local source_is_remote=0
   [[ "$r_to" != "local" ]] && source_is_remote=1
 
@@ -1371,16 +1419,42 @@ restore_site() {
   # 還原前快照寫在 backup-dir 底下的 rollback/；先檢查設定，不合法時在確認與下載之前停止
   backup_rollback_base >/dev/null || return 1
 
-  if [[ -z "$selected_file" ]]; then
+  local remote="" remote_dir="" search_dir=""
+  if [[ "$source_is_remote" -eq 1 ]]; then
+    remote="${r_to%:}"
+    remote_dir="${r_path:-${cfg_remote_dir}/${domain}}"
+    remote_dir=$(echo "$remote_dir" | sed 's~^/~~; s~/$~~')
+  else
+    search_dir="${r_path:-${cfg_local_dir}}"
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Step 1: Select backup file(s)
+  # ----------------------------------------------------------------------------
+  local -a sel_files=()
+  if [[ -n "$r_file" ]]; then
+    local -a parts=()
+    local part
+    IFS=',' read -ra parts <<< "$r_file"
+    for part in "${parts[@]}"; do
+      part="$(printf '%s' "$part" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [[ -n "$part" ]] && sel_files+=("$part")
+    done
+    if [[ ${#sel_files[@]} -eq 0 ]]; then
+      log_error "$(_t "BACKUP_RESTORE_ERR_EMPTY_LIST")"
+      return 1
+    fi
+    if [[ ${#sel_files[@]} -gt 1 && -n "$r_type" ]]; then
+      log_error "$(_t "BACKUP_RESTORE_ERR_TYPE_WITH_LIST")"
+      return 1
+    fi
+  else
     log_step "$(_t "BACKUP_SITE_20" "${domain}" "${r_to}")"
 
-    local available_files=()
-    local available_sizes=()
-    local available_dates=()
-    local available_types=()
+    local -a avail_files=() avail_sizes=() avail_dates=() avail_types=()
+    local -A RESTORE_MARKS=()
 
     if [[ "$source_is_remote" -eq 0 ]]; then
-      local search_dir="${r_path:-${cfg_local_dir}}"
       [[ -z "$r_path" ]] && _restore_hint_old_dir "$domain" "$search_dir"
       if [[ ! -d "$search_dir" ]]; then
         log_error "$(_t "BACKUP_SITE_21" "${search_dir}")"
@@ -1390,16 +1464,11 @@ restore_site() {
       # List matching local backup files sorted newest to oldest
       while IFS= read -r f; do
         [[ -z "$f" ]] && continue
-        local fname
+        local fname fbytes fsize fdate ftype
         fname=$(basename "$f")
-        local fbytes
         fbytes=$(stat -c '%s' "$f" 2>/dev/null || stat -f '%z' "$f" 2>/dev/null || wc -c < "$f")
-        local fsize
         fsize=$(backup_format_size "$fbytes")
-        local fdate
         fdate=$(date -r "$f" +"%Y-%m-%d %H:%M" 2>/dev/null || date -d "@$(stat -c '%Y' "$f" 2>/dev/null)" +"%Y-%m-%d %H:%M" 2>/dev/null || _t "BACKUP_DATE_UNKNOWN")
-
-        local ftype
         ftype=$(backup_file_type "$fname" "$domain")
 
         # Filter by r_type if requested
@@ -1407,17 +1476,14 @@ restore_site() {
           continue
         fi
 
-        available_files+=("$fname")
-        available_sizes+=("$fsize")
-        available_dates+=("$fdate")
-        available_types+=("$ftype")
+        avail_files+=("$fname")
+        avail_sizes+=("$fsize")
+        avail_dates+=("$fdate")
+        avail_types+=("$ftype")
       done < <(find "$search_dir" -maxdepth 1 -type f \( -name "${domain}-*.tar.gz" -o -name "${domain}-*.sql.gz" -o -name "${domain}-*.sql" \) -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2- || true)
 
     else
-      local remote="${r_to%:}"
       backup_validate_remote "$remote" || return 1
-      local remote_dir="${r_path:-${cfg_remote_dir}/${domain}}"
-      remote_dir=$(echo "$remote_dir" | sed 's~^/~~; s~/$~~')
 
       # Query rclone lsl (依日期時間由新到舊排序)
       local raw_lsl
@@ -1431,29 +1497,32 @@ restore_site() {
       while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         # Format of rclone lsl: "  123456 2026-09-21 12:34:56.000000000 filename"
-        local fbytes fdate ftime fname
+        local fbytes fdate ftime fname fsize ftype
         read -r fbytes fdate ftime fname <<< "$line"
         ftime="${ftime%%.*}"
         fname="${fname##*/}"
-
-        local fsize
         fsize=$(backup_format_size "$fbytes")
-        local ftype
         ftype=$(backup_file_type "$fname" "$domain")
 
         if [[ -n "$r_type" && "$ftype" != "$r_type" ]]; then
           continue
         fi
 
-        available_files+=("$fname")
-        available_sizes+=("$fsize")
-        available_dates+=("${fdate} ${ftime}")
-        available_types+=("$ftype")
+        avail_files+=("$fname")
+        avail_sizes+=("$fsize")
+        avail_dates+=("${fdate} ${ftime}")
+        avail_types+=("$ftype")
       done <<< "$raw_lsl"
     fi
 
-    if [[ ${#available_files[@]} -eq 0 ]]; then
+    if [[ ${#avail_files[@]} -eq 0 ]]; then
       log_error "$(_t "BACKUP_SITE_22" "${r_to}" "${domain}")"
+      return 1
+    fi
+
+    # 選單需要終端機（-y 不會自動挑選檔案）；讀到 EOF 或輸入 q 視為取消
+    if [[ ! -t 0 ]]; then
+      log_error "$(_t "BACKUP_RESTORE_ERR_MENU_NEEDS_TTY")"
       return 1
     fi
 
@@ -1461,111 +1530,173 @@ restore_site() {
     echo -e "${C_CYAN}${C_BOLD}========================================================================================================${C_NC}"
     echo -e "$(_t "BACKUP_SITE_23" "${C_CYAN}" "${C_BOLD}" "${domain}" "${r_to}" "${C_NC}")"
     echo -e "${C_CYAN}${C_BOLD}========================================================================================================${C_NC}"
-    printf "%-5s %-45s %-10s %-12s %-18s\n" "#" "$(_t "BACKUP_SITE_24")" "$(_t "BACKUP_SITE_25")" "$(_t "BACKUP_SITE_26")" "$(_t "BACKUP_SITE_27")"
-    echo "--------------------------------------------------------------------------------------------------------"
-    for i in "${!available_files[@]}"; do
-      local idx=$((i + 1))
-      printf "%-5s %-45s %-10s %-12s %-18s\n" "$idx" "${available_files[$i]}" "${available_types[$i]}" "${available_sizes[$i]}" "${available_dates[$i]}"
+
+    local -a whole_idx=() part_idx=()
+    local i
+    for i in "${!avail_files[@]}"; do
+      case "${avail_types[$i]}" in
+        db|compact|archive) part_idx+=("$i") ;;
+        *) whole_idx+=("$i") ;;
+      esac
     done
-    echo "--------------------------------------------------------------------------------------------------------"
-    echo ""
 
-    # 選單需要終端機（-y 不會自動挑選檔案）；讀到 EOF 視為取消
-    if [[ ! -t 0 ]]; then
-      log_error "$(_t "BACKUP_RESTORE_ERR_MENU_NEEDS_TTY")"
-      return 1
-    fi
-    local user_choice=""
-    read -r -p "$(_t "BACKUP_SITE_28" "${#available_files[@]}")" user_choice || user_choice=""
-    if [[ "$user_choice" =~ ^[Qq]$ || -z "$user_choice" ]]; then
-      log_info "$(_t "BACKUP_SITE_29")"
-      return 0
+    # -type 指定時與只有一種備份時：一張清單選一個（full 與無法判斷類型的封裝只能單獨還原）
+    local mode=2
+    if [[ -n "$r_type" ]]; then
+      mode=0
+    elif [[ ${#part_idx[@]} -eq 0 ]]; then
+      mode=1
+    elif [[ ${#whole_idx[@]} -gt 0 ]]; then
+      echo ""
+      echo "$(_t "BACKUP_RESTORE_MODE_TITLE")"
+      echo "$(_t "BACKUP_RESTORE_MODE_OPT1")"
+      echo "$(_t "BACKUP_RESTORE_MODE_OPT2")"
+      local mode_ans=""
+      while true; do
+        if ! read -r -p "$(_t "BACKUP_RESTORE_MODE_PROMPT")" mode_ans; then
+          echo ""
+          log_info "$(_t "BACKUP_SITE_29")"
+          return 0
+        fi
+        mode_ans="$(printf '%s' "$mode_ans" | tr -d '[:space:]')"
+        case "$mode_ans" in
+          1|2) mode="$mode_ans"; break ;;
+          q|Q) log_info "$(_t "BACKUP_SITE_29")"; return 0 ;;
+          *) log_warn "$(_t "BACKUP_SITE_30" "$mode_ans")" ;;
+        esac
+      done
     fi
 
-    # 以十進位解讀（010 不可被當成八進位的 8）
-    [[ "$user_choice" =~ ^[0-9]{1,6}$ ]] && user_choice=$((10#$user_choice))
-    if ! [[ "$user_choice" =~ ^[0-9]+$ ]] || [[ "$user_choice" -lt 1 || "$user_choice" -gt "${#available_files[@]}" ]]; then
-      log_error "$(_t "BACKUP_SITE_30" "${user_choice}")"
-      return 1
+    local RESTORE_PICK=""
+    if [[ "$mode" -ne 2 ]]; then
+      local -a list_idx=()
+      if [[ "$mode" -eq 0 ]]; then
+        list_idx=("${!avail_files[@]}")
+      else
+        list_idx=("${whole_idx[@]}")
+      fi
+      echo ""
+      _restore_print_rows "${list_idx[@]}"
+      echo ""
+      if ! _restore_ask "${#list_idx[@]}" "$(_t "BACKUP_SITE_28" "${#list_idx[@]}")" || [[ -z "$RESTORE_PICK" ]]; then
+        log_info "$(_t "BACKUP_SITE_29")"
+        return 0
+      fi
+      sel_files=("${avail_files[${list_idx[$((RESTORE_PICK - 1))]}]}")
+    else
+      # 依序選 db、compact、archive，每一步可以按 Enter 跳過
+      local step_kind step_key c_pick_year="" a_year
+      local -a step_idx=()
+      for step_kind in db compact archive; do
+        step_idx=()
+        for i in "${part_idx[@]}"; do
+          [[ "${avail_types[$i]}" == "$step_kind" ]] && step_idx+=("$i")
+        done
+        [[ ${#step_idx[@]} -eq 0 ]] && continue
+        if [[ "$step_kind" == "archive" && -n "$c_pick_year" ]]; then
+          for i in "${step_idx[@]}"; do
+            a_year=$(backup_file_year "${avail_files[$i]}")
+            if [[ -n "$a_year" && "$a_year" -lt "$c_pick_year" ]]; then
+              RESTORE_MARKS[$i]="$(_t "BACKUP_RESTORE_MARK_YEAR_GAP" "$a_year")"
+            fi
+          done
+        fi
+        step_key="BACKUP_RESTORE_STEP_${step_kind^^}"
+        echo ""
+        echo -e "${C_BOLD}$(_t "$step_key")${C_NC}"
+        _restore_print_rows "${step_idx[@]}"
+        if ! _restore_ask "${#step_idx[@]}" "$(_t "BACKUP_RESTORE_STEP_PROMPT" "${#step_idx[@]}")"; then
+          log_info "$(_t "BACKUP_SITE_29")"
+          return 0
+        fi
+        if [[ -n "$RESTORE_PICK" ]]; then
+          i="${step_idx[$((RESTORE_PICK - 1))]}"
+          sel_files+=("${avail_files[$i]}")
+          [[ "$step_kind" == "compact" ]] && c_pick_year=$(backup_file_year "${avail_files[$i]}")
+        fi
+      done
+      if [[ ${#sel_files[@]} -eq 0 ]]; then
+        log_info "$(_t "BACKUP_SITE_29")"
+        return 0
+      fi
     fi
-
-    selected_file="${available_files[$((user_choice - 1))]}"
   fi
 
-  # ----------------------------------------------------------------------------
-  # Step 2: Confirmation Prompt
-  # ----------------------------------------------------------------------------
-  echo ""
-  echo -e "$(_t "BACKUP_SITE_31" "${C_YELLOW}" "${C_BOLD}" "${C_NC}")"
-  echo -e "$(_t "BACKUP_SITE_32" "${C_CYAN}" "${domain}" "${C_NC}")"
-  echo -e "$(_t "BACKUP_SITE_33" "${C_YELLOW}" "${selected_file}" "${C_NC}")"
-  echo ""
-
+  # 確認需要終端機或 -y；在下載與解壓之前就檢查
   if [[ "$force_mode" -eq 0 ]]; then
     require_tty_or_yes || return 1
-    local confirm=""
-    read -r -p "$(_t "BACKUP_SITE_34")" confirm || confirm=""
-    if [[ "$confirm" != "yes" && "$confirm" != "y" ]]; then
-      log_info "$(_t "BACKUP_SITE_29")"
-      return 0
-    fi
   fi
 
-  # ----------------------------------------------------------------------------
-  # Step 3: Fetch file to local restore cache if remote
-  # ----------------------------------------------------------------------------
-  # 每次還原使用獨立且不可預測的暫存目錄（mktemp 會以 700 權限建立，避免其他本機使用者預先建立或替換檔案）
-  local restore_cache=""
-  trap '[[ -n "${restore_cache:-}" && -d "${restore_cache:-}" ]] && rm -rf "$restore_cache"; trap - RETURN' RETURN
-  local local_restore_file=""
-
-  if [[ "$source_is_remote" -eq 1 ]]; then
-    restore_cache=$(mktemp -d "/var/tmp/clpRestore.XXXXXX")
-    local remote="${r_to%:}"
-    local remote_dir="${r_path:-${cfg_remote_dir}/${domain}}"
-    remote_dir=$(echo "$remote_dir" | sed 's~^/~~; s~/$~~')
-
-    log_step "$(_t "BACKUP_SITE_35" "${remote}" "${selected_file}")"
-    rclone copy -P "${remote}:${remote_dir}/${selected_file}" "$restore_cache/" || {
-      # Fallback: try root of remote
-      rclone copy -P "${remote}:${selected_file}" "$restore_cache/" || {
-        log_error "$(_t "BACKUP_SITE_36")"
+  # 檢查組合並排出套用順序：每種類型最多一個；full 與無法判斷類型的封裝只能單獨還原
+  local -a item_name=() item_kind=() item_year=()
+  local -A seen_kind=()
+  local f fname fkind
+  for f in "${sel_files[@]}"; do
+    fname=$(basename "$f")
+    fkind=$(backup_file_type "$fname" "$domain")
+    if [[ ${#sel_files[@]} -gt 1 ]]; then
+      case "$fkind" in
+        full)
+          log_error "$(_t "BACKUP_RESTORE_ERR_FULL_MIXED" "$fname")"
+          return 1 ;;
+        db|compact|archive) ;;
+        *)
+          log_error "$(_t "BACKUP_RESTORE_ERR_UNKNOWN_IN_SET" "$fname")"
+          return 1 ;;
+      esac
+      if [[ -n "${seen_kind[$fkind]+x}" ]]; then
+        log_error "$(_t "BACKUP_RESTORE_ERR_DUP_TYPE" "$fkind")"
         return 1
-      }
-    }
-    local_restore_file="${restore_cache}/${selected_file}"
-  else
-    local search_dir="${r_path:-${cfg_local_dir}}"
-    if [[ -f "${search_dir}/${selected_file}" ]]; then
-      local_restore_file="${search_dir}/${selected_file}"
-    elif [[ -f "$selected_file" ]]; then
-      local_restore_file="$selected_file"
-    else
-      log_error "$(_t "BACKUP_SITE_37" "${selected_file}")"
+      fi
+    fi
+    seen_kind[$fkind]=1
+    if [[ "$f" != *.sql && "$f" != *.sql.gz && "$f" != *.tar.gz ]]; then
+      log_error "$(_t "BACKUP_SITE_54" "${f}")"
       return 1
     fi
-  fi
+  done
+  local -a ordered=()
+  local i k
+  for k in 1 2 3 4; do
+    for i in "${!sel_files[@]}"; do
+      fname=$(basename "${sel_files[$i]}")
+      [[ "$(_restore_kind_order "$(backup_file_type "$fname" "$domain")")" == "$k" ]] && ordered+=("${sel_files[$i]}")
+    done
+  done
+  sel_files=("${ordered[@]}")
+  local c_year="" a_year=""
+  for f in "${sel_files[@]}"; do
+    fname=$(basename "$f")
+    fkind=$(backup_file_type "$fname" "$domain")
+    item_name+=("$fname")
+    item_kind+=("$fkind")
+    item_year+=("$(backup_file_year "$fname")")
+    [[ "$fkind" == "compact" ]] && c_year="${item_year[-1]}"
+    [[ "$fkind" == "archive" ]] && a_year="${item_year[-1]}"
+  done
+  local n_items="${#sel_files[@]}"
 
-  if [[ ! -f "$local_restore_file" ]]; then
-    log_error "$(_t "BACKUP_SITE_38" "${local_restore_file}")"
-    return 1
-  fi
+  # 這組會不會匯入資料庫、會不會寫入檔案（只看檔名；full 與無法判斷類型的封裝可能含資料庫）
+  local needs_db=0 any_tar=0
+  for i in "${!sel_files[@]}"; do
+    [[ "${sel_files[$i]}" == *.tar.gz ]] && any_tar=1
+    case "${item_kind[$i]}" in
+      compact|archive) [[ "${sel_files[$i]}" == *.tar.gz ]] || needs_db=1 ;;
+      *) needs_db=1 ;;
+    esac
+  done
 
   # ----------------------------------------------------------------------------
-  # Step 4: Snapshot (Rollback Safety) + Execute Restore
+  # Step 2: Prepare every file (nothing on the site or in the database changes yet)
   # ----------------------------------------------------------------------------
-  log_step "$(_t "BACKUP_SITE_39")"
+  # 先確認資料庫可以存取（不再自動改用 MySQL root）：
+  #   會匯入資料庫時，失敗就在下載與任何變更之前停止；只還原檔案（compact、archive）時只警告，快照不含資料庫。
   local db_creds
   db_creds=$(backup_get_site_db_credentials "$siteroot")
-  # 先確認資料庫可以存取（不再自動改用 MySQL root）：
-  #   本次還原會匯入資料庫（.sql、full 或無法判斷類型的封裝）時，失敗就在快照與任何變更之前停止；
-  #   只還原檔案（compact、archive）時只警告，快照不含資料庫。
   local snap_db_mode="full"
   if [[ -n "${db_creds%%$'\x1f'*}" ]] && ! backup_db_check "$db_creds" "$siteroot" "$siteuser"; then
-    local restore_kind
-    restore_kind=$(backup_file_type "$(basename "$local_restore_file")" "$domain")
     backup_db_hint "$db_creds"
-    if [[ "$local_restore_file" == *.sql || "$local_restore_file" == *.sql.gz || "$restore_kind" != "compact" && "$restore_kind" != "archive" ]]; then
+    if [[ "$needs_db" -eq 1 ]]; then
       log_error "$(_t "BACKUP_RESTORE_ERR_DB_ACCESS" "$domain")"
       return 1
     fi
@@ -1573,6 +1704,199 @@ restore_site() {
     snap_db_mode="files"
   fi
 
+  if [[ "$any_tar" -eq 1 ]]; then
+    # 檔案寫入改由網站使用者執行，找不到網站使用者時不可繼續
+    if [[ -z "$siteuser" ]]; then
+      log_error "$(_t "BACKUP_RESTORE_ERR_NO_SITE_USER" "$domain")"
+      return 1
+    fi
+    # 網站中有不屬於網站使用者的檔案時，網站使用者無法覆寫或刪除，還原會失敗後 rollback；先列出並停止
+    local foreign_owned
+    foreign_owned=$(restore_foreign_owned "$siteuser" "$siteroot")
+    if [[ -n "$foreign_owned" ]]; then
+      log_error "$(_t "BACKUP_RESTORE_ERR_FOREIGN_OWNED" "$siteuser" "$siteuser" "$siteroot")"
+      printf '%s\n' "$foreign_owned" | sed 's/^/    /'
+      return 1
+    fi
+  fi
+
+  # 每次還原使用獨立且不可預測的暫存目錄（mktemp 以 700 建立）。root_dir 放 root 要讀取的檔案
+  # （下載的封裝、SQL、備份中的 wp-config.php、rsync 規則），永遠不交給網站使用者
+  local restore_cache=""
+  trap '[[ -n "${restore_cache:-}" && -d "${restore_cache:-}" ]] && rm -rf "$restore_cache"; trap - RETURN' RETURN
+  restore_cache=$(mktemp -d "/var/tmp/clpRestore.XXXXXX") || return 1
+  local root_dir="${restore_cache}/root"
+  (umask 077; mkdir "$root_dir") || return 1
+
+  local -a item_path=()
+  for i in "${!sel_files[@]}"; do
+    f="${sel_files[$i]}"
+    if [[ "$source_is_remote" -eq 1 ]]; then
+      log_step "$(_t "BACKUP_SITE_35" "${remote}" "${f}")"
+      rclone copy -P "${remote}:${remote_dir}/${f}" "$root_dir/" || {
+        # Fallback: try root of remote
+        rclone copy -P "${remote}:${f}" "$root_dir/" || {
+          log_error "$(_t "BACKUP_SITE_36")"
+          return 1
+        }
+      }
+      item_path+=("${root_dir}/${item_name[$i]}")
+      chmod 600 "${item_path[$i]}" 2>/dev/null || true
+    elif [[ -f "${search_dir}/${f}" ]]; then
+      item_path+=("${search_dir}/${f}")
+    elif [[ -f "$f" ]]; then
+      item_path+=("$f")
+    else
+      log_error "$(_t "BACKUP_SITE_37" "${f}")"
+      return 1
+    fi
+    if [[ ! -f "${item_path[$i]}" ]]; then
+      log_error "$(_t "BACKUP_SITE_38" "${item_path[$i]}")"
+      return 1
+    fi
+  done
+
+  local site_dirname
+  site_dirname="$(basename "$siteroot")"
+  local mirror_default=1
+  if has_opt "keep-extra" || has_opt "keep_extra"; then
+    mirror_default=0
+  fi
+  # 每個封裝的準備結果（索引與 sel_files 相同；SQL 檔沒有封裝相關欄位）
+  local -a item_src=() item_unpack=() item_sql=() item_wpcfg=() item_hascfg=() item_mirror=() item_del=()
+  for i in "${!sel_files[@]}"; do
+    item_src+=(""); item_unpack+=(""); item_sql+=(""); item_wpcfg+=(""); item_hascfg+=(0); item_mirror+=(0); item_del+=("")
+    if [[ "${item_path[$i]}" != *.tar.gz ]]; then
+      item_sql[$i]="${item_path[$i]}"
+      continue
+    fi
+    local unpack_dir="${restore_cache}/unpack_${i}"
+    (umask 077; mkdir "$unpack_dir") || return 1
+    log_info "$(_t "BACKUP_SITE_45")"
+    if ! tar --no-same-owner -xzf "${item_path[$i]}" -C "$unpack_dir"; then
+      log_error "$(_t "BACKUP_RESTORE_ERR_PREPARE" "${item_name[$i]}")"
+      return 1
+    fi
+
+    # 封裝最上層必須是這個網站的目錄（備份時以網站目錄名稱打包）。沒有時拒絕：
+    # 不可退回以解壓根目錄為來源，否則其他網站的目錄與最上層的 backup.sql 會被複製進網站根目錄（公開下載）
+    if [[ ! -d "${unpack_dir}/${site_dirname}" || -L "${unpack_dir}/${site_dirname}" ]]; then
+      log_error "$(_t "BACKUP_RESTORE_ERR_FOREIGN_ARCHIVE" "${item_name[$i]}" "$site_dirname")"
+      return 1
+    fi
+    local extracted_root="${unpack_dir}/${site_dirname}"
+    item_unpack[$i]="$unpack_dir"
+    item_src[$i]="$extracted_root"
+
+    # ------------------------------------------------------------------------
+    # rsync 規則：預設以 --delete 鏡像（還原結果 = 備份當時的檔案），只作用在該類型的備份範圍內。
+    # 被排除的路徑不會被 --delete 刪除，所以必須帶上與備份時相同的排除清單。
+    # 年份以「備份當時」為準（取自檔名時間戳記），不是還原當天。
+    # 同時還原 compact 時，archive 不處理 compact 的年份（以 compact 為準）。
+    # ------------------------------------------------------------------------
+    local skip_year=""
+    [[ "${item_kind[$i]}" == "archive" && -n "$c_year" ]] && skip_year="$c_year"
+    local rules_rc=0
+    restore_build_rsync_rules "${item_kind[$i]}" "${item_year[$i]}" "$extracted_root" "$siteroot" "$skip_year" || rules_rc=$?
+    local mirror_mode="$mirror_default"
+    if [[ "$mirror_mode" -eq 1 && "$rules_rc" -ne 0 ]]; then
+      if [[ "$rules_rc" -eq 2 ]]; then
+        log_warn "$(_t "BACKUP_RESTORE_WARN_NO_YEAR" "${item_name[$i]}")"
+      else
+        log_warn "$(_t "BACKUP_RESTORE_WARN_UNKNOWN_TYPE" "${item_name[$i]}")"
+      fi
+      mirror_mode=0
+    fi
+    item_mirror[$i]="$mirror_mode"
+    printf '%s\0' "${RESTORE_RSYNC_RULES[@]}" > "${root_dir}/rules_${i}" || return 1
+
+    # 交給網站使用者之前，先把要由 root 讀取的檔案移到 root_dir（之後網站使用者可以替換暫存目錄中的檔案）：
+    # 新版封裝最上層的 backup.sql、舊版的 <domain>/.clp_db_export.sql，以及備份中的 wp-config.php
+    # （之後另存於 root 專屬的快照目錄，不可放在網站根目錄，否則會被當成純文字公開）
+    if [[ -f "${unpack_dir}/backup.sql" && ! -L "${unpack_dir}/backup.sql" ]]; then
+      item_sql[$i]="${root_dir}/sql_${i}.sql"
+      mv "${unpack_dir}/backup.sql" "${item_sql[$i]}" || { log_error "$(_t "BACKUP_RESTORE_ERR_PREPARE" "${item_name[$i]}")"; return 1; }
+    elif [[ -f "${extracted_root}/.clp_db_export.sql" && ! -L "${extracted_root}/.clp_db_export.sql" ]]; then
+      item_sql[$i]="${root_dir}/sql_${i}.sql"
+      mv "${extracted_root}/.clp_db_export.sql" "${item_sql[$i]}" || { log_error "$(_t "BACKUP_RESTORE_ERR_PREPARE" "${item_name[$i]}")"; return 1; }
+    fi
+    if [[ -f "${extracted_root}/wp-config.php" && ! -L "${extracted_root}/wp-config.php" ]]; then
+      item_hascfg[$i]=1
+      if [[ -f "${siteroot}/wp-config.php" ]]; then
+        item_wpcfg[$i]="${root_dir}/wpcfg_${i}.php"
+        install -m 600 "${extracted_root}/wp-config.php" "${item_wpcfg[$i]}" || { log_error "$(_t "BACKUP_RESTORE_ERR_PREPARE" "${item_name[$i]}")"; return 1; }
+      fi
+    fi
+    if ! restore_stage_for_user "$siteuser" "$extracted_root" "$restore_cache" "$unpack_dir"; then
+      log_error "$(_t "BACKUP_RESTORE_ERR_PREPARE" "${item_name[$i]}")"
+      return 1
+    fi
+
+    # 先以 dry-run 計算會被刪除的檔案（確認時列出）
+    if [[ "$mirror_mode" -eq 1 ]]; then
+      item_del[$i]=$(sudo -H -u "$siteuser" rsync -rlpt --delete --dry-run --itemize-changes "${RESTORE_RSYNC_RULES[@]}" "${extracted_root}/" "${siteroot}/" 2>/dev/null \
+        | sed -n 's/^\*deleting  *//p' || true)
+    fi
+  done
+
+  # ----------------------------------------------------------------------------
+  # Step 3: Confirm once (files, years, items to be deleted)
+  # ----------------------------------------------------------------------------
+  echo ""
+  echo -e "$(_t "BACKUP_SITE_31" "${C_YELLOW}" "${C_BOLD}" "${C_NC}")"
+  echo -e "$(_t "BACKUP_SITE_32" "${C_CYAN}" "${domain}" "${C_NC}")"
+  if [[ "$n_items" -eq 1 ]]; then
+    echo -e "$(_t "BACKUP_SITE_33" "${C_YELLOW}" "${item_name[0]}" "${C_NC}")"
+  else
+    echo "$(_t "BACKUP_RESTORE_FILES_HEADER")"
+    for i in "${!item_name[@]}"; do
+      echo -e "  $((i + 1)). ${C_YELLOW}${item_name[$i]}${C_NC} (${item_kind[$i]})"
+    done
+  fi
+  echo ""
+  if [[ -n "$c_year" && -n "$a_year" && "$c_year" != "$a_year" ]]; then
+    if [[ "$a_year" -gt "$c_year" ]]; then
+      log_info "$(_t "BACKUP_RESTORE_INFO_YEAR_OVERLAP" "$c_year")"
+    else
+      log_warn "$(_t "BACKUP_RESTORE_WARN_YEAR_GAP" "$a_year" "$c_year" "$a_year")"
+    fi
+  fi
+
+  local total_del=0 any_keep_extra=0 del_count del_preview
+  for i in "${!item_name[@]}"; do
+    [[ -n "${item_src[$i]}" && "${item_mirror[$i]}" -eq 0 ]] && any_keep_extra=1
+    [[ -n "${item_del[$i]}" ]] || continue
+    del_count=$(printf '%s\n' "${item_del[$i]}" | wc -l | tr -d '[:space:]')
+    [[ "$del_count" -gt 0 ]] || continue
+    total_del=$((total_del + del_count))
+    if [[ "$n_items" -eq 1 ]]; then
+      log_warn "$(_t "BACKUP_RESTORE_DELETE_COUNT" "$del_count")"
+    else
+      log_warn "$(_t "BACKUP_RESTORE_DELETE_COUNT_FILE" "${item_name[$i]}" "$del_count")"
+    fi
+    # 先截取再輸出（避免清單很長時 head 提早結束，printf 收到 SIGPIPE 而在 pipefail 下中止）
+    del_preview=$(sed -n '1,20p' <<< "${item_del[$i]}")
+    printf '%s\n' "$del_preview" | sed 's/^/    /'
+    if [[ "$del_count" -gt 20 ]]; then
+      echo "    $(_t "BACKUP_RESTORE_DELETE_MORE" "$((del_count - 20))")"
+    fi
+  done
+  [[ "$any_keep_extra" -eq 1 ]] && log_info "$(_t "BACKUP_RESTORE_INFO_KEEP_EXTRA")"
+
+  if [[ "$force_mode" -eq 0 ]]; then
+    local confirm="" prompt_key="BACKUP_SITE_34"
+    [[ "$total_del" -gt 0 ]] && prompt_key="BACKUP_RESTORE_DELETE_PROMPT"
+    read -r -p "$(_t "$prompt_key")" confirm || confirm=""
+    if [[ "$confirm" != "yes" && "$confirm" != "y" ]]; then
+      log_info "$(_t "BACKUP_SITE_29")"
+      return 0
+    fi
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Step 4: Snapshot (Rollback Safety), once for the whole set
+  # ----------------------------------------------------------------------------
+  log_step "$(_t "BACKUP_SITE_39")"
   # 快照：預設建立；空間不足或快照失敗時，互動模式讓使用者決定是否在沒有快照的情況下繼續，
   # -y／--force 時一律中止（保守預設，需要明確加上 -no-snapshot 才會略過）。
   local snap_dir="" snap_mode="full" snap_problem=""
@@ -1612,193 +1936,73 @@ restore_site() {
     log_info "$(_t "BACKUP_SITE_40" "${snap_dir}")"
   fi
 
+  # 備份中的 wp-config.php 另存於快照目錄（root 專屬）
+  for i in "${!item_wpcfg[@]}"; do
+    [[ -n "${item_wpcfg[$i]}" ]] || continue
+    if install -m 600 "${item_wpcfg[$i]}" "${snap_dir}/wp-config.from-backup.php"; then
+      log_info "$(_t "BACKUP_SITE_49" "${snap_dir}")"
+    fi
+  done
+
+  # ----------------------------------------------------------------------------
+  # Step 5: Apply in order (archive → compact → full → db); any failure rolls back the whole set
+  # ----------------------------------------------------------------------------
   log_step "$(_t "BACKUP_SITE_41" "${domain}")"
-
-  if [[ "$local_restore_file" == *.sql.gz || "$local_restore_file" == *.sql ]]; then
-    # Pure DB Restore
-    log_info "$(_t "BACKUP_SITE_42")"
-    local db_restore_ok=0
-    restore_import_sql "$local_restore_file" "$db_creds" "$siteroot" "$siteuser" && db_restore_ok=1
-
-    if [[ "$db_restore_ok" -eq 0 ]]; then
-      log_error "$(_t "BACKUP_SITE_43")"
-      restore_rollback "$domain" "$siteroot" "$siteuser" "$snap_dir" || true
-      return 1
-    fi
-    log_success "$(_t "BACKUP_SITE_44")"
-    if [[ -f "${siteroot}/wp-config.php" ]]; then
-      restore_sync_wp_table_prefix "${siteroot}/wp-config.php" "$local_restore_file" "$siteuser"
-    fi
-
-  elif [[ "$local_restore_file" == *.tar.gz ]]; then
-    # 檔案寫入改由網站使用者執行，找不到網站使用者時不可繼續
-    if [[ -z "$siteuser" ]]; then
-      log_error "$(_t "BACKUP_RESTORE_ERR_NO_SITE_USER" "$domain")"
-      rm -rf "$snap_dir"
-      return 1
-    fi
-    # 網站中有不屬於網站使用者的檔案時，網站使用者無法覆寫或刪除，還原會失敗後 rollback；先列出並停止
-    local foreign_owned
-    foreign_owned=$(restore_foreign_owned "$siteuser" "$siteroot")
-    if [[ -n "$foreign_owned" ]]; then
-      log_error "$(_t "BACKUP_RESTORE_ERR_FOREIGN_OWNED" "$siteuser" "$siteuser" "$siteroot")"
-      printf '%s\n' "$foreign_owned" | sed 's/^/    /'
-      rm -rf "$snap_dir"
-      return 1
-    fi
-    [[ -z "$restore_cache" ]] && restore_cache=$(mktemp -d "/var/tmp/clpRestore.XXXXXX")
-    # 暫存目錄維持 700，直到解壓結果交給網站使用者後才改為 711（見 restore_stage_for_user）；下載的封裝維持 600
-    [[ "$local_restore_file" == "${restore_cache}/"* ]] && chmod 600 "$local_restore_file"
-    local unpack_dir="${restore_cache}/unpack_$(date +%s)"
-    (umask 077; mkdir -p "$unpack_dir")
-    log_info "$(_t "BACKUP_SITE_45")"
-    if ! tar --no-same-owner -xzf "$local_restore_file" -C "$unpack_dir"; then
-      log_error "$(_t "BACKUP_SITE_46")"
-      restore_rollback "$domain" "$siteroot" "$siteuser" "$snap_dir" || true
-      return 1
-    fi
-
-    # 封裝最上層必須是這個網站的目錄（備份時以網站目錄名稱打包）。沒有時拒絕：
-    # 不可退回以解壓根目錄為來源，否則其他網站的目錄與最上層的 backup.sql 會被複製進網站根目錄（公開下載）
-    local site_dirname
-    site_dirname="$(basename "$siteroot")"
-    if [[ ! -d "${unpack_dir}/${site_dirname}" || -L "${unpack_dir}/${site_dirname}" ]]; then
-      log_error "$(_t "BACKUP_RESTORE_ERR_FOREIGN_ARCHIVE" "$(basename "$local_restore_file")" "$site_dirname")"
-      # 尚未變更任何檔案或資料庫，移除本次快照
-      rm -rf "$snap_dir"
-      return 1
-    fi
-    local extracted_root="${unpack_dir}/${site_dirname}"
-
-    # ------------------------------------------------------------------------
-    # rsync 規則：預設以 --delete 鏡像（還原結果 = 備份當時的檔案），只作用在該類型的備份範圍內。
-    # 被排除的路徑不會被 --delete 刪除，所以必須帶上與備份時相同的排除清單。
-    # 年份以「備份當時」為準（取自檔名時間戳記），不是還原當天。
-    # ------------------------------------------------------------------------
-    local r_kind backup_year
-    r_kind=$(backup_file_type "$(basename "$local_restore_file")" "$domain")
-    backup_year=$(backup_file_year "$(basename "$local_restore_file")")
-    local mirror_mode=1
-    if has_opt "keep-extra" || has_opt "keep_extra"; then
-      mirror_mode=0
-    fi
-
-    local rules_rc=0
-    restore_build_rsync_rules "$r_kind" "$backup_year" "$extracted_root" "$siteroot" || rules_rc=$?
-    local rsync_rules=("${RESTORE_RSYNC_RULES[@]}")
-    if [[ "$mirror_mode" -eq 1 && "$rules_rc" -ne 0 ]]; then
-      if [[ "$rules_rc" -eq 2 ]]; then
-        log_warn "$(_t "BACKUP_RESTORE_WARN_NO_YEAR" "$(basename "$local_restore_file")")"
-      else
-        log_warn "$(_t "BACKUP_RESTORE_WARN_UNKNOWN_TYPE" "$(basename "$local_restore_file")")"
+  local any_files=0
+  for i in "${!item_name[@]}"; do
+    if [[ -z "${item_src[$i]}" ]]; then
+      # Pure DB Restore
+      log_info "$(_t "BACKUP_SITE_42")"
+      if ! restore_import_sql "${item_sql[$i]}" "$db_creds" "$siteroot" "$siteuser"; then
+        log_error "$(_t "BACKUP_SITE_43")"
+        restore_rollback "$domain" "$siteroot" "$siteuser" "$snap_dir" || true
+        return 1
       fi
-      mirror_mode=0
-    fi
-
-    # 交給網站使用者之前，先把要由 root 讀取的檔案移出（之後網站使用者可以替換暫存目錄中的檔案）：
-    # 舊版封裝的 <domain>/.clp_db_export.sql，以及備份中的 wp-config.php（另存於 root 專屬的快照目錄，
-    # 不可放在網站根目錄，否則會被當成純文字公開）
-    local embedded_sql=""
-    if [[ -f "${unpack_dir}/backup.sql" && ! -L "${unpack_dir}/backup.sql" ]]; then
-      embedded_sql="${unpack_dir}/backup.sql"
-    elif [[ -f "${extracted_root}/.clp_db_export.sql" && ! -L "${extracted_root}/.clp_db_export.sql" ]]; then
-      embedded_sql="${unpack_dir}/.clp_db_export.sql"
-      # 失敗時照下方的解開失敗處理（直接讓 set -e 中止會跳過 RETURN trap，暫存目錄留在磁碟上）
-      mv "${extracted_root}/.clp_db_export.sql" "$embedded_sql" || { log_error "$(_t "BACKUP_SITE_46")"; rm -rf "$snap_dir"; return 1; }
-    fi
-    local backup_has_wpconfig=0 backup_wpconfig=""
-    if [[ -f "${extracted_root}/wp-config.php" && ! -L "${extracted_root}/wp-config.php" ]]; then
-      backup_has_wpconfig=1
+      log_success "$(_t "BACKUP_SITE_44")"
       if [[ -f "${siteroot}/wp-config.php" ]]; then
-        backup_wpconfig="${snap_dir}/wp-config.from-backup.php"
-        install -m 600 "${extracted_root}/wp-config.php" "$backup_wpconfig" || { log_error "$(_t "BACKUP_SITE_46")"; rm -rf "$snap_dir"; return 1; }
-        log_info "$(_t "BACKUP_SITE_49" "${snap_dir}")"
+        restore_sync_wp_table_prefix "${siteroot}/wp-config.php" "${item_sql[$i]}" "$siteuser"
       fi
-    fi
-    if ! restore_stage_for_user "$siteuser" "$extracted_root" "$restore_cache" "$unpack_dir"; then
-      log_error "$(_t "BACKUP_SITE_46")"
-      rm -rf "$snap_dir"
-      return 1
+      continue
     fi
 
-    local rsync_mode_args=()
-    if [[ "$mirror_mode" -eq 1 ]]; then
-      rsync_mode_args=(--delete)
-      # 先以 dry-run 計算會被刪除的檔案，互動模式下再次確認（-y／--force 時直接執行）
-      local del_list del_count=0
-      del_list=$(sudo -H -u "$siteuser" rsync -rlpt --delete --dry-run --itemize-changes "${rsync_rules[@]}" "${extracted_root}/" "${siteroot}/" 2>/dev/null \
-        | sed -n 's/^\*deleting  *//p' || true)
-      if [[ -n "$del_list" ]]; then
-        del_count=$(printf '%s\n' "$del_list" | wc -l | tr -d '[:space:]')
-      fi
-      if [[ "$del_count" -gt 0 ]]; then
-        log_warn "$(_t "BACKUP_RESTORE_DELETE_COUNT" "$del_count")"
-        # 先截取再輸出（避免清單很長時 head 提早結束，printf 收到 SIGPIPE 而在 pipefail 下中止）
-        local del_preview
-        del_preview=$(sed -n '1,20p' <<< "$del_list")
-        printf '%s\n' "$del_preview" | sed 's/^/    /'
-        if [[ "$del_count" -gt 20 ]]; then
-          echo "    $(_t "BACKUP_RESTORE_DELETE_MORE" "$((del_count - 20))")"
-        fi
-        if [[ "$force_mode" -eq 0 ]]; then
-          local del_confirm=""
-          read -r -p "$(_t "BACKUP_RESTORE_DELETE_PROMPT")" del_confirm || del_confirm=""
-          if [[ "$del_confirm" != "yes" && "$del_confirm" != "y" ]]; then
-            # 尚未變更任何檔案或資料庫，移除本次快照
-            rm -rf "$snap_dir"
-            log_info "$(_t "BACKUP_SITE_29")"
-            return 0
-          fi
-        fi
-      fi
-    else
-      log_info "$(_t "BACKUP_RESTORE_INFO_KEEP_EXTRA")"
-    fi
-
-    # Check for embedded SQL dump (only CLP's own dump at the archive root; never import
-    # arbitrary .sql files that happen to be part of the site, e.g. old migration dumps)
-    # 新版：封裝最上層的 backup.sql（上方已確認封裝有網站目錄，所以這是 clp 自己的 dump）；
-    # 舊版：<domain>/.clp_db_export.sql（已在交給網站使用者之前移到 root 專屬的解壓目錄）
-    if [[ -n "$embedded_sql" ]]; then
+    # Embedded SQL dump (only CLP's own dump at the archive root or the legacy .clp_db_export.sql;
+    # never import arbitrary .sql files that happen to be part of the site)
+    if [[ -n "${item_sql[$i]}" ]]; then
       log_step "$(_t "BACKUP_SITE_47")"
-      local db_restore_ok=0
-      restore_import_sql "$embedded_sql" "$db_creds" "$siteroot" "$siteuser" && db_restore_ok=1
-      if [[ "$db_restore_ok" -eq 0 ]]; then
+      if ! restore_import_sql "${item_sql[$i]}" "$db_creds" "$siteroot" "$siteuser"; then
         log_error "$(_t "BACKUP_SITE_43")"
         restore_rollback "$domain" "$siteroot" "$siteuser" "$snap_dir" || true
         return 1
       fi
       log_success "$(_t "BACKUP_SITE_48")"
-      if [[ -f "${siteroot}/wp-config.php" && "$backup_has_wpconfig" -eq 0 ]]; then
-        restore_sync_wp_table_prefix "${siteroot}/wp-config.php" "$embedded_sql" "$siteuser"
+      if [[ -f "${siteroot}/wp-config.php" && "${item_hascfg[$i]}" -eq 0 ]]; then
+        restore_sync_wp_table_prefix "${siteroot}/wp-config.php" "${item_sql[$i]}" "$siteuser"
       fi
-      rm -f "$embedded_sql"
+      rm -f "${item_sql[$i]}"
     fi
 
-    # Sync web files（備份中的 wp-config.php 已另存於快照目錄，依它同步 table prefix）
-    if [[ -n "$backup_wpconfig" ]]; then
-      restore_sync_wp_table_prefix "${siteroot}/wp-config.php" "$backup_wpconfig" "$siteuser"
+    # Sync web files（備份中的 wp-config.php 已另存，依它同步 table prefix）
+    if [[ -n "${item_wpcfg[$i]}" ]]; then
+      restore_sync_wp_table_prefix "${siteroot}/wp-config.php" "${item_wpcfg[$i]}" "$siteuser"
     fi
+    local -a rsync_rules=() rsync_mode_args=()
+    mapfile -d '' -t rsync_rules < "${root_dir}/rules_${i}"
+    [[ "${item_mirror[$i]}" -eq 1 ]] && rsync_mode_args=(--delete)
     log_info "$(_t "BACKUP_SITE_50" "${siteroot}")"
     # 以網站使用者身分寫入，檔案直接屬於網站使用者，不需要再以 root chown -R
-    if ! restore_rsync_as_user "$siteuser" "$extracted_root" "$siteroot" ${rsync_mode_args[@]+"${rsync_mode_args[@]}"} "${rsync_rules[@]}"; then
+    if ! restore_rsync_as_user "$siteuser" "${item_src[$i]}" "$siteroot" ${rsync_mode_args[@]+"${rsync_mode_args[@]}"} "${rsync_rules[@]}"; then
       log_error "$(_t "BACKUP_SITE_51")"
       restore_rollback "$domain" "$siteroot" "$siteuser" "$snap_dir" || true
       return 1
     fi
-    rm -rf "$unpack_dir"
+    rm -rf "${item_unpack[$i]}"
     log_success "$(_t "BACKUP_SITE_52")"
+    any_files=1
+  done
 
-    # Optimize PHP-FPM and reload Nginx
-    local php_ver
-    php_ver=$(find_site_php_version "$domain")
+  if [[ "$any_files" -eq 1 ]]; then
     # PHP-FPM pool 固定值只在建立網站時套用；還原不改動使用者或 php-pm 調整過的值
-    : "$php_ver"
     nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
-
-  else
-    log_error "$(_t "BACKUP_SITE_54" "${local_restore_file}")"
-    return 1
   fi
 
   # 清理 WordPress 快取與 Transient
@@ -1817,7 +2021,9 @@ restore_site() {
   echo -e "$(_t "BACKUP_SITE_58" "${C_GREEN}" "${C_BOLD}" "${domain}" "${C_NC}")"
   echo -e "${C_GREEN}${C_BOLD}======================================================================${C_NC}"
   echo -e "$(_t "BACKUP_SITE_59" "${C_CYAN}" "${domain}" "${C_NC}")"
-  echo -e "$(_t "BACKUP_SITE_60" "${C_YELLOW}" "${selected_file}" "${C_NC}")"
+  for i in "${!item_name[@]}"; do
+    echo -e "$(_t "BACKUP_SITE_60" "${C_YELLOW}" "${item_name[$i]}" "${C_NC}")"
+  done
   echo ""
   return 0
 }
@@ -1853,6 +2059,7 @@ restore_handler() {
     echo -e "$(_t "BACKUP_HANDLER_8")"
     echo -e "  sudo clp restore example.com"
     echo -e "  sudo clp restore example.com -file=example.com-db-20260921_120000.sql.gz"
+    echo -e "  sudo clp restore example.com -file=example.com-archive-20260901_030000.tar.gz,example.com-compact-20260921_030000.tar.gz,example.com-db-20260921_030000.sql.gz"
     echo -e "  sudo clp restore example.com -to=google -type=full"
     echo -e "  sudo clp restore example.com -type=compact -keep-extra"
     echo -e "  sudo clp restore example.com -file=example.com-db-20260921_120000.sql.gz -db-root"

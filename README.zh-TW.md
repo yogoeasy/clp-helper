@@ -144,7 +144,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.3.4 (建置時間 2026-10-27 18:08:06)`
+輸出範例：`CLP Helper v1.3.5 (建置時間 2026-10-27 22:26:28)`
 
 查看全域功能說明選單：
 
@@ -190,7 +190,7 @@ sudo clp <module> [target_domain] [options...]
 | **`site`** | WordPress 網站管理 | `-new`, `-list`, `-on`, `-off`, `-ssl`, `-cf-waf`, `-cf-only`, `-varnish`, `-clone-from`, `-migrate`, `delete` |
 | **`server`** | 主機維運與安全加固 | `(無參數狀態檢查)`, `install`, `-harden`, `-ufw`, `-ssh`, `-fail2ban`, `-clean` |
 | **`backup`** | 網站與資料庫備份 | `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}`, `-expire=<Nd>` |
-| **`restore`** | 備份還原作業 | `[-file=<name>]`, `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}` |
+| **`restore`** | 備份還原作業 | `[-file=<name>[,...]]`, `-type={db\|full\|compact\|archive}`, `-to={local\|<remote>}` |
 | **`httpauth`** | HTTP 認證與存取防護 | `-add`, `-delete`, `-list`, `-wp-admin`, `-path`, `-whitelist` |
 | **`php-pm`** | PHP-FPM 行程池調校 | `<domain>`, `-all`, `-status`, `-fix`, `-max-children=`, `-idle-timeout=`, `-max-requests=` |
 | **`config`** | 全域偏好設定與金鑰管理 | `-set <key>=<val>`, `-get <key>`, `-list`, `-unset <key>` |
@@ -1129,7 +1129,7 @@ sudo clp restore example.com
 sudo clp restore example.com -to=google
 ```
 
-執行後系統會自動列出歷史備份清單，輸入號碼並輸入 `yes` 確認即可自動執行資料庫匯入、檔案還原、重新載入 PHP-FPM 與清除 WordPress 快取。可以用 `-type={db|full|compact|archive}` 只列出特定類型。
+執行後會列出可用的備份。同時有 full 與 db／compact／archive 時，先選擇還原方式：**1) 單一完整備份（full）**，或 **2) 自己挑選 db + compact + archive**，分三步選擇（資料庫 → 網站檔案 → 歷年 uploads，每一步可以按 Enter 跳過）。第 3 步中比所選 compact 舊的 archive，會標示兩個檔案都沒有的 uploads 年份。全部下載、解壓之後，輸入一次 `yes` 確認。可以用 `-type={db|full|compact|archive}` 只列出特定類型、選一個檔案。
 
 #### ② 精確命令列還原
 
@@ -1158,7 +1158,7 @@ sudo clp restore example.com -file=example.com-full-20261005_153000.tar.gz -to=b
   - `db`：只匯入資料庫，不涉及檔案。
 - **年份以備份當時為準**：從檔名的時間戳記判斷，不是還原當天的年份。
 - **一律保護**：目前的 `wp-config.php`（備份中的版本另存到快照目錄）、上方列出的快取與備份外掛目錄。
-- **確認提示**：互動模式下會先列出將刪除的項目數量與前 20 筆，輸入 `yes` 才會繼續；使用 `-y` 或 `--force` 時直接執行。
+- **確認提示**：先下載並解壓所有檔案，互動模式下再列出每個檔案將刪除的項目數量與前 20 筆，輸入一次 `yes` 才會繼續（輸入其他內容時什麼都不會變更，也不會留下快照）；使用 `-y` 或 `--force` 時直接執行。
 - **保留舊行為**：加上 `-keep-extra` 只覆蓋、不刪除。
 - **可以復原**：還原前會先建立快照（`<backup-dir>/rollback/`，預設 `/root/clpBackup/rollback/`），涵蓋所有可能被刪除的檔案；還原失敗會自動回復。
 
@@ -1195,21 +1195,17 @@ sudo clp site -clone-from=example.com new-example.com -db-root
 
 #### ⑤ 用 compact + db + archive 還原完整網站
 
-`restore` 一次還原一個檔案。三個類型各自只會處理自己範圍內的檔案，所以依序還原三個檔案即可得到完整網站，建議順序為 `db` → `compact` → `archive`：
+在同一個 `-file` 中以逗號分隔三個檔案（每種類型最多一個；`full` 備份一律單獨還原）：
 
 ```bash
-sudo clp restore example.com -type=db -to=google
+sudo clp restore example.com -to=google -file=example.com-archive-20261001_030000.tar.gz,example.com-compact-20261025_030000.tar.gz,example.com-db-20261025_030000.sql.gz
 ```
 
-```bash
-sudo clp restore example.com -type=compact -to=google
-```
-
-```bash
-sudo clp restore example.com -type=archive -to=google
-```
-
-注意：每次還原前都會建立一次完整的網站快照，三次還原會產生三份快照，請確認 `/root/clpBackup` 有足夠空間。
+- **先全部準備好**：所有檔案先下載、解壓並算出要刪除的項目，才開始變更。任何一個檔案失敗（下載、解壓、其他網站的封裝）就全部取消。
+- **確認一次、快照一次**：所有檔案只確認一次，只建立一份快照，再依 `archive` → `compact` → `db` 套用；任何一步失敗，都用這份快照回復網站與資料庫。
+- **compact 的年份以 compact 為準**：archive 也含有 compact 的年份時（例如 12 月的 compact 與 1 月的 archive），該年取自 compact，archive 不處理。
+- **兩個檔案都沒有的年份**：archive 的年份比 compact 早時（例如 12 月的 archive 與 1 月的 compact），archive 那一年兩個檔案都沒有，會維持網站目前的內容，並顯示警告。
+- **磁碟空間**：所有檔案會同時解壓（在 `/var/tmp`；遠端檔案也下載到這裡），另加一份快照。空間不夠時，改為一次還原一個檔案。
 
 ---
 
