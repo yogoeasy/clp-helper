@@ -560,10 +560,21 @@ ssh_prepare_privsep() {
   [[ -d /run/sshd ]] || mkdir -p -m 0755 /run/sshd 2>/dev/null || true
 }
 
+# sshd_cmd：呼叫 ssh.service 實際使用的 sshd（Ubuntu／Debian 為 /usr/sbin/sshd）。
+#   不依 PATH 尋找：主機若另外安裝了 sshd（例如自行編譯在 /usr/local/sbin），PATH 中的那一個
+#   讀的是另一份設定檔，-t／-T 的結果與正在執行的 sshd 不符
+sshd_cmd() {
+  if [[ -x /usr/sbin/sshd ]]; then
+    /usr/sbin/sshd "$@"
+  else
+    sshd "$@"
+  fi
+}
+
 # ssh_config_test：檢查 sshd 設定語法；錯誤訊息輸出到 stdout 供呼叫端顯示
 ssh_config_test() {
   ssh_prepare_privsep
-  sshd -t 2>&1
+  sshd_cmd -t 2>&1
 }
 
 # ssh_detect_ports：輸出所有 SSH 監聽埠（每行一個、排序去重）；完全抓不到時回傳 1
@@ -577,7 +588,7 @@ ssh_detect_ports() {
       port) ports+=("$val") ;;
       listenaddress) p="${val##*:}"; [[ "$val" == *:* ]] && ports+=("$p") ;;
     esac
-  done < <(sshd -T 2>/dev/null || true)
+  done < <(sshd_cmd -T 2>/dev/null || true)
   if systemctl is-active --quiet ssh.socket 2>/dev/null; then
     while read -r p; do
       ports+=("$p")
@@ -780,7 +791,7 @@ setup_ssh_hardening() {
   # 1. 不放寬既有設定：目前生效的 PermitRootLogin 比 prohibit-password 嚴格時沿用
   local root_login="prohibit-password" cur_root_login
   ssh_prepare_privsep
-  cur_root_login=$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" { print $2; exit }' || true)
+  cur_root_login=$(sshd_cmd -T 2>/dev/null | awk '$1 == "permitrootlogin" { print $2; exit }' || true)
   if [[ "$cur_root_login" == "no" || "$cur_root_login" == "forced-commands-only" ]]; then
     root_login="$cur_root_login"
     log_info "$(_t "SERVER_SSH_INFO_KEEP_ROOT_LOGIN" "$cur_root_login")"
@@ -902,7 +913,7 @@ ${settings}
 
   # 驗證最終生效狀態
   local active_passauth
-  active_passauth=$(sshd -T 2>/dev/null | grep -i '^passwordauthentication' | awk '{print $2}' || true)
+  active_passauth=$(sshd_cmd -T 2>/dev/null | grep -i '^passwordauthentication' | awk '{print $2}' || true)
   if [[ "$active_passauth" == "no" ]]; then
     log_success "$(_t "SERVER_SSH_SUCCESS")"
   else
@@ -923,7 +934,7 @@ setup_fail2ban() {
 
   apt-get -o DPkg::Lock::Timeout=60 install -y fail2ban
   local active_ssh_port
-  active_ssh_port=$(sshd -T 2>/dev/null | grep -i '^port[[:space:]]' | head -n1 | awk '{print $2}' || true)
+  active_ssh_port=$(sshd_cmd -T 2>/dev/null | grep -i '^port[[:space:]]' | head -n1 | awk '{print $2}' || true)
   [[ -z "$active_ssh_port" ]] && active_ssh_port="ssh"
 
   local jail_local="/etc/fail2ban/jail.local"
@@ -3163,7 +3174,7 @@ server_status() {
 
   # SSH 稽核
   local ssh_passauth
-  ssh_passauth=$(sshd -T 2>/dev/null | grep -i '^passwordauthentication' | awk '{print $2}' || true)
+  ssh_passauth=$(sshd_cmd -T 2>/dev/null | grep -i '^passwordauthentication' | awk '{print $2}' || true)
   if [[ "$ssh_passauth" == "no" ]]; then
     audit_ssh="${C_GREEN}$(_t "SERVER_AUDIT_SSH_PASS_DISABLED")${C_NC}"
   else
@@ -3606,7 +3617,7 @@ ${emergency_settings}
 
       # 檢查實際生效之 PasswordAuthentication
       local active_passauth
-      active_passauth=$(sshd -T 2>/dev/null | grep -i '^passwordauthentication' | awk '{print $2}' || echo "unknown")
+      active_passauth=$(sshd_cmd -T 2>/dev/null | grep -i '^passwordauthentication' | awk '{print $2}' || echo "unknown")
       if [[ "$active_passauth" != "yes" ]]; then
         log_warn "$(_t "SERVER_SSH_MANAGE_WARN_PASSAUTH_NOT_ENABLED" "$active_passauth")"
       fi
@@ -3627,9 +3638,9 @@ ${emergency_settings}
   # 預設：檢視目前 SSH 設定與金鑰狀況
   log_step "$(_t "SERVER_SSH_MANAGE_STEP_STATUS")"
   local passauth rootlogin port
-  passauth=$(sshd -T 2>/dev/null | grep -i '^passwordauthentication' | awk '{print $2}' || echo "unknown")
-  rootlogin=$(sshd -T 2>/dev/null | grep -i '^permitrootlogin' | awk '{print $2}' || echo "unknown")
-  port=$(sshd -T 2>/dev/null | grep -i '^port' | awk '{print $2}' || echo "22")
+  passauth=$(sshd_cmd -T 2>/dev/null | grep -i '^passwordauthentication' | awk '{print $2}' || echo "unknown")
+  rootlogin=$(sshd_cmd -T 2>/dev/null | grep -i '^permitrootlogin' | awk '{print $2}' || echo "unknown")
+  port=$(sshd_cmd -T 2>/dev/null | grep -i '^port' | awk '{print $2}' || echo "22")
 
   local root_keys=0 sudo_keys=0
   if [[ -f /root/.ssh/authorized_keys ]]; then

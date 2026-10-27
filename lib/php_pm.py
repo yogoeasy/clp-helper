@@ -10,6 +10,8 @@ Usage:
         site <domain> <php_ver> <pool_file> <pm> <max_children> <idle_timeout> <max_requests>
              <days> <max_active> <reached_status> <reached_log> <suggest> <conclusion> <mem_tight>
       ("-" for unknown values)
+  php_pm.py auto
+      stdout: the pm.max_children for "php-max-children=auto" (see below)
 
 Where the numbers come from:
   - The pool's status page (pm.status_path, queried over FastCGI on the pool's listen
@@ -32,6 +34,9 @@ Suggestion (pm.max_children only, ondemand pools only):
   raise when "reached" happened or current < max active x OK_LOW;
   lower when current > base x OK_HIGH or current > limit; otherwise ok.
 
+auto (php-max-children=auto, used when tuning with fixed values):
+  the memory limit for one site (budget / worker), clamped to MIN_CHILDREN..AUTO_MAX_CHILDREN
+
 Conclusions: ok raise lower tight short not-ondemand no-status
 Exit status: 0 success, 2 error.
 """
@@ -51,6 +56,7 @@ DOMAIN_RE = re.compile(r'^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-
 SYSTEM_POOLS = ("www", "default", "global")
 
 MIN_CHILDREN = 10
+AUTO_MAX_CHILDREN = 35
 HEADROOM = 1.5
 OK_LOW = 1.2
 OK_HIGH = 2.0
@@ -383,9 +389,16 @@ def cmd_status(domain=None):
         print("\t".join("-" if x is None or x == "" else str(x) for x in row))
 
 
+def cmd_auto():
+    mem = memory_info()
+    print(min(AUTO_MAX_CHILDREN, max(MIN_CHILDREN, mem["budget"] // mem["worker"])))
+
+
 def main(argv):
     if len(argv) >= 2 and argv[1] == "status" and len(argv) <= 3:
         cmd_status(argv[2] if len(argv) == 3 else None)
+    elif len(argv) == 2 and argv[1] == "auto":
+        cmd_auto()
     else:
         fail(__doc__)
 

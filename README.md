@@ -72,6 +72,9 @@
 
 All end-to-end testing has been done on Ubuntu 22.04, 24.04, and 26.04. Debian is supported by CloudPanel and CLP Helper does not block it, but it has not been tested. Please report any issues.
 
+> [!NOTE]
+> **Ubuntu 22.04**: CloudPanel's Nginx package for 22.04 (1.21.x) has no `/etc/nginx/global_settings`, and its site vhosts do not include one, so the `nginx_security` rules (blocking `.user.ini` and `debug.log`) are skipped there by `clp server install` and `clp server -harden`. Everything else works. Use Ubuntu 24.04 or 26.04 if you need these rules.
+
 ---
 
 ## 3. Installation & Quick Start
@@ -143,7 +146,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.3.3 (build 2026-10-27 08:20:54)`
+Output example:`CLP Helper v1.3.4 (build 2026-10-27 18:08:06)`
 
 Display global help menu:
 
@@ -697,7 +700,7 @@ rc=0; out=$(clp site -varnish=status -check) || rc=$?
 3. **When optimizing the Wordfence firewall, choose "Include", not "Override", and enable Varnish before the Wordfence optimization**: Wordfence writes a `.user.ini` that switches to its own `wordfence-waf.php`, which takes precedence over the vhost, so `wordfence-waf.php` must include `controller.php`. If the order was reversed or Override was chosen, run `clp site <domain> -varnish=fix`.
 4. **Changes to `.user.ini` take up to 5 minutes** (PHP's `user_ini.cache_ttl`). `-varnish=fix` never edits `.user.ini`; its changes to the vhost and `wordfence-waf.php` take effect immediately.
 5. **The front end must send requests to Varnish**: in the 80/443 server block, `location /` must be `proxy_pass http://127.0.0.1:6081;` (the `server` in `settings.json`). CloudPanel writes it only when the vhost is generated; if Varnish was switched on later (for example with the WordPress plugin), it stays at `8080`, requests go straight to PHP, and nothing is cached even though everything else looks right. The `front` column of `-varnish=status` shows the port. When it is not the Varnish port, the result asks you to open the site's Vhost tab in CloudPanel and press Save; `-varnish=fix` does not change it. (The `wp-admin` location always uses `8080`; that is normal.)
-6. **Wordfence warns that `.user.ini` may be publicly readable**: the Nginx security rules of `clp server -harden` already block `.user.ini` (in `/etc/nginx/clp-security.conf`, loaded from `/etc/nginx/global_settings`).
+6. **Wordfence warns that `.user.ini` may be publicly readable**: the Nginx security rules of `clp server -harden` already block `.user.ini` (in `/etc/nginx/clp-security.conf`, loaded from `/etc/nginx/global_settings`). Not available on Ubuntu 22.04 (see System Requirements & Compatibility).
 
 **What `-varnish=fix` does**
 
@@ -846,7 +849,7 @@ sudo clp server install --dry-run
 9. `unattended_upgrades`: Automatic security patch updates
 10. `snap_retention`: Cap Snap revisions to 2 to reclaim disk space
 11. `php_timezone`: Synchronize system and multi-version PHP timezones
-12. `nginx_security`: Global block rules for `.user.ini` and `debug.log` leaks
+12. `nginx_security`: Global block rules for `.user.ini` and `debug.log` leaks (skipped on Ubuntu 22.04)
 13. `smtp`: Postfix external SMTP relay setup
 14. `certbot`: Isolated `/opt/certbot` virtualenv with Cloudflare DNS plugin
 15. `netdata`: Netdata real-time monitoring agent on port 19999
@@ -1329,7 +1332,7 @@ All three values can be passed when tuning one site or `-all`, or stored as defa
 
 | Setting | Command option | `clp config` key | Default | Format |
 | :--- | :--- | :--- | :--- | :--- |
-| `pm.max_children` | `-max-children=N` | `php-max-children` | `15` | 1–999999 |
+| `pm.max_children` | `-max-children=N` | `php-max-children` | `15` | 1–999999, or `auto` |
 | `pm.process_idle_timeout` | `-idle-timeout=T` | `php-idle-timeout` | `30s` | number, optionally with `s`/`m`/`h`/`d`, e.g. `60s`, `5m` |
 | `pm.max_requests` | `-max-requests=N` | `php-max-requests` | `300` | 0–999999999 (`0` = never recycle workers) |
 
@@ -1359,6 +1362,12 @@ sudo clp config -set php-idle-timeout=60s
 
 ```bash
 sudo clp config -set php-max-requests=500
+```
+
+`auto` sets `pm.max_children` from the server's memory: the memory limit for one site that `-status` shows, kept between 10 and 35. It is calculated when a pool is tuned (for example after creating a site): sites tuned in the same run get the same value, and sites already tuned keep their value until `clp php-pm` runs again. For a site that needs more, use `-status` / `-fix`.
+
+```bash
+sudo clp config -set php-max-children=auto
 ```
 
 > [!NOTE]
@@ -1442,7 +1451,7 @@ The first choice shown is the recommended one; `sudo bash install.sh -y` uses it
 | :--- | :--- | :--- |
 | `lang` | Default CLI interface language | `auto` (follow the system locale), `en_US`, `zh_TW`; default `auto` |
 | `cf-token` | Cloudflare API Token for edge WAF & SSL DNS-01 automation | Token string or credentials file path (e.g. `/root/.secrets/example.ini`) |
-| `php-max-children` | Default `pm.max_children` for `clp php-pm` | 1–999999, default `15` |
+| `php-max-children` | Default `pm.max_children` for `clp php-pm` | 1–999999 or `auto`, default `15` |
 | `php-idle-timeout` | Default `pm.process_idle_timeout` for `clp php-pm` | e.g. `30s`, `5m`, default `30s` |
 | `php-max-requests` | Default `pm.max_requests` for `clp php-pm` | 0–999999999, default `300` |
 | `cf-default-mode` | Cloudflare SSL mode applied by `-cf-waf=on` | `off`, `flexible`, `full`, `strict`; default `strict` |

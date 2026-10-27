@@ -70,6 +70,9 @@
 
 所有實機測試都在 Ubuntu 22.04、24.04 與 26.04 上進行。CloudPanel 支援 Debian，CLP Helper 也不會阻擋，但尚未在 Debian 上實機測試；如遇問題歡迎回報。
 
+> [!NOTE]
+> **Ubuntu 22.04**：CloudPanel 在 22.04 的 Nginx 套件（1.21.x）沒有 `/etc/nginx/global_settings`，網站的 vhost 也不會載入它，所以 `clp server install` 與 `clp server -harden` 在 22.04 會略過 `nginx_security` 規則（阻擋 `.user.ini` 與 `debug.log`），其他功能不受影響。需要這些規則請使用 Ubuntu 24.04 或 26.04。
+
 ---
 
 ## 三、安裝與快速開始 (Quick Start)
@@ -141,7 +144,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.3.3 (建置時間 2026-10-27 08:20:54)`
+輸出範例：`CLP Helper v1.3.4 (建置時間 2026-10-27 18:08:06)`
 
 查看全域功能說明選單：
 
@@ -705,7 +708,7 @@ rc=0; out=$(clp site -varnish=status -check) || rc=$?
 3. **Wordfence 防火牆最佳化時要選「Include」，不要選「Override」，而且要先開 Varnish、再做 Wordfence 最佳化**：Wordfence 會建立 `.user.ini` 改用自己的 `wordfence-waf.php`，它的優先順序比 vhost 高，所以 `wordfence-waf.php` 必須 include `controller.php`。順序相反或選了 Override 時，用 `clp site <domain> -varnish=fix` 補上。
 4. **`.user.ini` 修改後最多 5 分鐘才生效**（PHP 的 `user_ini.cache_ttl`）。`-varnish=fix` 不會修改 `.user.ini`，修改的 vhost 與 `wordfence-waf.php` 都會立即生效。
 5. **前端要把請求轉給 Varnish**：80／443 server block 的 `location /` 必須是 `proxy_pass http://127.0.0.1:6081;`（`settings.json` 的 `server`）。CloudPanel 只在產生 vhost 時寫入；如果 Varnish 是之後才開啟的（例如用 WordPress 外掛開啟），這一行會維持 `8080`，請求直接交給 PHP，其他項目看起來都正常卻完全沒有快取。`-varnish=status` 的 `front` 欄位會顯示埠號；不是 Varnish 的埠號時，結論會請你在 CloudPanel 後台開啟該網站的 Vhost 分頁並按儲存，`-varnish=fix` 不會修改這一行。（`wp-admin` 那一段固定是 `8080`，這是正常的。）
-6. **Wordfence 提醒 `.user.ini` 可能被公開讀取**：`clp server -harden` 的 Nginx 安全規則已經擋下 `.user.ini`（規則在 `/etc/nginx/clp-security.conf`，由 `/etc/nginx/global_settings` 載入）。
+6. **Wordfence 提醒 `.user.ini` 可能被公開讀取**：`clp server -harden` 的 Nginx 安全規則已經擋下 `.user.ini`（規則在 `/etc/nginx/clp-security.conf`，由 `/etc/nginx/global_settings` 載入）。Ubuntu 22.04 不適用（見「系統需求與相容性」）。
 
 **`-varnish=fix` 做什麼**
 
@@ -854,7 +857,7 @@ sudo clp server install --dry-run
 9. `unattended_upgrades`：啟用系統安全漏洞自動修補
 10. `snap_retention`：限制 Snap 歷史版本保留數為 2 份以節省空間
 11. `php_timezone`：同步變更全系統與所有 PHP 版本之時區
-12. `nginx_security`：全域阻擋 `.user.ini` 與 `debug.log` 洩漏
+12. `nginx_security`：全域阻擋 `.user.ini` 與 `debug.log` 洩漏（Ubuntu 22.04 會略過）
 13. `smtp`：安裝 Postfix 並設定外部 SMTP Relay
 14. `certbot`：部署 `/opt/certbot` 獨立虛擬環境與 Cloudflare DNS 套件
 15. `netdata`：安裝 Netdata 即時效能監控 Agent (Port 19999)
@@ -1337,7 +1340,7 @@ sudo clp php-pm -all
 
 | 參數 | 指令參數 | `clp config` 設定鍵 | 預設值 | 格式 |
 | :--- | :--- | :--- | :--- | :--- |
-| `pm.max_children` | `-max-children=N` | `php-max-children` | `15` | 1～999999 |
+| `pm.max_children` | `-max-children=N` | `php-max-children` | `15` | 1～999999，或 `auto` |
 | `pm.process_idle_timeout` | `-idle-timeout=T` | `php-idle-timeout` | `30s` | 數字，可加 `s`／`m`／`h`／`d`，例如 `60s`、`5m` |
 | `pm.max_requests` | `-max-requests=N` | `php-max-requests` | `300` | 0～999999999（`0` 表示不回收行程） |
 
@@ -1367,6 +1370,12 @@ sudo clp config -set php-idle-timeout=60s
 
 ```bash
 sudo clp config -set php-max-requests=500
+```
+
+`auto` 依主機記憶體決定 `pm.max_children`：取 `-status` 顯示的單站記憶體上限，並限制在 10～35 之間。在調校 pool 時（例如建立網站後）計算：同一次執行調校的網站使用同一個值，已調校過的網站維持原值，直到再次執行 `clp php-pm`。需要更多的網站請用 `-status`／`-fix`。
+
+```bash
+sudo clp config -set php-max-children=auto
 ```
 
 > [!NOTE]
@@ -1450,7 +1459,7 @@ CLP Helper 提供專屬的全域設定管理模組 (`clp config`)，用來保存
 | :--- | :--- | :--- |
 | `lang` | CLP Helper 預設命令列介面語言 | `auto`（依系統 locale 判斷）、`en_US`、`zh_TW`；預設 `auto` |
 | `cf-token` | Cloudflare API 權杖 (用於邊緣 WAF 與 SSL DNS-01 自動化) | Token 字串或憑證檔路徑 (如 `/root/.secrets/example.ini`) |
-| `php-max-children` | `clp php-pm` 的 `pm.max_children` 預設值 | 1～999999，預設 `15` |
+| `php-max-children` | `clp php-pm` 的 `pm.max_children` 預設值 | 1～999999 或 `auto`，預設 `15` |
 | `php-idle-timeout` | `clp php-pm` 的 `pm.process_idle_timeout` 預設值 | 例如 `30s`、`5m`，預設 `30s` |
 | `php-max-requests` | `clp php-pm` 的 `pm.max_requests` 預設值 | 0～999999999，預設 `300` |
 | `cf-default-mode` | `-cf-waf=on` 套用的 Cloudflare SSL 模式 | `off`、`flexible`、`full`、`strict`；預設 `strict` |

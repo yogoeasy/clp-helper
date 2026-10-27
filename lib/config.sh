@@ -238,7 +238,7 @@ config_validate_value() {
   local key="$1" v="$2"
   case "$key" in
     CLP_LANG)             [[ "$v" == "auto" || "$v" == "zh_TW" || "$v" == "en_US" ]] ;;
-    PHP_FPM_MAX_CHILDREN) [[ "$v" =~ ^[1-9][0-9]{0,5}$ ]] ;;
+    PHP_FPM_MAX_CHILDREN) [[ "$v" == "auto" || "$v" =~ ^[1-9][0-9]{0,5}$ ]] ;;   # auto：依主機記憶體計算
     PHP_FPM_MAX_REQUESTS) [[ "$v" =~ ^(0|[1-9][0-9]{0,8})$ ]] ;;   # 0 = 不回收行程
     PHP_FPM_IDLE_TIMEOUT) [[ "$v" =~ ^[1-9][0-9]{0,5}[smhd]?$ ]] ;;
     CF_DEFAULT_MODE)      [[ "$v" =~ ^(off|flexible|full|strict)$ ]] ;;

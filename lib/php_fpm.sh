@@ -78,10 +78,31 @@ php_fpm_resolve_settings() {
   IFS=$'\t' read -r v2 s2 <<< "$line"
   line=$(_php_fpm_pick "$(opt_get "max-requests" "$(opt_get "max_requests" "")")" "$PHP_FPM_ENV_MAX_REQUESTS" "PHP_FPM_MAX_REQUESTS") || return 1
   IFS=$'\t' read -r v3 s3 <<< "$line"
+  local l1
+  l1="$(_php_fpm_src_label "$s1")"
+  if [[ "$v1" == "auto" ]]; then
+    php_fpm_auto_max_children || return 1
+    v1="$PHP_FPM_AUTO_MAX_CHILDREN"
+    l1="$(_t "PHP_FPM_SRC_AUTO" "$l1")"
+  fi
   PHP_FPM_MAX_CHILDREN="$v1"
   PHP_FPM_IDLE_TIMEOUT="$v2"
   PHP_FPM_MAX_REQUESTS="$v3"
-  PHP_FPM_SETTINGS_SOURCE="pm.max_children=${v1} ($(_php_fpm_src_label "$s1")), pm.process_idle_timeout=${v2} ($(_php_fpm_src_label "$s2")), pm.max_requests=${v3} ($(_php_fpm_src_label "$s3"))"
+  PHP_FPM_SETTINGS_SOURCE="pm.max_children=${v1} (${l1}), pm.process_idle_timeout=${v2} ($(_php_fpm_src_label "$s2")), pm.max_requests=${v3} ($(_php_fpm_src_label "$s3"))"
+}
+
+# php_fpm_auto_max_children：php-max-children=auto 的實際值（主機記憶體算出的單站上限，夾在 10～35，
+# 算法見 php_pm.py 開頭說明）。結果存於 PHP_FPM_AUTO_MAX_CHILDREN，同一次執行只計算一次（-all 不重複取樣）。
+PHP_FPM_AUTO_MAX_CHILDREN=""
+php_fpm_auto_max_children() {
+  [[ -n "$PHP_FPM_AUTO_MAX_CHILDREN" ]] && return 0
+  local out rc=0
+  out=$(php_pm_py auto 2>&1) || rc=$?
+  if [[ "$rc" -ne 0 || ! "$out" =~ ^[1-9][0-9]*$ ]]; then
+    log_error "$(_t "PHP_FPM_ERR_AUTO" "$out")"
+    return 1
+  fi
+  PHP_FPM_AUTO_MAX_CHILDREN="$out"
 }
 
 # php_fpm_validate_value <max_children|idle_timeout|max_requests> <value>：clp config -set 與調校前共用的檢查
