@@ -1453,6 +1453,7 @@ restore_site() {
 
     local -a avail_files=() avail_sizes=() avail_dates=() avail_types=()
     local -A RESTORE_MARKS=()
+    local -A seen_types=() # 過濾 -type 之前看到的類型，找不到指定類型時列出可用的類型
 
     if [[ "$source_is_remote" -eq 0 ]]; then
       [[ -z "$r_path" ]] && _restore_hint_old_dir "$domain" "$search_dir"
@@ -1470,6 +1471,7 @@ restore_site() {
         fsize=$(backup_format_size "$fbytes")
         fdate=$(date -r "$f" +"%Y-%m-%d %H:%M" 2>/dev/null || date -d "@$(stat -c '%Y' "$f" 2>/dev/null)" +"%Y-%m-%d %H:%M" 2>/dev/null || _t "BACKUP_DATE_UNKNOWN")
         ftype=$(backup_file_type "$fname" "$domain")
+        seen_types[$ftype]=1
 
         # Filter by r_type if requested
         if [[ -n "$r_type" && "$ftype" != "$r_type" ]]; then
@@ -1503,6 +1505,7 @@ restore_site() {
         fname="${fname##*/}"
         fsize=$(backup_format_size "$fbytes")
         ftype=$(backup_file_type "$fname" "$domain")
+        seen_types[$ftype]=1
 
         if [[ -n "$r_type" && "$ftype" != "$r_type" ]]; then
           continue
@@ -1516,7 +1519,15 @@ restore_site() {
     fi
 
     if [[ ${#avail_files[@]} -eq 0 ]]; then
-      log_error "$(_t "BACKUP_SITE_22" "${r_to}" "${domain}")"
+      local have_types="" t
+      for t in db full compact archive; do
+        [[ -n "${seen_types[$t]:-}" ]] && have_types="${have_types:+${have_types}, }${t}"
+      done
+      if [[ -n "$r_type" && -n "$have_types" ]]; then
+        log_error "$(_t "BACKUP_RESTORE_ERR_TYPE_NONE" "${r_to}" "${domain}" "${r_type}" "${have_types}")"
+      else
+        log_error "$(_t "BACKUP_SITE_22" "${r_to}" "${domain}")"
+      fi
       return 1
     fi
 
@@ -1585,14 +1596,26 @@ restore_site() {
       sel_files=("${avail_files[${list_idx[$((RESTORE_PICK - 1))]}]}")
     else
       # 依序選 db、compact、archive，每一步可以按 Enter 跳過
-      local step_kind step_key c_pick_year="" a_year
-      local -a step_idx=()
+      # 來源中沒有的類型先說明並略過，步驟編號只算實際有的類型
+      local step_kind step_key c_pick_year="" a_year step_no=0
+      local -a step_idx=() step_kinds=()
       for step_kind in db compact archive; do
+        for i in "${part_idx[@]}"; do
+          if [[ "${avail_types[$i]}" == "$step_kind" ]]; then
+            step_kinds+=("$step_kind")
+            break
+          fi
+        done
+        if [[ " ${step_kinds[*]} " != *" ${step_kind} "* ]]; then
+          log_info "$(_t "BACKUP_RESTORE_STEP_MISSING" "$step_kind")"
+        fi
+      done
+      for step_kind in "${step_kinds[@]}"; do
+        step_no=$((step_no + 1))
         step_idx=()
         for i in "${part_idx[@]}"; do
           [[ "${avail_types[$i]}" == "$step_kind" ]] && step_idx+=("$i")
         done
-        [[ ${#step_idx[@]} -eq 0 ]] && continue
         if [[ "$step_kind" == "archive" && -n "$c_pick_year" ]]; then
           for i in "${step_idx[@]}"; do
             a_year=$(backup_file_year "${avail_files[$i]}")
@@ -1603,7 +1626,7 @@ restore_site() {
         fi
         step_key="BACKUP_RESTORE_STEP_${step_kind^^}"
         echo ""
-        echo -e "${C_BOLD}$(_t "$step_key")${C_NC}"
+        echo -e "${C_BOLD}$(_t "BACKUP_RESTORE_STEP_HEADER" "$step_no" "${#step_kinds[@]}" "$(_t "$step_key")")${C_NC}"
         _restore_print_rows "${step_idx[@]}"
         if ! _restore_ask "${#step_idx[@]}" "$(_t "BACKUP_RESTORE_STEP_PROMPT" "${#step_idx[@]}")"; then
           log_info "$(_t "BACKUP_SITE_29")"
