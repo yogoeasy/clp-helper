@@ -146,7 +146,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.3.7 (build 2026-11-11 12:29:24)`
+Output example:`CLP Helper v1.3.8 (build 2026-11-11 16:26:33)`
 
 Display global help menu:
 
@@ -517,6 +517,8 @@ sudo clp site -migrate=remote-vps -all -exclude="test.,dev.,staging." -force-rep
   - **Edit-Lock Detection**: Automatically detects active post editing locks (`_edit_lock`) within the last 10 minutes to prevent overwriting unsaved work.
   - **SSH Agent Integration**: Detects key passphrases and loads them into `ssh-agent` for seamless passwordless streaming.
   - **Site-user read on the remote**: the remote side of the file transfer runs as the remote site user (`sudo -u`), so the remote host needs `sudo`. The site directory must not be a symbolic link and must be owned by that user. Device files, FIFOs and sockets are not copied.
+  - **Staged file transfer**: files are received into a root-only staging directory under `/home` (on the same file system as the site) and moved into the site directory only when the transfer is complete, so the new site never serves half-copied files. Files are owned by the new site user as they arrive, and setuid/setgid bits are removed. If some source files disappear during the transfer (common on a busy site), clp warns and continues.
+  - **Disk space check**: before anything is deleted or created, clp measures the remote site files and database (read-only) and checks each file system that will receive them: the site files under `/home`, the database backup in `backup-dir`, and the imported database in the MySQL data directory (plus 5% for files, 10% for the database and 256 MB per file system). Each file system's need and free space are shown. With `-force-replace`, the space used by the local site being replaced is counted as free (an estimate: its database size is read through that site's `wp-config.php`). It stops if there is not enough, and warns about staging directories left by an interrupted migration (`/home/.clp-migrate.*`).
   - Access protection (`clp httpauth`, IP whitelist, Cloudflare-only) is not migrated; set it up again on the new host.
   - **SSL while DNS still points to the old host**: the certificate is issued with Cloudflare DNS validation. When no token file in `/root/.secrets/` matches the domain by name and several are available, an interactive run lists them so you can pick one (with `-all`, the next site defaults to your previous choice); with `-y` or without a terminal, add `-api=<name>` instead, otherwise it falls back to HTTP-01, which fails until DNS points to the new host.
 

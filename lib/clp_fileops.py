@@ -546,6 +546,68 @@ def htpasswd_del(file_path, username, user=None):
     )
 
 
+class CrossDeviceError(Exception):
+    pass
+
+
+def move_into_site(stage_dir, stage_name, target_path, user):
+    """
+    把 root 擁有的暫存目錄中的 stage_name 以 rename 搬到 target_path（/home/<user>/... 中）。
+      - stage_dir 必須是 root 擁有、群組與其他人沒有任何權限的實體目錄（不是 symlink）
+      - target_path 的上層目錄以 fd 逐層開啟（O_NOFOLLOW），路徑中途被換成 symlink 時拒絕
+      - target_path 已存在時（不論是目錄、檔案或 symlink），先 rename 到暫存目錄中的 old，
+        不跟隨、不刪除使用者的東西；由呼叫端連同暫存目錄一起清除
+      - 兩邊不在同一個檔案系統時丟出 CrossDeviceError（不改用複製）
+    """
+    if not user:
+        raise PermissionError("move-into-site requires --user")
+    if not stage_name or "/" in stage_name or stage_name in (".", ".."):
+        raise PermissionError(f"invalid stage entry name: {stage_name!r}")
+    t_user, real_target = home_split(os.path.abspath(target_path))
+    if t_user != user:
+        raise PermissionError(f"Security violation: {target_path} is not inside the home of {user}")
+    home_user_dir = os.path.join(os.path.realpath(os.path.abspath(os.environ.get("CLP_HOME_DIR", "/home"))), user)
+    parent, name = os.path.split(real_target.rstrip("/"))
+    # 只接受 /home/<user>/htdocs/<名稱>：傳錯路徑時不可把 htdocs、.ssh 等整個目錄移走
+    if not name or name in (".", "..") or os.path.normpath(parent) != os.path.join(home_user_dir, "htdocs"):
+        raise PermissionError(f"invalid target path (must be /home/<user>/htdocs/<name>): {target_path}")
+
+    dflags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        dflags |= os.O_NOFOLLOW
+    stage_fd = os.open(stage_dir, dflags)
+    open_fds = [stage_fd]
+    try:
+        st = os.fstat(stage_fd)
+        if st.st_uid != 0 and st.st_uid != os.geteuid():
+            raise PermissionError(f"staging directory is not owned by root: {stage_dir}")
+        if st.st_mode & 0o077:
+            raise PermissionError(f"staging directory must not be accessible by others: {stage_dir}")
+        src = os.stat(stage_name, dir_fd=stage_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(src.st_mode):
+            raise PermissionError(f"staged entry is not a directory: {stage_name}")
+
+        parent_fd, fds = open_dir_tree_nofollow(home_user_dir, parent)
+        open_fds.extend(fds)
+        if os.fstat(parent_fd).st_dev != st.st_dev:
+            raise CrossDeviceError(f"{stage_dir} and {parent} are on different file systems")
+
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            exists = True
+        except FileNotFoundError:
+            exists = False
+        if exists:
+            os.rename(name, "old", src_dir_fd=parent_fd, dst_dir_fd=stage_fd)
+        os.rename(stage_name, name, src_dir_fd=stage_fd, dst_dir_fd=parent_fd)
+    finally:
+        for fd in reversed(open_fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="CLP Helper Safe File Operations")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
@@ -584,6 +646,13 @@ def main():
     p_sync.add_argument("source", help="Backup wp-config.php or SQL dump path")
     p_sync.add_argument("--user", help="Require path inside /home/<user>/", default=None)
 
+    # Subcommand: move-into-site
+    p_move = subparsers.add_parser("move-into-site", help="Rename a staged directory into a site path (same file system)")
+    p_move.add_argument("stage_dir", help="Root-owned staging directory (mode 700)")
+    p_move.add_argument("stage_name", help="Entry inside stage_dir to move")
+    p_move.add_argument("target", help="Target path under /home/<user>/")
+    p_move.add_argument("--user", help="Site user that owns the target home", required=True)
+
     args = parser.parse_args()
 
     try:
@@ -619,6 +688,12 @@ def main():
                 args.username,
                 user=target_user
             )
+        elif args.subcommand == "move-into-site":
+            try:
+                move_into_site(args.stage_dir, args.stage_name, args.target, args.user)
+            except CrossDeviceError as ce:
+                sys.stderr.write(f"clp_fileops error: {ce}\n")
+                sys.exit(3)
         elif args.subcommand == "sync-wp-table-prefix":
             try:
                 res = sync_wp_table_prefix(

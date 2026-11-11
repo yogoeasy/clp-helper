@@ -3792,7 +3792,7 @@ _migrate_pick_cf_secret() {
       ans=0
     fi
     ans="${ans:-$default_idx}"
-    if [[ "$ans" =~ ^[0-9]+$ ]] && (( 10#$ans <= ${#files[@]} )); then
+    if [[ "$ans" =~ ^[0-9]{1,6}$ ]] && (( 10#$ans <= ${#files[@]} )); then
       ans=$((10#$ans))
       break
     fi
@@ -3814,6 +3814,157 @@ _migrate_pick_cf_secret() {
 # 7a. 內部輔助：搬移單一網站至本地 (供 site_migrate 與 site_migrate_all 共用)
 #     參數: <remote_host> <source_domain> <target_domain> [same_domain|diff_domain]
 # ------------------------------------------------------------------------------
+# _migrate_df <路徑>：輸出「<可用 KB> <掛載點>」；路徑還不存在時（例如 backup-dir）往上找存在的目錄
+_migrate_df() {
+  local p="$1"
+  while [[ -n "$p" && "$p" != "/" && ! -e "$p" ]]; do p=$(dirname "$p"); done
+  df -Pk "$p" 2>/dev/null | awk 'NR == 2 { print $4, $6 }'
+}
+
+# _migrate_mysql_datadir：輸出本機 MySQL／MariaDB 的資料目錄；找不到時輸出空字串
+#   讀取順序：先 /etc/mysql 最上層的 *.cnf（my.cnf 最先被讀、優先度最低），再依完整路徑（LC_ALL=C）排序的
+#   子目錄 *.cnf；取最後一個 datadir 設定。這是近似：實際順序由 my.cnf 的 !includedir 決定，Ubuntu／Debian 的預設
+#   （conf.d 之後才是 mysql.conf.d／mariadb.conf.d）與字典順序一致；不分辨區段，行尾的 # 註解會去掉。
+#   設定值不是目錄時，依序改試 /home/mysql（CloudPanel）、/var/lib/mysql。
+_migrate_mysql_datadir() {
+  local conf_dir="${CLP_MYSQL_CONF_DIR:-/etc/mysql}" dd="" cand
+  local -a cnfs=()
+  mapfile -t cnfs < <({ find "$conf_dir" -maxdepth 1 -type f -name '*.cnf' 2>/dev/null | LC_ALL=C sort
+                        find "$conf_dir" -mindepth 2 -type f -name '*.cnf' 2>/dev/null | LC_ALL=C sort; } || true)
+  if [[ ${#cnfs[@]} -gt 0 ]]; then
+    dd=$(grep -hs '^[[:space:]]*datadir[[:space:]]*=' "${cnfs[@]}" 2>/dev/null | tail -n 1 \
+      | sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//; s/^["'\'']//; s/["'\'']$//' || true)
+  fi
+  if [[ -n "$dd" && -d "$dd" ]]; then
+    echo "$dd"
+    return 0
+  fi
+  local -a fallbacks=(/home/mysql /var/lib/mysql)
+  [[ -n "${CLP_MYSQL_DATADIR_FALLBACKS:-}" ]] && read -r -a fallbacks <<< "$CLP_MYSQL_DATADIR_FALLBACKS"
+  for cand in "${fallbacks[@]}"; do
+    if [[ -d "$cand" ]]; then
+      echo "$cand"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+# _migrate_check_space <remote_host> <remote_root> <remote_user> <backup_dir> [<要被取代的本機網站>]
+#   在刪除或建立任何東西之前檢查磁碟空間，依檔案系統分別加總：
+#     - 網站檔案（遠端 du，扣除 rsync 排除的目錄）＋5%：/home（暫存目錄與網站目錄）
+#     - 資料庫（遠端 wp db size，唯讀）＋10%：backup-dir（SQL 備份）與 MySQL 資料目錄（匯入後）各一份
+#     - 每個檔案系統另外預留 256 MB
+#   -force-replace 時，要被取代的本機網站（檔案與資料庫）會在匯入前刪除，其大小計入可用空間；
+#   但 SQL 備份在刪除之前就下載，backup-dir 所在的檔案系統另外檢查一次（不計入要釋放的空間）。
+#   空間不足回傳 1；量不到網站檔案大小或本機可用空間時只警告並回傳 0（不阻擋搬移）。
+_migrate_check_space() {
+  local remote_host="$1" remote_root="$2" remote_user="$3" backup_dir="$4" replace_target="${5:-}"
+  local margin_kb=262144
+
+  # 之前中斷的搬移留下的暫存目錄：只警告（可能是另一個正在執行的搬移），每次執行只提示一次
+  if [[ -z "${CLP_MIGRATE_STAGE_WARNED:-}" ]]; then
+    CLP_MIGRATE_STAGE_WARNED=1
+    local left
+    for left in /home/.clp-migrate.*; do
+      [[ -d "$left" && ! -L "$left" ]] || continue
+      log_warn "$(_t "SITE_MIGRATE_WARN_STAGE_LEFT" "$left" "$(du -sh "$left" 2>/dev/null | cut -f1 || true)")"
+    done
+  fi
+
+  log_info "$(_t "SITE_MIGRATE_INFO_SPACE_CHECKING")"
+  local probe
+  probe=$(ssh -n "$remote_host" "cd '${remote_root}' && { echo \"F \$(sudo -H -u '${remote_user}' du -sk . 2>/dev/null | cut -f1)\"; for d in wp-content/cache wp-content/updraft wp-content/wpvividbackups; do [ -d \"\$d\" ] && echo \"X \$(sudo -H -u '${remote_user}' du -sk \"\$d\" 2>/dev/null | cut -f1)\"; done; echo \"D \$(sudo -H -u '${remote_user}' wp db size --size_format=b --quiet 2>/dev/null)\"; true; }" 2>/dev/null || true)
+  local files_kb db_kb
+  files_kb=$(printf '%s\n' "$probe" | awk '$1 == "F" && $2 ~ /^[0-9]+$/ { f = $2; ok = 1 } $1 == "X" && $2 ~ /^[0-9]+$/ { x += $2 } END { if (ok) { t = f - x; if (t < 0) t = 0; printf "%d\n", t } }')
+  db_kb=$(printf '%s\n' "$probe" | awk '$1 == "D" && $2 ~ /^[0-9]+$/ { printf "%d\n", ($2 + 1023) / 1024 }')
+  if [[ ! "$files_kb" =~ ^[0-9]+$ ]]; then
+    log_warn "$(_t "SITE_MIGRATE_WARN_SPACE_UNKNOWN")"
+    return 0
+  fi
+  if [[ ! "$db_kb" =~ ^[0-9]+$ ]]; then
+    log_warn "$(_t "SITE_MIGRATE_WARN_DB_SIZE_UNKNOWN")"
+    db_kb=0
+  fi
+  log_info "$(_t "SITE_MIGRATE_INFO_SPACE" "$(( files_kb / 1024 ))" "$(( db_kb / 1024 ))")"
+
+  # 要被取代的本機網站：以它的網站使用者身分量測（唯讀）
+  #   這是估計值：資料庫大小取自舊站 wp-config.php 指向的資料庫，不一定是 site_delete 實際刪除的那一個
+  #   （wp-config.php 由網站使用者控制，只影響預檢準確度）
+  local old_root="" old_user="" freed_files_kb=0 freed_db_kb=0 v
+  if [[ -n "$replace_target" ]]; then
+    old_root=$(find_site_root "$replace_target" 2>/dev/null || true)
+    old_user=$(find_site_user "$replace_target" 2>/dev/null || true)
+    if [[ -n "$old_root" && -d "$old_root" && -n "$old_user" ]]; then
+      v=$(sudo -u "$old_user" du -sk "$old_root" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
+      [[ "$v" =~ ^[0-9]+$ ]] && freed_files_kb="$v"
+      v=$(sudo -H -u "$old_user" wp db size --size_format=b --quiet --path="$old_root" 2>/dev/null || true)
+      [[ "$v" =~ ^[0-9]+$ ]] && freed_db_kb=$(( v / 1024 ))
+      log_info "$(_t "SITE_MIGRATE_INFO_SPACE_FREED" "$replace_target" "$(( freed_files_kb / 1024 ))" "$(( freed_db_kb / 1024 ))")"
+    fi
+  fi
+
+  local datadir
+  datadir=$(_migrate_mysql_datadir || true)
+
+  # <路徑>|<需要 KB>|<會釋放 KB>
+  local db_need_kb=$(( db_kb + db_kb / 10 ))
+  local -a items=("/home|$(( files_kb + files_kb / 20 ))|0" "${backup_dir}|${db_need_kb}|0")
+  if [[ -n "$datadir" ]]; then
+    items+=("${datadir}|${db_need_kb}|${freed_db_kb}")
+  else
+    # 找不到資料目錄時不猜它的位置：只略過資料庫匯入那一份，其餘照常檢查
+    log_warn "$(_t "SITE_MIGRATE_WARN_DATADIR_UNKNOWN")"
+  fi
+  [[ -n "$old_root" && "$freed_files_kb" -gt 0 ]] && items+=("${old_root}|0|${freed_files_kb}")
+
+  local -A fs_avail=() fs_need=() fs_freed=()
+  local item path kb freed line avail mnt bk_mnt=""
+  for item in "${items[@]}"; do
+    IFS='|' read -r path kb freed <<< "$item"
+    line=$(_migrate_df "$path" || true)
+    read -r avail mnt <<< "$line"
+    if [[ ! "$avail" =~ ^[0-9]+$ || -z "$mnt" ]]; then
+      log_warn "$(_t "SITE_MIGRATE_WARN_SPACE_UNKNOWN")"
+      return 0
+    fi
+    [[ "$path" == "$backup_dir" ]] && bk_mnt="$mnt"
+    fs_avail["$mnt"]="$avail"
+    fs_need["$mnt"]=$(( ${fs_need["$mnt"]:-0} + kb ))
+    fs_freed["$mnt"]=$(( ${fs_freed["$mnt"]:-0} + freed ))
+  done
+
+  local rc=0 need have
+  for mnt in "${!fs_need[@]}"; do
+    (( ${fs_need["$mnt"]} > 0 )) || continue
+    need=$(( ${fs_need["$mnt"]} + margin_kb ))
+    have=$(( ${fs_avail["$mnt"]} + ${fs_freed["$mnt"]} ))
+    if (( ${fs_freed["$mnt"]} > 0 )); then
+      log_info "$(_t "SITE_MIGRATE_INFO_SPACE_FS_FREED" "$mnt" "$(( need / 1024 ))" "$(( ${fs_avail["$mnt"]} / 1024 ))" "$(( ${fs_freed["$mnt"]} / 1024 ))")"
+    else
+      log_info "$(_t "SITE_MIGRATE_INFO_SPACE_FS" "$mnt" "$(( need / 1024 ))" "$(( ${fs_avail["$mnt"]} / 1024 ))")"
+    fi
+    if (( have < need )); then
+      if (( ${fs_freed["$mnt"]} > 0 )); then
+        log_error "$(_t "SITE_MIGRATE_ERR_SPACE_FREED" "$mnt" "$(( ${fs_freed["$mnt"]} / 1024 ))" "$(( need / 1024 ))" "$(( ${fs_avail["$mnt"]} / 1024 ))")"
+      else
+        log_error "$(_t "SITE_MIGRATE_ERR_SPACE" "$mnt" "$(( need / 1024 ))" "$(( have / 1024 ))")"
+      fi
+      rc=1
+    fi
+  done
+  # SQL 備份在刪除既有網站之前下載：backup-dir 所在的檔案系統不能計入要釋放的空間
+  if [[ "$rc" -eq 0 && -n "$bk_mnt" && "${fs_freed["$bk_mnt"]:-0}" -gt 0 ]]; then
+    need=$(( db_need_kb + margin_kb ))
+    if (( ${fs_avail["$bk_mnt"]} < need )); then
+      log_error "$(_t "SITE_MIGRATE_ERR_SPACE_BACKUP" "$bk_mnt" "$(( need / 1024 ))" "$(( ${fs_avail["$bk_mnt"]} / 1024 ))")"
+      rc=1
+    fi
+  fi
+  [[ "$rc" -eq 0 ]] || log_error "$(_t "SITE_MIGRATE_ERR_SPACE_NOTHING_CHANGED")"
+  return "$rc"
+}
+
 _migrate_single_site() {
   local remote_host="$1"
   local source_domain="$2"
@@ -3867,15 +4018,21 @@ _migrate_single_site() {
   if [[ "${CLP_MIGRATE_BATCH:-0}" -ne 1 ]]; then
     target_user=$(opt_get "user" "")
   fi
+  # CloudPanel 的網站使用者規則：英文字母開頭，3～32 個字元（必須在刪除既有網站之前檢查）
+  local site_user_re='^[a-z][a-z0-9_-]{2,31}$'
   if [[ -n "$target_user" ]]; then
     target_user=$(echo "$target_user" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
+    if [[ ! "$target_user" =~ $site_user_re ]]; then
+      log_error "$(_t "SITE_MIGRATE_ERR_USER_INVALID" "$(strip_ctrl_chars "$(opt_get "user" "")")")"
+      return 1
+    fi
     if ! replace_user_available "$target_user" "$replace_target"; then
       log_error "$(_t "SITE__MIGRATE_SINGLE_SITE_4" "${target_user}")"
       return 1
     fi
   else
     local replaced_user=""
-    if replace_user_available "$remote_user" "$replace_target"; then
+    if [[ "$remote_user" =~ $site_user_re ]] && replace_user_available "$remote_user" "$replace_target"; then
       target_user="$remote_user"
     elif [[ -n "$replace_target" ]] && replaced_user=$(find_site_user "$replace_target" 2>/dev/null) && [[ -n "$replaced_user" ]]; then
       # 取代既有網站時沿用它的使用者（刪除時會一併移除，再由新網站建立）
@@ -3895,6 +4052,9 @@ _migrate_single_site() {
   fi
   log_info "$(_t "SITE_CLONE_11" "${php_ver}")"
 
+  # 磁碟空間預檢（此時還沒有刪除或建立任何東西）
+  _migrate_check_space "$remote_host" "$remote_root" "$remote_user" "$backup_dir" "$replace_target" || return 1
+
   # 先完整下載遠端資料庫並驗證（不依賴本地網站）；失敗時本地網站還沒有被動到
   #   - 遠端不經 gzip 管線（改用 ssh -C 壓縮傳輸），ssh 的結束狀態即為 wp db export 的狀態
   #   - 以 mysqldump 結尾的 "-- Dump completed" 標記確認 dump 完整，避免匯入只有一半資料表的檔案
@@ -3903,7 +4063,10 @@ _migrate_single_site() {
   local timestamp
   timestamp=$(date +"%Y%m%d_%H%M%S")
   local sql_backup="${backup_dir}/${source_domain}-backup-${timestamp}.sql"
-  ( umask 077; : > "$sql_backup" )
+  if ! ( umask 077; : > "$sql_backup" ); then
+    log_error "$(_t "SITE_MIGRATE_ERR_FILE_WRITE" "$sql_backup")"
+    return 1
+  fi
   if ! ssh -n -C "$remote_host" "cd '${remote_root}' && sudo -H -u '${remote_user}' wp db export - --add-drop-table" > "$sql_backup"; then
     log_error "$(_t "SITE__MIGRATE_SINGLE_SITE_11")"
     rm -f "$sql_backup"
@@ -3962,11 +4125,22 @@ _migrate_single_site() {
       rm -f "$sql_backup"
       return 1
   fi
+  # 之後的失敗都要清除新網站、資料庫與資料庫備份
+  _migrate_abort_db() {
+    clpctl site:delete --domainName="$target_domain" --force >/dev/null 2>&1 || true
+    clpctl db:delete --databaseName="$target_dbname" 2>/dev/null || true
+    rm -f "$sql_backup"
+  }
+
   # 已啟用 nginx hooks 時，新網站立即加入 hook
   nginx_hooks_after_create "$target_domain"
 
   local target_root="/home/${target_user}/htdocs/${target_domain}"
-  mkdir -p "$target_root"
+  if ! mkdir -p "$target_root"; then
+    log_error "$(_t "SITE_MIGRATE_ERR_TARGET_DIR" "$target_root")"
+    _migrate_abort_db
+    return 1
+  fi
 
   # SSL 憑證配置 (Fail-Fast: 建立網站後立即配置，確保 HTTPS 即刻就緒且避免搬移白做工)
   # 與 clone 相同的 SSL 參數解析（-ssl=http、-http、-ssl=off／no 等）
@@ -3994,12 +4168,6 @@ _migrate_single_site() {
   fi
 
   # 匯入已下載的遠端資料庫；本地帳號匯入失敗時，只有加上 -db-root 才改用 root 重試
-  _migrate_abort_db() {
-    clpctl site:delete --domainName="$target_domain" --force >/dev/null 2>&1 || true
-    clpctl db:delete --databaseName="$target_dbname" 2>/dev/null || true
-    rm -f "$sql_backup"
-  }
-
   if ! _site_db_import "$target_dbname" "$target_dbpass" "$sql_backup" "SITE__MIGRATE_SINGLE_SITE_13"; then
     log_error "$(_t "SITE__MIGRATE_SINGLE_SITE_14")"
     _migrate_abort_db
@@ -4007,28 +4175,52 @@ _migrate_single_site() {
   fi
 
   chmod 600 "$sql_backup" 2>/dev/null || true
-  # 只在不存在或原本就是連結時建立，不可覆蓋使用者自己放的同名檔案
-  if [[ ! -e "/root/${source_domain}.sql" || -L "/root/${source_domain}.sql" ]]; then
-    ln -sfn "$sql_backup" "/root/${source_domain}.sql"
-  fi
   log_success "$(_t "SITE__MIGRATE_SINGLE_SITE_15" "${sql_backup}")"
 
   # 網站檔案同步
   log_step "$(_t "SITE__MIGRATE_SINGLE_SITE_16")"
   #   遠端：以遠端網站使用者身分讀取（不是 ssh 登入的 root），來源目錄被換成 symlink 時也讀不到其他檔案
-  #   本機：root 接收，但不建立裝置檔、特殊檔，也不沿用遠端的擁有者（之後再 chown 給網站使用者）
-  if ! rsync -avzP --no-devices --no-specials --no-owner --no-group \
+  #   本機：root 接收，但不建立裝置檔、特殊檔；檔案落地時就屬於目標網站使用者（--chown），
+  #         並清除 setuid／setgid（--chmod），之後不需要再以 root 執行 chown -R
+  #   接收位置：/home 下 root 擁有、權限 700 的暫存目錄（與網站同一個檔案系統），同步期間網站使用者與
+  #         PHP 都碰不到；完成後由 clp_fileops.py 以 rename 搬入網站目錄（不複製，不需要兩倍空間）。
+  #         /home 與網站目錄不在同一個檔案系統時，退回直接同步到網站目錄
+  #   結束代碼 24（來源檔案在同步時消失，忙碌的網站常見）只警告，其餘檔案已同步完成
+  local migrate_stage="" rsync_dest="${target_root}/"
+  if [[ "$(stat -L -c %d /home 2>/dev/null || true)" == "$(stat -L -c %d "/home/${target_user}/htdocs" 2>/dev/null || echo x)" ]] \
+    && migrate_stage=$(mktemp -d /home/.clp-migrate.XXXXXX 2>/dev/null); then
+    chmod 700 "$migrate_stage"
+    rsync_dest="${migrate_stage}/site/"
+  else
+    migrate_stage=""
+    log_warn "$(_t "SITE_MIGRATE_WARN_NO_STAGE")"
+  fi
+  local rsync_rc=0
+  rsync -avzP --no-devices --no-specials \
+    --chown="${target_user}:${target_user}" --chmod=ug-s \
     --rsync-path="sudo -u ${remote_user} rsync" \
     --exclude='wp-content/cache' \
     --exclude='wp-content/updraft' \
     --exclude='wp-content/wpvividbackups' \
-    "${remote_host}:${remote_root}/" "${target_root}/"; then
+    "${remote_host}:${remote_root}/" "$rsync_dest" || rsync_rc=$?
+  if [[ "$rsync_rc" -eq 24 ]]; then
+    log_warn "$(_t "SITE_CLONE_WARN_VANISHED")"
+  elif [[ "$rsync_rc" -ne 0 ]]; then
     log_error "$(_t "SITE__MIGRATE_SINGLE_SITE_17" "${sql_backup}")"
+    [[ -n "$migrate_stage" ]] && rm -rf "$migrate_stage"
     clpctl site:delete --domainName="$target_domain" --force >/dev/null 2>&1 || true
     clpctl db:delete --databaseName="$target_dbname" 2>/dev/null || true
     return 1
   fi
-  chown -R "${target_user}:${target_user}" "$target_root"
+  if [[ -n "$migrate_stage" ]]; then
+    if ! python3 -I "${CLP_LIB_DIR}/clp_fileops.py" move-into-site "$migrate_stage" site "$target_root" --user "$target_user"; then
+      log_error "$(_t "SITE_MIGRATE_ERR_MOVE" "$target_root")"
+      rm -rf "$migrate_stage"
+      _migrate_abort_db
+      return 1
+    fi
+    rm -rf "$migrate_stage"
+  fi
   log_success "$(_t "SITE__MIGRATE_SINGLE_SITE_18")"
 
   # 安全與環境絕對路徑修復 (.user.ini / Wordfence / 快取外掛)
@@ -4064,8 +4256,13 @@ _migrate_single_site() {
   sudo -H -u "$target_user" wp cache flush --path="$target_root" 2>/dev/null || true
   sudo -H -u "$target_user" wp transient delete --all --path="$target_root" 2>/dev/null || true
 
-  # 權限校正、PHP-FPM 調校、Nginx reload
-  chown -R "${target_user}:${target_user}" "$target_root"
+  # 搬移成功後才建立 /root/<來源網域>.sql 連結（失敗路徑可能刪除備份，避免留下斷掉的連結）
+  #   只在不存在或原本就是連結時建立，不可覆蓋使用者自己放的同名檔案
+  if [[ ! -e "/root/${source_domain}.sql" || -L "/root/${source_domain}.sql" ]]; then
+    ln -sfn "$sql_backup" "/root/${source_domain}.sql" 2>/dev/null || true
+  fi
+
+  # PHP-FPM 調校、Nginx reload（檔案擁有者已由 rsync --chown 設定，不再以 root 執行 chown -R）
   optimize_site_php_fpm "$target_domain" "$php_ver" || log_warn "$(_t "PHP_FPM_WARN_OPTIMIZE_SKIPPED")"
   nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
 
@@ -4107,10 +4304,11 @@ site_migrate() {
   source_domain=$(clean_domain "$(opt_get 'from' '')")
 
   local target_domain=""
+  # -migrate 只接受 -migrate=<主機> 格式，POSITIONAL 不會包含主機名稱，不可拿它比對（主機名稱可能就是網域）
   for pos in "${POSITIONAL[@]}"; do
     local clean_pos
     clean_pos=$(clean_domain "$pos")
-    if [[ "$clean_pos" != "site" && "$clean_pos" != "$remote_host" ]]; then
+    if [[ "$clean_pos" != "site" ]]; then
       target_domain="$clean_pos"
       break
     fi
