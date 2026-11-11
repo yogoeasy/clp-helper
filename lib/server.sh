@@ -2104,7 +2104,6 @@ ensure_system_bootstrap() {
     sudo \
     ca-certificates \
     gnupg \
-    software-properties-common \
     locales \
     sqlite3 \
     debconf-utils \

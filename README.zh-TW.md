@@ -144,7 +144,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.3.6 (建置時間 2026-10-28 11:21:40)`
+輸出範例：`CLP Helper v1.3.7 (建置時間 2026-11-11 12:29:24)`
 
 查看全域功能說明選單：
 
@@ -526,6 +526,7 @@ sudo clp site -migrate=remote-vps -all -exclude="test.,dev.,staging." -force-rep
   - **SSH 金鑰解鎖整合**：金鑰有設定密碼時，會自動載入 `ssh-agent`，只需要輸入一次。
   - **遠端以網站使用者身分讀取**：遠端傳送檔案的那一端以遠端網站使用者身分執行（`sudo -u`），遠端主機需要有 `sudo`。網站目錄不可是符號連結，擁有者必須是該網站使用者。裝置檔、FIFO、socket 不會被複製。
   - 存取防護（`clp httpauth`、IP 白名單、Cloudflare-only）不會一起搬移，需要在新主機重新設定。
+  - **DNS 仍指向舊主機時的 SSL**：憑證以 Cloudflare DNS 驗證簽發。`/root/.secrets/` 中沒有任何 token 檔名符合網域、但有多個可用時，互動執行會列出清單讓您選擇（`-all` 時下一個網站預設沿用上一次的選擇）；使用 `-y` 或沒有終端機時，請改加 `-api=<名稱>`，否則會改用 HTTP-01 驗證，在 DNS 指向新主機之前會失敗。
 
 #### ⑥ 啟用、停用與刪除網站
 

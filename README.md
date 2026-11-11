@@ -146,7 +146,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.3.6 (build 2026-10-28 11:21:40)`
+Output example:`CLP Helper v1.3.7 (build 2026-11-11 12:29:24)`
 
 Display global help menu:
 
@@ -518,6 +518,7 @@ sudo clp site -migrate=remote-vps -all -exclude="test.,dev.,staging." -force-rep
   - **SSH Agent Integration**: Detects key passphrases and loads them into `ssh-agent` for seamless passwordless streaming.
   - **Site-user read on the remote**: the remote side of the file transfer runs as the remote site user (`sudo -u`), so the remote host needs `sudo`. The site directory must not be a symbolic link and must be owned by that user. Device files, FIFOs and sockets are not copied.
   - Access protection (`clp httpauth`, IP whitelist, Cloudflare-only) is not migrated; set it up again on the new host.
+  - **SSL while DNS still points to the old host**: the certificate is issued with Cloudflare DNS validation. When no token file in `/root/.secrets/` matches the domain by name and several are available, an interactive run lists them so you can pick one (with `-all`, the next site defaults to your previous choice); with `-y` or without a terminal, add `-api=<name>` instead, otherwise it falls back to HTTP-01, which fails until DNS points to the new host.
 
 #### ⑥ Site State Management
 

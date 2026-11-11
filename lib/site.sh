@@ -647,6 +647,8 @@ PYEOF
 
   local api_param
   api_param=$(opt_get "api" "")
+  # -migrate 時使用者從選單選的 token 檔（_migrate_pick_cf_secret；呼叫端以 local 設定，只影響這次搬移）
+  [[ -z "$api_param" ]] && api_param="${CLP_SSL_API_FILE:-}"
 
   if [[ -n "$api_param" ]]; then
     if ! cf_resolve_credentials "$ssl_domain" "" "$api_param"; then
@@ -3740,6 +3742,75 @@ site_migrate_all() {
 }
 
 # ------------------------------------------------------------------------------
+# _migrate_pick_cf_secret <domain>：搬移時以 Cloudflare DNS 驗證簽發憑證前，決定要用哪個 token 檔
+#   搬移時網域通常仍指向來源主機，HTTP-01 必定失敗；所以無法依檔名自動對應、又有可用的 .ini 時，
+#   讓使用者從清單選擇。選擇結果寫入 CLP_MIGRATE_CF_PICK（檔案路徑；空字串為不使用 Cloudflare），
+#   並記在 CLP_MIGRATE_CF_LAST，-all 的下一個網站以它為預設值。
+#   有 -api、能自動對應、或沒有可用的 .ini 時不詢問（CLP_MIGRATE_CF_PICK 為空，沿用原本的流程）。
+#   非互動（-y 或非 TTY）時不詢問，只提示可用 -api= 指定。
+# ------------------------------------------------------------------------------
+CLP_MIGRATE_CF_LAST=""
+CLP_MIGRATE_CF_PICK=""
+_migrate_pick_cf_secret() {
+  local domain="$1"
+  CLP_MIGRATE_CF_PICK=""
+
+  has_opt "api" && return 0
+  if cf_resolve_credentials "$(remove_www "$domain")" "" "" 2>/dev/null; then
+    return 0
+  fi
+  cf_find_usable_secret_files
+  local files=(${CF_USABLE_SECRETS[@]+"${CF_USABLE_SECRETS[@]}"})
+  [[ ${#files[@]} -eq 0 ]] && return 0
+
+  if clp_auto_yes || [[ ! -t 0 ]]; then
+    log_warn "$(_t "SITE_MIGRATE_CF_PICK_HINT_NONINTERACTIVE" "$domain")"
+    return 0
+  fi
+
+  local default_idx="" i
+  echo ""
+  log_info "$(_t "SITE_MIGRATE_CF_PICK_TITLE" "$domain")"
+  for i in "${!files[@]}"; do
+    echo "  $((i + 1))) $(strip_ctrl_chars "${files[$i]}")"
+    [[ -n "$CLP_MIGRATE_CF_LAST" && "${files[$i]}" == "$CLP_MIGRATE_CF_LAST" ]] && default_idx=$((i + 1))
+  done
+  echo "  0) $(_t "SITE_MIGRATE_CF_PICK_SKIP")"
+  # 上一個網站選了「不使用」時，預設值也是 0
+  [[ -z "$default_idx" && "$CLP_MIGRATE_CF_LAST" == "none" ]] && default_idx=0
+
+  local ans prompt_msg
+  if [[ -n "$default_idx" ]]; then
+    prompt_msg="$(_t "SITE_MIGRATE_CF_PICK_PROMPT" "$default_idx")"
+  else
+    prompt_msg="$(_t "SITE_MIGRATE_CF_PICK_PROMPT_NO_DEFAULT")"
+  fi
+  while true; do
+    # 讀到 EOF（Ctrl-D）視為取消：不使用 Cloudflare，沿用原本的流程
+    if ! read -r -p "$(echo -e "${C_YELLOW}? ${prompt_msg} ${C_NC}")" ans; then
+      echo ""
+      ans=0
+    fi
+    ans="${ans:-$default_idx}"
+    if [[ "$ans" =~ ^[0-9]+$ ]] && (( 10#$ans <= ${#files[@]} )); then
+      ans=$((10#$ans))
+      break
+    fi
+    echo "$(_t "SITE_MIGRATE_CF_PICK_INVALID" "${#files[@]}")"
+  done
+
+  if [[ "$ans" -eq 0 ]]; then
+    CLP_MIGRATE_CF_LAST="none"
+    log_info "$(_t "SITE_MIGRATE_CF_PICK_SKIPPED")"
+    return 0
+  fi
+  CLP_MIGRATE_CF_PICK="${files[$((ans - 1))]}"
+  CLP_MIGRATE_CF_LAST="$CLP_MIGRATE_CF_PICK"
+  log_info "$(_t "SITE_MIGRATE_CF_PICK_CHOSEN" "$(strip_ctrl_chars "$CLP_MIGRATE_CF_PICK")")"
+  return 0
+}
+
+# ------------------------------------------------------------------------------
 # 7a. 內部輔助：搬移單一網站至本地 (供 site_migrate 與 site_migrate_all 共用)
 #     參數: <remote_host> <source_domain> <target_domain> [same_domain|diff_domain]
 # ------------------------------------------------------------------------------
@@ -3914,6 +3985,11 @@ _migrate_single_site() {
   if [[ "$enable_ssl" == "y" ]]; then
     log_step "$(_t "SITE_CLONE_16")"
     local CLP_INTERNAL_SSL_CALL=1
+    local CLP_SSL_API_FILE=""
+    if [[ "$migrate_ssl_mode" == "dns" ]]; then
+      _migrate_pick_cf_secret "$target_domain"
+      CLP_SSL_API_FILE="$CLP_MIGRATE_CF_PICK"
+    fi
     site_ssl "$target_domain" "$migrate_ssl_mode" || log_warn "$(_t "SITE_CLONE_17" "${target_domain}")"
   fi
 

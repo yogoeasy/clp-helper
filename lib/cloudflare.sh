@@ -42,6 +42,28 @@ cf_is_global_key_file() {
     grep -qE '^[[:space:]]*dns_cloudflare_api_key[[:space:]]*=[[:space:]]*[^[:space:]]' "$1" 2>/dev/null
 }
 
+# cf_find_usable_secret_files：把 /root/.secrets、~/.secrets、~/.secret 中可用的 *.ini 放進 CF_USABLE_SECRETS 陣列
+#   （以全域陣列回傳，避免在 $(...) 子 shell 中處理含空白的檔名）
+#   取不到 token 的檔案（例如舊版留下的佔位範本）不列入，否則會擋住「只有一個 .ini」的備援
+CF_USABLE_SECRETS=()
+cf_find_usable_secret_files() {
+  CF_USABLE_SECRETS=()
+  local secret_dirs=("/root/.secrets" "${HOME}/.secrets" "${HOME}/.secret")
+  local seen_dirs=" " real_dir sdir sf
+  for sdir in "${secret_dirs[@]}"; do
+    # 以 root 執行時 HOME=/root，同一個目錄不可重複計算（否則「只有一個 .ini」的備援永遠不會成立）
+    real_dir=$(realpath "$sdir" 2>/dev/null || echo "$sdir")
+    [[ "$seen_dirs" == *" ${real_dir} "* ]] && continue
+    seen_dirs+="${real_dir} "
+    [[ -d "$sdir" ]] || continue
+    while IFS= read -r -d '' sf; do
+      if _extract_token_from_file "$sf" >/dev/null 2>&1 || cf_is_global_key_file "$sf"; then
+        CF_USABLE_SECRETS+=("$sf")
+      fi
+    done < <(find "$sdir" -maxdepth 1 -name "*.ini" -print0 2>/dev/null || true)
+  done
+}
+
 cf_resolve_credentials() {
   local domain="${1:-}"
   local cli_token="${2:-}"
@@ -99,27 +121,8 @@ cf_resolve_credentials() {
     fi
 
     if [[ -z "$credentials_file" && -z "$token" ]]; then
-      local secret_dirs=("/root/.secrets" "${HOME}/.secrets" "${HOME}/.secret")
-      local available_secrets=() seen_dirs=" " real_dir
-      for sdir in "${secret_dirs[@]}"; do
-        # 以 root 執行時 HOME=/root，同一個目錄不可重複計算（否則「只有一個 .ini」的備援永遠不會成立）
-        real_dir=$(realpath "$sdir" 2>/dev/null || echo "$sdir")
-        [[ "$seen_dirs" == *" ${real_dir} "* ]] && continue
-        seen_dirs+="${real_dir} "
-        if [[ -d "$sdir" ]]; then
-          while IFS= read -r -d '' sf; do
-            available_secrets+=("$sf")
-          done < <(find "$sdir" -maxdepth 1 -name "*.ini" -print0 2>/dev/null || true)
-          # 取不到 token 的檔案（例如舊版留下的佔位範本）不列入，否則會擋住「只有一個 .ini」的備援
-          local usable=() cand
-          for cand in ${available_secrets[@]+"${available_secrets[@]}"}; do
-            if _extract_token_from_file "$cand" >/dev/null 2>&1 || cf_is_global_key_file "$cand"; then
-              usable+=("$cand")
-            fi
-          done
-          available_secrets=(${usable[@]+"${usable[@]}"})
-        fi
-      done
+      cf_find_usable_secret_files
+      local available_secrets=(${CF_USABLE_SECRETS[@]+"${CF_USABLE_SECRETS[@]}"})
 
       if [[ ${#available_secrets[@]} -gt 0 ]]; then
         # Smart domain match：見 cf_credentials_match_score（完整網域／上層網域優先，其次網域主要名稱）；
