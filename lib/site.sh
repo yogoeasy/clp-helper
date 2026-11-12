@@ -345,7 +345,443 @@ site_off() {
 }
 
 # ------------------------------------------------------------------------------
+# 3a. 刪除網站使用者的等待、進度與確認（審查 60）
+#   CloudPanel 的 site:delete 可能在 userdel -r 刪完家目錄之前就返回；刪除期間帳號檔（/etc/passwd 等）被鎖住，
+#   這時建立或刪除任何網站使用者都會失敗（useradd: cannot lock /etc/passwd）。
+#   這裡的函式只讀取：不刪鎖定檔、不結束行程、不呼叫 userdel。
+# ------------------------------------------------------------------------------
+CLP_DEL_STALL_SECS=600          # 連續多久沒有進展算停滯（互動時詢問、非互動時停止）
+CLP_DEL_ASK_EVERY=1800          # 互動時，即使有進展也每隔多久詢問一次
+CLP_DEL_MAX_SECS=3600           # 非互動時的總上限
+CLP_DEL_FAIL_GRACE=20           # 沒有任何帳號行程、也沒有進展多久，判定刪除不會再完成
+CLP_DEL_MONITOR_MIN_FILES=20000 # 檔案少於這個數量時不顯示刪除中的進度（很快就結束）
+CLP_DEL_MENU_POLL=30            # 選單等待輸入時，每隔多久重新檢查一次是否已刪除完成
+CLP_DEL_COUNT_USER="" CLP_DEL_COUNT_FILES="" CLP_DEL_COUNT_KB=""
+CLP_DEL_MON_PID=""
+
+# 帳號檔的鎖定檔（shadow-utils 的 <檔案>.lock；常駐的 /etc/.pwd.lock 存在不代表上鎖，不列入）
+_acct_lock_files() { printf '%s\n' /etc/passwd.lock /etc/shadow.lock /etc/group.lock /etc/gshadow.lock; }
+_site_user_home() { printf '/home/%s\n' "$1"; }
+_clp_now() { date +%s; }
+_clp_sleep() { sleep "$1"; }
+# 等待時可以詢問使用者（有終端機、沒有 -y）
+_del_interactive() { ! clp_auto_yes && [[ -t 0 ]]; }
+
+# _acct_procs：正在修改帳號檔的行程（PID 與名稱；不印命令列，useradd 的參數含密碼雜湊）
+_acct_procs() {
+  pgrep -l -x 'userdel|useradd|usermod|deluser|adduser|groupdel|groupadd|groupmod|chpasswd|passwd|chage|gpasswd|newusers|vipw' 2>/dev/null | paste -sd ',' - || true
+}
+
+# _acct_locks_present：輸出存在的鎖定檔（以空白分隔），沒有則無輸出
+_acct_locks_present() {
+  local f out=""
+  while IFS= read -r f; do
+    if [[ -e "$f" ]]; then out+="${out:+ }$f"; fi
+  done < <(_acct_lock_files)
+  printf '%s' "$out"
+}
+
+# _user_leftovers <使用者>：輸出仍存在的項目（使用者、家目錄），都不存在則無輸出
+_user_leftovers() {
+  local u="$1" h out=""
+  [[ -n "$u" ]] || return 0
+  h="$(_site_user_home "$u")"
+  if id -u "$u" >/dev/null 2>&1; then out="$(_t "SITE_DEL_LEFT_USER" "$u")"; fi
+  if [[ -e "$h" || -L "$h" ]]; then out+="${out:+, }$h"; fi
+  printf '%s' "$out"
+}
+
+# _fs_inodes_used <路徑>：該路徑所在檔案系統已用的 inode 數；讀不到（btrfs、ZFS 等回報 0）時回傳 1
+_fs_inodes_used() {
+  local out c d
+  out=$(stat -f -c '%c %d' "$1" 2>/dev/null) || return 1
+  read -r c d <<< "$out"
+  [[ "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
+  (( c > 0 && c >= d )) || return 1
+  printf '%s\n' "$((c - d))"
+}
+
+# _count_home_files <目錄>：輸出「檔案數 KB」；目錄不存在、是連結、逾時或讀取錯誤時回傳 1
+#   以 root 只讀取（不跟隨連結、不跨檔案系統），不修改網站使用者目錄中的任何東西
+#   find 回傳 1（走訪時有檔案剛好被網站刪掉，線上網站常見）仍採用加總結果；逾時（124）或無法執行（125 以上）才算失敗
+_count_home_files() {
+  local dir="$1" out rc=0
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
+  out=$(timeout 120 find "$dir" -xdev -printf '%k\n' 2>/dev/null | awk '{ n++; k += $1 } END { printf "%.0f %.0f\n", n, k }'; exit "${PIPESTATUS[0]}") || rc=$?
+  if [[ "$rc" -ne 0 && "$rc" -ne 1 ]]; then return 1; fi
+  [[ "${out%% *}" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$out"
+}
+
+_human_kb() { awk -v k="${1:-0}" 'BEGIN { if (k >= 1048576) printf "%.1f GB", k / 1048576; else if (k >= 1024) printf "%.0f MB", k / 1024; else printf "%.0f KB", k }'; }
+_dur() {
+  local s="${1:-0}"
+  if (( s >= 3600 )); then printf '%dh%02dm' "$((s / 3600))" "$((s % 3600 / 60))"
+  elif (( s >= 60 )); then printf '%dm%02ds' "$((s / 60))" "$((s % 60))"
+  else printf '%ds' "$s"; fi
+}
+# 進度訊息只印到畫面（stderr），不寫入 log 檔
+_progress_msg() { printf '%b[%s]%b %s\n' "${C_CYAN:-}" "${CLP_TAG_INFO:-INFO }" "${C_NC:-}" "$1" >&2; }
+
+# _del_prepare_count <使用者>：計算家目錄的檔案數與大小，結果存在 CLP_DEL_COUNT_*（同一個使用者只算一次；
+#   以使用者名稱為鍵：同一次執行中不會刪除後又重建同名使用者再刪除，所以不會沿用到過時的數字）
+_del_prepare_count() {
+  local u="$1" r
+  [[ -n "$u" && "$CLP_DEL_COUNT_USER" == "$u" ]] && return 0
+  CLP_DEL_COUNT_USER="$u" CLP_DEL_COUNT_FILES="" CLP_DEL_COUNT_KB=""
+  [[ -n "$u" ]] || return 0
+  local h
+  h="$(_site_user_home "$u")"
+  [[ -d "$h" && ! -L "$h" ]] || return 0
+  _progress_msg "$(_t "SITE_DEL_INFO_COUNTING" "$h")"
+  if r=$(_count_home_files "$h"); then
+    read -r CLP_DEL_COUNT_FILES CLP_DEL_COUNT_KB <<< "$r"
+  fi
+  return 0
+}
+
+# _del_progress_text <基準 inode> <檔案數> <開始時間>：一行進度文字
+_del_progress_text() {
+  local base="$1" total="${2:-0}" start="$3" el used ndone pct
+  el=$(( $(_clp_now) - start ))
+  if [[ -n "$base" && "$total" =~ ^[0-9]+$ ]] && (( total > 0 )) && used=$(_fs_inodes_used /home); then
+    ndone=$(( base - used ))
+    (( ndone < 0 )) && ndone=0
+    (( ndone > total )) && ndone=$total
+    pct=$(( ndone * 100 / total ))
+    (( pct > 99 )) && pct=99
+    _t "SITE_DEL_PROGRESS" "$pct" "$ndone" "$total" "$(_dur "$el")"
+  else
+    _t "SITE_DEL_PROGRESS_TIME" "$(_dur "$el")"
+  fi
+}
+
+# 刪除中的進度：背景子行程每秒醒來，每 10 秒（非終端機 60 秒）印一行；主程式結束時自行離開
+#   （非互動的 bash 中背景子行程收不到 Ctrl-C，所以不能只靠 trap 清除）
+_del_monitor_start() {
+  CLP_DEL_MON_PID=""
+  local base="$1" total="$2" start="$3" parent=$$ interval=10
+  [[ -t 2 ]] || interval=60
+  (
+    i=0
+    while kill -0 "$parent" 2>/dev/null; do
+      _clp_sleep 1
+      i=$((i + 1))
+      if (( i % interval == 0 )); then _progress_msg "$(_del_progress_text "$base" "$total" "$start")"; fi
+    done
+  ) >/dev/null &
+  CLP_DEL_MON_PID=$!
+}
+_del_monitor_stop() {
+  if [[ -n "$CLP_DEL_MON_PID" ]]; then
+    kill "$CLP_DEL_MON_PID" 2>/dev/null || true
+    wait "$CLP_DEL_MON_PID" 2>/dev/null || true
+    CLP_DEL_MON_PID=""
+  fi
+}
+
+# _home_entries <使用者>：家目錄第一層的項目數（/home 的 inode 數讀不到時，用來判斷是否還在刪除）
+_home_entries() {
+  local h
+  [[ -n "$1" ]] || return 0
+  h="$(_site_user_home "$1")"
+  if [[ -d "$h" && ! -L "$h" ]]; then
+    find "$h" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ' || true
+  fi
+  return 0
+}
+
+# _del_diag <使用者> <基準> <檔案數> <開始> <最後進展時間>：印出等待中的診斷（只讀取）
+_del_diag() {
+  local u="$1" base="$2" total="$3" start="$4" last="$5" now procs locks left uprocs
+  now=$(_clp_now)
+  procs="$(_acct_procs)"
+  locks="$(_acct_locks_present)"
+  left="$(_user_leftovers "$u")"
+  echo "" >&2
+  echo -e "${C_YELLOW}$(_t "SITE_DEL_DIAG_TITLE" "$(_dur $((now - start)))")${C_NC}" >&2
+  echo "  $(_del_progress_text "$base" "$total" "$start")" >&2
+  echo "$(_t "SITE_DEL_DIAG_LAST" "$(_dur $((now - last)))")" >&2
+  if [[ -n "$procs" ]]; then echo "$(_t "SITE_DEL_DIAG_PROCS" "$procs")" >&2; else echo "$(_t "SITE_DEL_DIAG_NO_PROCS")" >&2; fi
+  [[ -z "$locks" ]] || echo "$(_t "SITE_DEL_DIAG_LOCKS" "$locks")" >&2
+  [[ -z "$left" ]] || echo "$(_t "SITE_DEL_DIAG_LEFT" "$left")" >&2
+  if [[ -n "$u" ]] && id -u "$u" >/dev/null 2>&1; then
+    uprocs=$(ps -u "$u" -o pid=,comm= 2>/dev/null | head -n 5 | awk '{ printf "%s%s(%s)", (NR > 1 ? ", " : ""), $2, $1 }' || true)
+    [[ -z "$uprocs" ]] || echo "$(_t "SITE_DEL_DIAG_USER_PROCS" "$u" "$uprocs")" >&2
+  fi
+  if [[ -z "$procs" ]]; then
+    echo "$(_t "SITE_DEL_DIAG_CAUSE_FAILED")" >&2
+  elif (( now - last >= CLP_DEL_STALL_SECS )); then
+    echo "$(_t "SITE_DEL_DIAG_CAUSE_STUCK" "$(_dur $((now - last)))")" >&2
+  else
+    echo "$(_t "SITE_DEL_DIAG_CAUSE_BUSY")" >&2
+  fi
+}
+
+# _del_clean <使用者>：使用者與家目錄都不在，帳號檔也沒有被占用
+_del_clean() {
+  [[ -z "$(_user_leftovers "$1")" ]] || return 1
+  [[ -z "$(_acct_procs)" && -z "$(_acct_locks_present)" ]]
+}
+
+# _del_wait_menu：互動選單；回傳 0＝等待期間已刪除完成、3＝停止、10＝再等
+#   read -t 定時醒來重新檢查，使用者不在時刪除完成也會自動繼續；讀到 EOF 視為停止
+_del_wait_menu() {
+  local u="$1"
+  echo "$(_t "SITE_DEL_MENU_1" "$((CLP_DEL_STALL_SECS / 60))")" >&2
+  echo "$(_t "SITE_DEL_MENU_2")" >&2
+  printf '%s' "$(_t "SITE_DEL_MENU_PROMPT")" >&2
+  local ans rc
+  while true; do
+    ans="" rc=0
+    read -r -t "$CLP_DEL_MENU_POLL" ans || rc=$?
+    if (( rc > 128 )); then
+      if _del_clean "$u"; then echo "" >&2; _progress_msg "$(_t "SITE_DEL_MENU_DONE_WHILE")"; return 0; fi
+      # 已經沒有行程在刪除、卻仍有殘留：回到主迴圈，由主迴圈判定刪除失敗（不等使用者回答）
+      if [[ -z "$(_acct_procs)" && -n "$(_user_leftovers "$u")" ]]; then echo "" >&2; return 10; fi
+      continue
+    elif (( rc != 0 )); then
+      echo "" >&2
+      return 3
+    fi
+    case "${ans// /}" in
+      ""|1) return 10 ;;
+      2) return 3 ;;
+      *) printf '%s' "$(_t "SITE_DEL_MENU_INVALID")" >&2 ;;
+    esac
+  done
+}
+
+# _wait_user_removed <使用者> <基準 inode> <檔案數> <開始時間>
+#   使用者為空字串時，只等帳號檔不再被占用（鎖定檔與 userdel 等行程）。
+#   回傳 0＝已清除；2＝刪除未完成、也沒有行程在刪（不會自行完成）；3＝仍在刪除，使用者選擇停止或非互動逾時
+#   互動：連續 10 分鐘沒有進展、或每滿 30 分鐘，顯示診斷與選單；-y／非終端機：連續 10 分鐘沒有進展或總共 60 分鐘就停止
+_wait_user_removed() {
+  local u="$1" base="$2" total="$3" start="$4"
+  _del_clean "$u" && return 0
+
+  local interactive=0 interval=10
+  if _del_interactive; then interactive=1; fi
+  [[ -t 2 ]] || interval=60
+  local now metric min_metric="" idle_since="" procs rc
+  now=$(_clp_now)
+  local last_progress=$now last_print=$now last_menu=$now
+  local next_ask=$((now + CLP_DEL_ASK_EVERY))
+  if [[ -n "$u" ]]; then
+    _progress_msg "$(_t "SITE_DEL_WAIT_USER" "$u" "$(_site_user_home "$u")")"
+  else
+    _progress_msg "$(_t "SITE_DEL_WAIT_ACCT")"
+  fi
+
+  while true; do
+    if _del_clean "$u"; then
+      now=$(_clp_now)
+      if [[ -n "$u" ]]; then
+        log_success "$(_t "SITE_DEL_WAIT_DONE" "$u" "$(_site_user_home "$u")" "$(_dur $((now - start)))")"
+      else
+        log_success "$(_t "SITE_DEL_WAIT_ACCT_DONE" "$(_dur $((now - start)))")"
+      fi
+      return 0
+    fi
+    now=$(_clp_now)
+    procs="$(_acct_procs)"
+
+    # 進展：/home 已用 inode 比之前看到的最小值少。
+    #   讀不到 inode（btrfs、ZFS 等）時：帳號行程仍在執行就算有進展；家目錄第一層的項目變少也算
+    if metric=$(_fs_inodes_used /home); then
+      if [[ -z "$min_metric" ]]; then
+        min_metric=$metric
+      elif (( metric < min_metric )); then
+        min_metric=$metric
+        last_progress=$now
+      fi
+    else
+      if [[ -n "$procs" ]]; then last_progress=$now; fi
+      metric=$(_home_entries "$u") || metric=""
+      if [[ "$metric" =~ ^[0-9]+$ ]]; then
+        if [[ -z "$min_metric" ]]; then
+          min_metric=$metric
+        elif (( metric < min_metric )); then
+          min_metric=$metric
+          last_progress=$now
+        fi
+      fi
+    fi
+
+    # 沒有任何帳號行程：一段時間內也沒有進展，判定刪除不會再完成
+    if [[ -z "$procs" ]]; then
+      if [[ -z "$idle_since" ]] || (( last_progress > idle_since )); then idle_since=$now; fi
+      if (( now - idle_since >= CLP_DEL_FAIL_GRACE )); then
+        if [[ -n "$(_user_leftovers "$u")" ]]; then
+          return 2
+        fi
+        # 只剩鎖定檔、沒有任何行程：舊的鎖定檔（shadow-utils 下次取鎖時會自行清除）
+        log_warn "$(_t "SITE_DEL_WARN_STALE_LOCK" "$(_acct_locks_present)")"
+        return 0
+      fi
+    else
+      idle_since=""
+    fi
+
+    if (( now - last_print >= interval )); then
+      _progress_msg "$(_del_progress_text "$base" "$total" "$start")"
+      last_print=$now
+    fi
+
+    if (( interactive == 1 )); then
+      if (( now - last_progress >= CLP_DEL_STALL_SECS && now - last_menu >= CLP_DEL_STALL_SECS )) || (( now >= next_ask )); then
+        _del_diag "$u" "$base" "$total" "$start" "$last_progress"
+        rc=0
+        _del_wait_menu "$u" || rc=$?
+        if (( rc == 0 || rc == 3 )); then return "$rc"; fi
+        now=$(_clp_now)
+        last_menu=$now
+        next_ask=$((now + CLP_DEL_ASK_EVERY))
+      fi
+    else
+      if (( now - last_progress >= CLP_DEL_STALL_SECS )); then
+        log_warn "$(_t "SITE_DEL_STOP_STALL" "$(_dur $((now - last_progress)))")"
+        return 3
+      fi
+      if (( now - start >= CLP_DEL_MAX_SECS )); then
+        log_warn "$(_t "SITE_DEL_STOP_MAX" "$(_dur $((now - start)))")"
+        return 3
+      fi
+    fi
+    _clp_sleep 2
+  done
+}
+
+# _del_report <使用者> <rc>：說明刪除沒有完成的狀態（rc 2＝不會自行完成；3＝仍在背景刪除）
+_del_report() {
+  local u="$1" rc="$2" h
+  h="$(_site_user_home "$u")"
+  if [[ "$rc" -eq 2 ]]; then
+    log_error "$(_t "SITE_DEL_FAILED" "$u" "$(_user_leftovers "$u")")"
+    local uprocs=""
+    if id -u "$u" >/dev/null 2>&1; then
+      uprocs=$(ps -u "$u" -o pid=,comm= 2>/dev/null | head -n 5 | awk '{ printf "%s%s(%s)", (NR > 1 ? ", " : ""), $2, $1 }' || true)
+    fi
+    [[ -z "$uprocs" ]] || echo "$(_t "SITE_DEL_DIAG_USER_PROCS" "$u" "$uprocs")" >&2
+    log_warn "$(_t "SITE_DEL_FAILED_CAUSE")"
+    log_warn "$(_t "SITE_DEL_FAILED_HINT")"
+  else
+    log_warn "$(_t "SITE_DEL_STOPPED" "$u" "$h")"
+    echo "$(_t "SITE_DEL_CHECK_HINT")" >&2
+  fi
+  # 檢查用的唯讀指令，各自獨立一行方便複製
+  echo "pgrep -l -x userdel" >&2
+  echo "ls -d $h" >&2
+}
+
+# _acct_busy_hint：建立網站失敗後的唯讀診斷（帳號檔被占用時說明可能原因）
+_acct_busy_hint() {
+  local procs locks
+  procs="$(_acct_procs)"
+  locks="$(_acct_locks_present)"
+  if [[ -n "$procs$locks" ]]; then
+    log_warn "$(_t "SITE_ACCT_DIAG_BUSY" "${procs:-$locks}")"
+  fi
+  return 0
+}
+
+# _replace_notice <網域>：要被取代的網站的說明（使用者、檔案數與大小、資料庫、刪除期間的影響）
+_replace_notice() {
+  local domain="$1" u h db=""
+  u=$(find_site_user "$domain" 2>/dev/null || true)
+  local clp_db="/home/clp/htdocs/app/data/db.sq3"
+  if [[ -f "$clp_db" ]] && command -v sqlite3 >/dev/null 2>&1; then
+    db=$(sqlite3 -readonly "$clp_db" "SELECT d.name FROM \"database\" d JOIN site s ON d.site_id=s.id WHERE s.domain_name='$domain';" 2>/dev/null | paste -sd ',' - || true)
+  fi
+  _del_prepare_count "$u"
+  echo "" >&2
+  echo -e "${C_YELLOW}${C_BOLD}$(_t "SITE_REPLACE_NOTICE_TITLE" "$domain")${C_NC}" >&2
+  if [[ -n "$u" ]]; then
+    h="$(_site_user_home "$u")"
+    echo "$(_t "SITE_REPLACE_NOTICE_USER" "$u" "$h")" >&2
+    if [[ -n "$CLP_DEL_COUNT_FILES" ]]; then
+      echo "$(_t "SITE_REPLACE_NOTICE_FILES" "$CLP_DEL_COUNT_FILES" "$(_human_kb "$CLP_DEL_COUNT_KB")")" >&2
+    elif [[ -d "$h" ]]; then
+      echo "$(_t "SITE_REPLACE_NOTICE_FILES_UNKNOWN")" >&2
+    fi
+  fi
+  [[ -z "$db" ]] || echo "$(_t "SITE_REPLACE_NOTICE_DB" "$db")" >&2
+  echo -e "${C_YELLOW}$(_t "SITE_REPLACE_NOTICE_LOCK")${C_NC}" >&2
+}
+
+# _confirm_replace_site <網域>：取代前說明並確認（在匯出／下載資料庫之前呼叫，實際刪除在之後）
+#   -y：-force-replace 已是明確同意，只印說明；批次搬移（-all）已在清單確認，也只印說明。
+#   非終端機又沒有 -y 的情況，呼叫端在判定要取代時已經以 require_tty_or_yes 擋下。讀到 EOF 視為取消。
+_confirm_replace_site() {
+  local domain="$1" ans=""
+  _replace_notice "$domain"
+  if clp_auto_yes || [[ "${CLP_MIGRATE_BATCH:-0}" -eq 1 ]]; then
+    return 0
+  fi
+  read -r -p "$(_t "SITE_REPLACE_PROMPT" "$domain")" ans || ans=""
+  if [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+    return 0
+  fi
+  log_warn "$(_t "SITE_REPLACE_CANCELLED")"
+  return 1
+}
+
+# _replace_delete_failed <網域> <site_delete 的回傳值> [<保留的資料庫匯出檔>]：取代流程中刪除舊網站沒有完成時的說明
+#   2／3：舊網站已刪除、新網站沒有建立；1：CloudPanel 刪除失敗；4：帳號檔被占用，沒有刪除任何東西（site_delete 已說明）
+#   第三個參數：clone 保留的匯出檔；空字串＝migrate（已刪除，重跑會重新下載）；-＝site -new（沒有匯出檔）
+_replace_delete_failed() {
+  local domain="$1" rc="$2" sql="${3:-}"
+  case "$rc" in
+    2|3)
+      log_error "$(_t "SITE_REPLACE_ABORT_STATE" "$domain")"
+      if [[ "$sql" == "-" ]]; then
+        :   # site -new：沒有匯出的資料庫
+      elif [[ -n "$sql" ]]; then
+        log_info "$(_t "SITE_REPLACE_ABORT_SQL_KEPT" "$sql")"
+      else
+        log_info "$(_t "SITE_REPLACE_ABORT_SQL_GONE")"
+      fi
+      log_info "$(_t "SITE_REPLACE_ABORT_RERUN")"
+      ;;
+    4)
+      log_info "$(_t "SITE_REPLACE_ABORT_NOT_DELETED" "$domain")"
+      if [[ "$sql" == "-" ]]; then
+        :
+      elif [[ -n "$sql" ]]; then
+        log_info "$(_t "SITE_REPLACE_ABORT_SQL_KEPT" "$sql")"
+      else
+        log_info "$(_t "SITE_REPLACE_ABORT_SQL_GONE")"
+      fi
+      ;;
+    *) log_error "$(_t "SITE__MIGRATE_SINGLE_SITE_3" "$domain")" ;;
+  esac
+}
+
+# _wait_acct_before_create [<要建立的使用者>]：建立網站使用者之前，確認帳號檔沒有被占用
+#   （回滾刪除後緊接著建站、批次搬移的下一站、停止等待後立刻重跑）。
+#   指定使用者時，另外確認沒有殘留的同名家目錄（使用者已刪除、家目錄還在時，useradd 會沿用舊目錄）。
+#   回傳 0＝可以建立；1＝帳號檔仍被占用；2＝有殘留的家目錄
+_wait_acct_before_create() {
+  local u="${1:-}" rc=0 h
+  _wait_user_removed "" "" "" "$(_clp_now)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    log_error "$(_t "SITE_DEL_ERR_ACCT_BUSY_CREATE")"
+    return 1
+  fi
+  if [[ -n "$u" ]] && ! id -u "$u" >/dev/null 2>&1; then
+    h="$(_site_user_home "$u")"
+    if [[ -e "$h" || -L "$h" ]]; then
+      log_error "$(_t "SITE_ERR_HOME_LEFT" "$h" "$u")"
+      return 2
+    fi
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------------------
 # 3. Site Delete (clp site delete <domain> / clp site <domain> -delete)
+#   回傳 0＝已刪除且網站使用者已清除；1＝失敗；2＝網站已刪除，但使用者或家目錄殘留（不會自行完成）；
+#   3＝網站已刪除，使用者仍在背景刪除（使用者選擇不等或非互動逾時）；4＝帳號檔被占用，沒有刪除任何東西
 # ------------------------------------------------------------------------------
 site_delete() {
   local domain
@@ -397,10 +833,44 @@ site_delete() {
     [[ -n "$queried_db" ]] && dbname="$queried_db"
   fi
 
+  # 1b. 刪除前記下家目錄的檔案數（唯讀），用來估計刪除進度
+  local del_base="" del_total="" del_start del_home=""
+  if [[ -n "$site_user" ]]; then
+    del_home="$(_site_user_home "$site_user")"
+    _del_prepare_count "$site_user"
+    del_total="$CLP_DEL_COUNT_FILES"
+    if [[ -d "$del_home" ]]; then
+      if [[ -n "$del_total" ]]; then
+        log_info "$(_t "SITE_DEL_INFO_START" "$del_home" "$del_total" "$(_human_kb "$CLP_DEL_COUNT_KB")")"
+      else
+        log_info "$(_t "SITE_DEL_INFO_START_UNKNOWN" "$del_home")"
+      fi
+    fi
+  fi
+
+  # 1c. 帳號檔被占用（例如另一個網站的使用者還在刪除）時先等待，否則這個網站的使用者會刪不掉而殘留。
+  #     放在計數之後、緊接 clpctl 之前：計數可能要數十秒，先檢查會讓這段期間開始的另一個刪除漏掉（審查 60 第四輪 Q1）
+  local acct_rc=0
+  _wait_user_removed "" "" "" "$(_clp_now)" || acct_rc=$?
+  if [[ "$acct_rc" -ne 0 ]]; then
+    log_error "$(_t "SITE_DEL_ERR_ACCT_BUSY")"
+    return 4
+  fi
+  # inode 基準要在等待之後才取，否則另一個網站刪除的量會被算成這個網站的進度
+  del_base=$(_fs_inodes_used /home) || del_base=""
+  del_start=$(_clp_now)
+
   # 2. 透過 CloudPanel 刪除網站
   if command -v clpctl >/dev/null 2>&1; then
     log_info "$(_t "SITE_DELETE_INFO_CLP" "$domain")"
-    if ! clpctl site:delete --domainName="$domain" --force 2>&1; then
+    # 檔案多（或量不出來）時，刪除期間在背景顯示進度
+    if [[ -d "$del_home" ]] && { [[ -z "$del_total" ]] || (( del_total >= CLP_DEL_MONITOR_MIN_FILES )); }; then
+      _del_monitor_start "$del_base" "$del_total" "$del_start"
+    fi
+    local clp_rc=0
+    clpctl site:delete --domainName="$domain" --force 2>&1 || clp_rc=$?
+    _del_monitor_stop
+    if [[ "$clp_rc" -ne 0 ]]; then
       # clpctl 失敗時，若 CloudPanel 資料庫仍有此網站，停止後續手動清理，
       # 避免面板仍列出網站、vhost 與憑證卻已被刪除的不一致狀態
       if [[ -f "$clp_db" ]] && command -v sqlite3 >/dev/null 2>&1 && \
@@ -449,6 +919,16 @@ site_delete() {
 
   # 4. 重載服務
   nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+
+  # 5. 等網站使用者與家目錄真正刪除（CloudPanel 可能在 userdel 刪完家目錄之前就返回）
+  if [[ -n "$site_user" ]]; then
+    local wait_rc=0
+    _wait_user_removed "$site_user" "$del_base" "$del_total" "$del_start" || wait_rc=$?
+    if [[ "$wait_rc" -ne 0 ]]; then
+      _del_report "$site_user" "$wait_rc"
+      return "$wait_rc"
+    fi
+  fi
   log_success "$(_t "SITE_DELETE_SUCCESS" "$domain")"
 }
 
@@ -1473,6 +1953,8 @@ site_new() {
   site_root=$(find_site_root "$domain" 2>/dev/null || true)
   if [[ -n "$site_root" && -d "$site_root" ]]; then
     if has_opt "force-replace" || has_opt "force_replace"; then
+      # 取代前要確認建置計畫：非終端機又沒有 -y 時，在任何修改之前停止
+      require_tty_or_yes || return 1
       replace_existing=1
     else
       log_error "$(_t "SITE_NEW_ERR_SITE_EXISTS" "${domain}")"
@@ -1482,6 +1964,8 @@ site_new() {
   fi
 
   # 4. 決定預設站台基本參數 (Site User, PHP, SSL)
+  #    先確認帳號檔沒有被占用：上一個網站的使用者還在刪除時，名稱會被誤判為已使用而換成其他名稱
+  _wait_acct_before_create || return 1
   local default_user=""
   if (( replace_existing == 1 )); then
     default_user=$(find_site_user "$domain" 2>/dev/null || true)
@@ -1535,6 +2019,11 @@ site_new() {
     non_interactive=true
   fi
 
+  # 要取代既有網站時，先說明要刪除的內容（檔案數只算一次；選單重畫時只顯示一行摘要）
+  if [[ "$replace_existing" -eq 1 ]]; then
+    _replace_notice "$domain"
+  fi
+
   if [[ "$non_interactive" != "true" ]]; then
     while true; do
       echo ""
@@ -1576,6 +2065,13 @@ site_new() {
       echo ""
       echo "----------------------------------------------------------------------"
       echo -e " $(_t "SITE_NEW_PLAN_CONFIG_BAR" "${C_BOLD}${siteuser}${C_NC}" "${C_BOLD}${php_ver}${C_NC}" "${C_BOLD}${wp_locale}${C_NC}" "${C_BOLD}${ssl_type}${C_NC}")"
+      if [[ "$replace_existing" -eq 1 ]]; then
+        if [[ -n "$CLP_DEL_COUNT_FILES" ]]; then
+          echo -e " ${C_YELLOW}$(_t "SITE_NEW_PLAN_REPLACE_LINE" "$domain" "$CLP_DEL_COUNT_FILES" "$(_human_kb "$CLP_DEL_COUNT_KB")")${C_NC}"
+        else
+          echo -e " ${C_YELLOW}$(_t "SITE_NEW_PLAN_REPLACE_LINE_UNKNOWN" "$domain")${C_NC}"
+        fi
+      fi
       echo "----------------------------------------------------------------------"
       echo -e " $(_t "SITE_NEW_PLAN_FOOTER_HINT")"
       echo "----------------------------------------------------------------------"
@@ -1662,14 +2158,15 @@ site_new() {
     done
   fi
 
-  # 5b. 建置計畫已確認，才刪除要被取代的既有網站
-  if [[ "$replace_existing" -eq 1 ]]; then
-    log_warn "$(_t "SITE_NEW_WARN_EXISTING_FORCE")"
-    site_delete "$domain"
+  # 5b. 取代既有網站時，使用者名稱只能是被取代網站的使用者或尚未存在的名稱（在刪除之前檢查）；
+  #     實際刪除延後到所有輸入都完成、建立網站之前（第 8 步）
+  if [[ "$replace_existing" -eq 1 ]] && ! replace_user_available "$siteuser" "$domain"; then
+    log_error "$(_t "SITE_NEW_ERR_USER_EXISTS" "${siteuser}")"
+    return 1
   fi
 
-  # 6. 檢查 siteuser 是否已存在系統中 (/etc/passwd 衝突防護)
-  while id -u "$siteuser" >/dev/null 2>&1; do
+  # 6. 檢查 siteuser 是否已存在系統中 (/etc/passwd 衝突防護；取代時已在上面檢查)
+  while [[ "$replace_existing" -ne 1 ]] && id -u "$siteuser" >/dev/null 2>&1; do
     log_error "$(_t "SITE_NEW_ERR_USER_EXISTS" "${siteuser}")"
     default_user=$(suggest_site_user "$domain")
     if [[ "$non_interactive" == "true" ]]; then
@@ -1748,7 +2245,26 @@ site_new() {
 
   log_info "$(_t "SITE_NEW_INFO_TARGET_DB" "${dbname}")"
 
+  # 7b. 所有輸入都完成後，才刪除要被取代的既有網站；必須刪除成功、網站使用者也已清除才繼續
+  if [[ "$replace_existing" -eq 1 ]]; then
+    log_warn "$(_t "SITE_NEW_WARN_EXISTING_FORCE")"
+    local del_rc=0
+    site_delete "$domain" -force || del_rc=$?
+    if [[ "$del_rc" -ne 0 ]]; then
+      _replace_delete_failed "$domain" "$del_rc" "-"
+      return 1
+    fi
+    if id -u "$siteuser" >/dev/null 2>&1; then
+      log_error "$(_t "SITE_NEW_ERR_USER_EXISTS" "${siteuser}")"
+      return 1
+    fi
+  fi
+
   # 8. 呼叫 CloudPanel 建立網站與資料庫
+  if ! _wait_acct_before_create "$siteuser"; then
+    [[ "$replace_existing" -eq 1 ]] && _replace_delete_failed "$domain" 3 "-"
+    return 1
+  fi
   log_step "$(_t "SITE_NEW_STEP_CREATE_SITE")"
   clpctl site:add:php \
     --domainName="$domain" \
@@ -1757,6 +2273,7 @@ site_new() {
     --siteUser="$siteuser" \
     --siteUserPassword="$siteuserpass" || {
       log_error "$(_t "SITE_NEW_ERR_CREATE_SITE")"
+      _acct_busy_hint
       return 1
     }
   log_success "$(_t "SITE_NEW_SUCCESS_CREATE_SITE")"
@@ -3045,6 +3562,8 @@ site_clone() {
   local replace_target=""
   if site_exists "$target_domain" || [[ -n "$target_root" && -d "$target_root" ]]; then
     if has_opt "force-replace" || has_opt "force_replace"; then
+      # 取代前會詢問確認：非終端機又沒有 -y 時，在任何修改之前停止
+      require_tty_or_yes || return 1
       replace_target="$target_domain"
     else
       log_error "$(_t "SITE_CLONE_8" "${target_domain}")"
@@ -3053,6 +3572,8 @@ site_clone() {
   fi
 
   # 3. 取得來源站擁有者與決定目標站 Site User (CloudPanel 要求每個網站必須擁有獨立且尚未存在於 /etc/passwd 的使用者)
+  #    先確認帳號檔沒有被占用：上一個網站的使用者還在刪除時，名稱會被誤判為已使用而換成其他名稱
+  _wait_acct_before_create || return 1
 
   local target_user replaced_user=""
   target_user=$(opt_get "user" "")
@@ -3079,6 +3600,11 @@ site_clone() {
   fi
   log_info "$(_t "SITE_CLONE_11" "${php_ver}")"
 
+  # 4a. 要取代既有網站時，先說明並確認（在匯出資料庫之前；實際刪除在匯出完成之後）
+  if [[ -n "$replace_target" ]]; then
+    _confirm_replace_site "$replace_target" || return 1
+  fi
+
   # 4b. 先匯出來源資料庫（不依賴目標網站）；失敗時目標網站還沒有被動到
   log_step "$(_t "SITE_CLONE_18")"
   mkdir -p "$backup_dir" && chmod 700 "$backup_dir" 2>/dev/null || true
@@ -3099,17 +3625,21 @@ site_clone() {
   log_info "$(_t "SITE_CLONE_20" "${sql_backup}")"
 
   # 4c. 檢查與來源資料都準備好之後，才刪除要被取代的目標網站
+  #     site_delete 會等到網站使用者與家目錄真正刪除；沒有刪乾淨就停止，不改用其他使用者名稱
   if [[ -n "$replace_target" ]]; then
     log_warn "$(_t "SITE_CLONE_7" "${target_domain}")"
-    if ! site_delete "$target_domain" -force; then
-      log_error "$(_t "SITE__MIGRATE_SINGLE_SITE_3" "${target_domain}")"
+    local del_rc=0
+    site_delete "$target_domain" -force || del_rc=$?
+    if [[ "$del_rc" -ne 0 ]]; then
+      _replace_delete_failed "$target_domain" "$del_rc" "$sql_backup"
       return 1
     fi
-    # 沿用的使用者若沒有被刪除（例如仍有行程），改用新的名稱，避免建站失敗
-    if id -u "$target_user" >/dev/null 2>&1; then
-      target_user=$(suggest_site_user "$target_domain")
-      log_info "$(_t "SITE_CLONE_10" "${target_user}")"
-    fi
+  fi
+
+  # 4d. 建立網站使用者之前，確認帳號檔沒有被占用、沒有殘留的同名家目錄
+  if ! _wait_acct_before_create "$target_user"; then
+    [[ -n "$replace_target" ]] && _replace_delete_failed "$target_domain" 3 "$sql_backup"
+    return 1
   fi
 
   # 5. 自動產生資料庫帳密
@@ -3128,6 +3658,7 @@ site_clone() {
     --siteUser="$target_user" \
     --siteUserPassword="$siteuserpass" || {
       log_error "$(_t "SITE_CLONE_13")"
+      _acct_busy_hint
       return 1
     }
 
@@ -3442,7 +3973,37 @@ probe_remote_site() {
 
 # ------------------------------------------------------------------------------
 # 7. Site Migrate All (clp site -migrate=<vps> -all [-exclude=<pattern>] [-force-replace])
+#
+# _migrate_all_mark <網域>：確認清單中標出本機已存在的網站（有 -force-replace 時會被取代）
+#   只查 CloudPanel 記錄與目錄，不計算大小（網站多時清單會等很久）
 # ------------------------------------------------------------------------------
+_migrate_all_mark() {
+  local dom="$1" root
+  root=$(find_site_root "$dom" 2>/dev/null || true)
+  if site_exists "$dom" || [[ -n "$root" && -d "$root" ]]; then
+    if has_opt "force-replace" || has_opt "force_replace"; then
+      printf '%s' "$(_t "SITE_MIGRATE_ALL_MARK_REPLACE")"
+    else
+      printf '%s' "$(_t "SITE_MIGRATE_ALL_MARK_EXISTS")"
+    fi
+  fi
+  return 0
+}
+
+# _migrate_all_replace_warn <網域...>：清單中有要被取代的網站時，提醒刪除期間的影響（只印一次）
+_migrate_all_replace_warn() {
+  has_opt "force-replace" || has_opt "force_replace" || return 0
+  local dom
+  for dom in "$@"; do
+    if [[ -n "$(_migrate_all_mark "$dom")" ]]; then
+      echo -e "${C_YELLOW}$(_t "SITE_REPLACE_NOTICE_LOCK")${C_NC}"
+      echo ""
+      return 0
+    fi
+  done
+  return 0
+}
+
 site_migrate_all() {
   local remote_host
   remote_host=$(opt_get "migrate" "")
@@ -3554,10 +4115,11 @@ site_migrate_all() {
     echo -e "${C_BOLD}======================================================${C_NC}"
     local idx=1
     for dom in "${domains_to_migrate[@]}"; do
-      printf "  [%2d] %s\n" "$idx" "$dom"
+      printf "  [%2d] %s%s\n" "$idx" "$dom" "$(_migrate_all_mark "$dom")"
       idx=$((idx + 1))
     done
     echo ""
+    _migrate_all_replace_warn "${domains_to_migrate[@]}"
     log_info "$(_t "SITE_MIGRATE_ALL_AUTO_YES_CONFIRMED")"
   else
     if [[ ! -t 0 ]]; then
@@ -3571,10 +4133,11 @@ site_migrate_all() {
       echo -e "${C_BOLD}======================================================${C_NC}"
       local idx=1
       for dom in "${domains_to_migrate[@]}"; do
-        printf "  [%2d] %s\n" "$idx" "$dom"
+        printf "  [%2d] %s%s\n" "$idx" "$dom" "$(_migrate_all_mark "$dom")"
         idx=$((idx + 1))
       done
       echo ""
+      _migrate_all_replace_warn "${domains_to_migrate[@]}"
       echo -e "$(_t "SITE_MIGRATE_ALL_13" "${C_YELLOW}" "${C_NC}")"
       echo -e "$(_t "SITE_MIGRATE_ALL_14" "${C_GREEN}" "${C_NC}" "${C_RED}" "${C_NC}" "${C_CYAN}" "${C_NC}" "${C_CYAN}" "${C_NC}")"
       read -r -p "$(_t "SITE_MIGRATE_ALL_15")" confirm || confirm="n"
@@ -3660,7 +4223,9 @@ site_migrate_all() {
   local start_time
   start_time=$(date +%s)
 
+  local dom_idx=0
   for dom in "${domains_to_migrate[@]}"; do
+    dom_idx=$((dom_idx + 1))
     echo ""
     echo -e "${C_CYAN}${C_BOLD}------------------------------------------------------${C_NC}"
     echo -e "$(_t "SITE_MIGRATE_ALL_20" "${C_CYAN}" "${C_BOLD}" "${dom}" "${C_NC}")"
@@ -3685,6 +4250,7 @@ site_migrate_all() {
           return 1
         fi
         echo -e "$(_t "SITE_MIGRATE_ALL_22" "${C_YELLOW}" "${dom}" "${C_NC}")"
+        echo -e "${C_YELLOW}$(_t "SITE_REPLACE_NOTICE_LOCK")${C_NC}"
         echo "$(_t "SITE_MIGRATE_ALL_23")"
         echo "$(_t "SITE_MIGRATE_ALL_24")"
         echo "$(_t "SITE_MIGRATE_ALL_25")"
@@ -3710,13 +4276,23 @@ site_migrate_all() {
     fi
 
     # 執行單站搬移（網域不變，不需要 search-replace）
-    if CLP_MIGRATE_BATCH=1 _migrate_single_site "$remote_host" "$dom" "$dom" "same_domain" "$replace_dom"; then
+    local single_rc=0
+    CLP_MIGRATE_BATCH=1 _migrate_single_site "$remote_host" "$dom" "$dom" "same_domain" "$replace_dom" || single_rc=$?
+    if [[ "$single_rc" -eq 0 ]]; then
       log_success "$(_t "SITE_MIGRATE_ALL_30" "${dom}")"
       count_success=$((count_success + 1))
     else
       log_error "$(_t "SITE_MIGRATE_ALL_31" "${dom}")"
       failed_domains+=("$dom")
       count_fail=$((count_fail + 1))
+      # 帳號檔仍被占用（刪除中的使用者沒有刪完）：後面的網站也建不起來，結束整批
+      if [[ "$single_rc" -eq 3 ]]; then
+        log_warn "$(_t "SITE_MIGRATE_ALL_STOP_ACCT")"
+        if (( dom_idx < ${#domains_to_migrate[@]} )); then
+          log_warn "$(_t "SITE_MIGRATE_ALL_NOT_PROCESSED" "$(printf '%s\n' "${domains_to_migrate[@]:dom_idx}" | paste -sd ' ' -)")"
+        fi
+        break
+      fi
     fi
   done
 
@@ -4013,6 +4589,8 @@ _migrate_single_site() {
   [[ "$replace_existing" -eq 1 ]] && replace_target="$target_domain"
 
   # 決定本地 site user（單站支援 -user= 覆寫；若預設使用者已存在於系統則自動建議可用名稱）
+  #   先確認帳號檔沒有被占用：上一個網站的使用者還在刪除時，名稱會被誤判為已使用而換成其他名稱
+  _wait_acct_before_create || return 3
   local target_user=""
   # -user 只適用於單站搬移；批次搬移 (-all) 每個網站必須各自使用不同的系統使用者
   if [[ "${CLP_MIGRATE_BATCH:-0}" -ne 1 ]]; then
@@ -4055,6 +4633,11 @@ _migrate_single_site() {
   # 磁碟空間預檢（此時還沒有刪除或建立任何東西）
   _migrate_check_space "$remote_host" "$remote_root" "$remote_user" "$backup_dir" "$replace_target" || return 1
 
+  # 要取代本地網站時，先說明並確認（在下載資料庫之前；實際刪除在下載完成之後）
+  if [[ -n "$replace_target" ]]; then
+    _confirm_replace_site "$replace_target" || return 1
+  fi
+
   # 先完整下載遠端資料庫並驗證（不依賴本地網站）；失敗時本地網站還沒有被動到
   #   - 遠端不經 gzip 管線（改用 ssh -C 壓縮傳輸），ssh 的結束狀態即為 wp db export 的狀態
   #   - 以 mysqldump 結尾的 "-- Dump completed" 標記確認 dump 完整，避免匯入只有一半資料表的檔案
@@ -4081,16 +4664,26 @@ _migrate_single_site() {
   # 檢查與遠端資料都準備好之後，才刪除要被覆寫的本地網站
   if [[ -n "$replace_target" ]]; then
     log_warn "$(_t "SITE__MIGRATE_SINGLE_SITE_2" "${target_domain}")"
-    if ! site_delete "$target_domain" -force; then
-      log_error "$(_t "SITE__MIGRATE_SINGLE_SITE_3" "${target_domain}")"
+    # site_delete 會等到網站使用者與家目錄真正刪除；沒有刪乾淨就停止，不改用其他使用者名稱
+    local del_rc=0
+    site_delete "$target_domain" -force || del_rc=$?
+    if [[ "$del_rc" -ne 0 ]]; then
       rm -f "$sql_backup"
+      _replace_delete_failed "$target_domain" "$del_rc"
+      # 3／4：帳號檔仍被占用，批次搬移的後續網站也無法建立
+      [[ "$del_rc" -eq 3 || "$del_rc" -eq 4 ]] && return 3
       return 1
     fi
-    # 沿用的使用者若沒有被刪除（例如仍有行程），改用新的名稱，避免建站失敗
-    if id -u "$target_user" >/dev/null 2>&1; then
-      target_user=$(suggest_site_user "$target_domain")
-      log_info "$(_t "SITE__MIGRATE_SINGLE_SITE_5" "${target_user}")"
-    fi
+  fi
+
+  # 建立網站使用者之前，確認帳號檔沒有被占用、沒有殘留的同名家目錄
+  local acct_rc=0
+  _wait_acct_before_create "$target_user" || acct_rc=$?
+  if [[ "$acct_rc" -ne 0 ]]; then
+    rm -f "$sql_backup"
+    [[ -n "$replace_target" ]] && _replace_delete_failed "$target_domain" 3
+    [[ "$acct_rc" -eq 1 ]] && return 3
+    return 1
   fi
 
   # 自動產生本地資料庫帳密
@@ -4109,6 +4702,7 @@ _migrate_single_site() {
     --siteUser="$target_user" \
     --siteUserPassword="$siteuserpass" || {
       log_error "$(_t "SITE__MIGRATE_SINGLE_SITE_7")"
+      _acct_busy_hint
       rm -f "$sql_backup"
       return 1
     }
@@ -4359,6 +4953,8 @@ site_migrate() {
   target_root=$(find_site_root "$target_domain" 2>/dev/null || true)
   if site_exists "$target_domain" || [[ -n "$target_root" && -d "$target_root" ]]; then
     if has_opt "force-replace" || has_opt "force_replace"; then
+      # 取代前會詢問確認：非終端機又沒有 -y 時，在任何修改之前停止
+      require_tty_or_yes || return 1
       log_warn "$(_t "SITE_MIGRATE_3" "${target_domain}")"
       replace_existing=1
     else
@@ -5833,8 +6429,10 @@ site_handler() {
   fi
 
   if has_opt "delete" || [[ "$action" == "delete" ]]; then
-    site_delete "$target_domain"
-    return 0
+    local del_rc=0
+    # 結束代碼：0 已清除；1 失敗；2 有殘留；3 停止等待（仍在背景刪除）；4 帳號檔被占用、未刪除
+    site_delete "$target_domain" || del_rc=$?
+    return "$del_rc"
   fi
 
   # Varnish 快取診斷與修正

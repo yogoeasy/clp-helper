@@ -144,7 +144,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.3.8 (建置時間 2026-11-11 16:26:33)`
+輸出範例：`CLP Helper v1.3.9 (建置時間 2026-11-13 01:06:07)`
 
 查看全域功能說明選單：
 
@@ -475,7 +475,7 @@ sudo clp site -clone-from=example.com new-example.com
 sudo clp site -clone-from=example.com new-example.com -force-replace
 ```
 
-使用 `-force-replace` 時，要等所有檢查（使用者名稱、PHP 版本）通過、來源資料庫匯出完成後，才會刪除既有網站。之後的步驟若失敗，舊網站不會自動復原，需要時請先備份。只有 `-force-replace` 會取代網站，`-force` 不會。
+使用 `-force-replace` 時，clp 會先列出要刪除的內容（網站使用者、檔案數與大小、資料庫），在匯出來源資料庫之前請您確認；`-y` 代表事先確認，沒有終端機時必須加 `-y`。要等所有檢查（使用者名稱、PHP 版本）通過、來源資料庫匯出完成後，才會刪除既有網站；舊的網站使用者與家目錄真正刪除後，才建立新網站（見上方「刪除網站」），新網站沿用舊網站的使用者名稱。之後的步驟若失敗，舊網站不會自動復原，需要時請先備份。只有 `-force-replace` 會取代網站，`-force` 不會。`-migrate`（在下載資料庫之前確認）與 `-new -force-replace`（在建置計畫中顯示）也相同。
 
 自訂目標站使用者或 PHP 版本：
 
@@ -555,6 +555,12 @@ sudo clp site delete example.com
 ```bash
 sudo clp site delete example.com --force
 ```
+
+刪除大型網站可能需要數分鐘：CloudPanel 可能在系統刪完網站使用者與家目錄之前就返回，而刪除期間這台主機無法建立或刪除其他網站使用者（帳號檔 `/etc/passwd` 等會被鎖住）。clp 會先計算檔案數、顯示刪除進度，等使用者與 `/home/<使用者>` 都刪除後才結束。連續 10 分鐘沒有進展（以及每滿 30 分鐘）時，會列出目前狀況並詢問是否繼續等待；使用 `-y` 或沒有終端機時，連續 10 分鐘沒有進展或總共 60 分鐘就停止。停止等待時，刪除會在背景繼續。刪除失敗（已經沒有行程在刪除使用者）時，clp 會列出殘留的項目並以錯誤結束，不會自行刪除它們。
+
+`clp site -delete` 的結束代碼：`0` 網站、使用者與家目錄都已刪除；`1` 失敗；`2` 使用者或家目錄有殘留，需要手動移除；`3` 停止等待（網站已刪除，使用者仍在背景刪除）；`4` 帳號檔被占用，沒有刪除任何東西。
+
+請不要同時執行兩個會刪除或建立網站的 clp 指令，也不要在 clp 執行期間於 CloudPanel 面板刪除網站：CloudPanel 不會檢查 `userdel` 是否成功，第二個 `userdel` 拿不到帳號檔的鎖就會放棄。clp 開始刪除前會先等其他正在進行的刪除，大多數情況可以避開；但兩個幾乎同時開始的刪除仍可能撞上，這時 clp 會以結束代碼 `2` 結束並列出殘留的項目。
 
 #### ⑦ Cloudflare 邊緣 WAF 防護與安全最佳化 (`clp site <domain> -cf-waf`)
 

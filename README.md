@@ -146,7 +146,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.3.8 (build 2026-11-11 16:26:33)`
+Output example:`CLP Helper v1.3.9 (build 2026-11-13 01:06:07)`
 
 Display global help menu:
 
@@ -467,7 +467,7 @@ Overwrite existing target site:
 sudo clp site -clone-from=example.com new-example.com -force-replace
 ```
 
-With `-force-replace`, the existing site is deleted only after every check passes and the source database has been exported (user name, PHP version, export). If a later step fails, the old site is not restored, so back it up first if you need it. Only `-force-replace` replaces a site; `-force` does not.
+With `-force-replace`, clp first shows what will be deleted (site user, number of files and size, database) and asks for confirmation before exporting the source database; `-y` confirms in advance, and without a terminal `-y` is required. The existing site is deleted only after every check passes and the source database has been exported (user name, PHP version, export), and the new site is created only after the old site user and its home directory are really gone (see deleting a site above); the new site keeps the old site user name. If a later step fails, the old site is not restored, so back it up first if you need it. Only `-force-replace` replaces a site; `-force` does not. The same applies to `-migrate` (the confirmation comes before the database download) and to `-new -force-replace` (shown in the build plan).
 
 Customize user and PHP version for target site:
 
@@ -547,6 +547,12 @@ Force delete without interactive prompt:
 ```bash
 sudo clp site delete example.com --force
 ```
+
+Deleting a large site can take several minutes: CloudPanel may return before the system has finished removing the site user and its home directory, and while that runs no other site user can be created or deleted (the account files `/etc/passwd` etc. are locked). clp counts the files first, shows the progress, and returns only when the user and `/home/<user>` are gone. If there has been no progress for 10 minutes (and every 30 minutes), it shows what it sees and asks whether to keep waiting; with `-y` or without a terminal it stops after 10 minutes without progress or 60 minutes in total. Stopping leaves the deletion running in the background. If the deletion fails (nothing is deleting the user any more), clp lists what is left and exits with an error; it never removes these itself.
+
+Exit codes of `clp site -delete`: `0` site, user and home directory all removed; `1` failed; `2` the user or home directory is left over and must be removed by hand; `3` stopped waiting (the site is deleted, the user is still being removed in the background); `4` the account files were busy, nothing was deleted.
+
+Do not run two clp commands that delete or create sites at the same time, and do not delete a site in the CloudPanel panel while one is running: CloudPanel does not check whether `userdel` succeeded, and a second `userdel` that cannot lock the account files gives up. clp waits for running deletions before it starts, which covers most cases, but two deletions that start almost together can still collide; clp then exits with code `2` and lists what is left.
 
 #### ⑦ Cloudflare Edge WAF & Security Optimization (`clp site <domain> -cf-waf`)
 
