@@ -285,6 +285,9 @@ clp_realip_write() {
   systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
 }
 
+# _human_kb <KB>：把 KB 換成易讀的大小（1 GB 以上到小數一位，其次整數 MB，再小為 KB）；磁碟空間的訊息共用
+_human_kb() { awk -v k="${1:-0}" 'BEGIN { if (k >= 1048576) printf "%.1f GB", k / 1048576; else if (k >= 1024) printf "%.0f MB", k / 1024; else printf "%.0f KB", k }'; }
+
 # cf_credentials_match_score <ini 檔名(不含 .ini)> <domain>
 #   評估 Cloudflare 憑證檔名與網域的對應程度（數字越大越精確，0 = 不符合）：
 #   - 檔名等於網域或其上層網域（example.com.ini 對應 shop.example.com）：1000 + 長度

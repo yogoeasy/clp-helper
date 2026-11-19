@@ -144,7 +144,7 @@ git clone https://github.com/yogoeasy/clp-helper.git && sudo bash clp-helper/ins
 clp -v
 ```
 
-輸出範例：`CLP Helper v1.3.9 (建置時間 2026-11-13 01:06:07)`
+輸出範例：`CLP Helper v1.4.0 (建置時間 2026-11-19 15:50:02)`
 
 查看全域功能說明選單：
 
@@ -445,6 +445,8 @@ sudo clp site example.com -dns
 sudo clp site example.com -ssl=on -dns -api=my-cloudflare.ini
 ```
 
+沒有 `-api` 時，依檔名選用 token 檔（`example.com.ini`，或以上層網域命名的檔案）。沒有任何檔名符合、但有多個可用時，互動執行會列出清單讓您選擇；`-new`、`-clone`、`-migrate` 也一樣。使用 `-y` 或沒有終端機時，請改加 `-api=<名稱>`，否則會改用 HTTP-01 驗證（網域經 Cloudflare 代理且 SSL 模式為 Full (strict)，或尚未指向本機時會失敗）。
+
 申請 CloudPanel 原生 HTTP-01 SSL (網域已指向本機 IP)：
 
 ```bash
@@ -475,7 +477,7 @@ sudo clp site -clone-from=example.com new-example.com
 sudo clp site -clone-from=example.com new-example.com -force-replace
 ```
 
-使用 `-force-replace` 時，clp 會先列出要刪除的內容（網站使用者、檔案數與大小、資料庫），在匯出來源資料庫之前請您確認；`-y` 代表事先確認，沒有終端機時必須加 `-y`。要等所有檢查（使用者名稱、PHP 版本）通過、來源資料庫匯出完成後，才會刪除既有網站；舊的網站使用者與家目錄真正刪除後，才建立新網站（見上方「刪除網站」），新網站沿用舊網站的使用者名稱。之後的步驟若失敗，舊網站不會自動復原，需要時請先備份。只有 `-force-replace` 會取代網站，`-force` 不會。`-migrate`（在下載資料庫之前確認）與 `-new -force-replace`（在建置計畫中顯示）也相同。
+使用 `-force-replace` 時，clp 會先列出要刪除的內容（網站使用者、檔案數與大小、資料庫），在匯出來源資料庫之前請您確認；`-y` 代表事先確認，沒有終端機時必須加 `-y`。要等所有檢查（使用者名稱、PHP 版本）通過、來源資料庫匯出完成後，才會刪除既有網站；舊的網站使用者與家目錄真正刪除後，才建立新網站（見上方「刪除網站」），新網站沿用舊網站的使用者名稱。clp 不會先備份，之後的步驟若失敗，舊網站也不會自動復原，需要時請先執行 `clp backup <網域> -type=full`。只有 `-force-replace` 會取代網站，`-force` 不會。`-migrate`（在下載資料庫之前確認）與 `-new -force-replace`（在建置計畫中顯示）也相同。
 
 自訂目標站使用者或 PHP 版本：
 
@@ -544,13 +546,13 @@ sudo clp site example.com -off
 sudo clp site example.com -on
 ```
 
-互動確認刪除網站與對應資料庫：
+互動確認刪除網站與對應資料庫（clp 不會先備份；需要時請先執行 `clp backup example.com -type=full`）：
 
 ```bash
 sudo clp site delete example.com
 ```
 
-強制刪除網站 (略過確認提示)：
+強制刪除網站 (略過確認提示，仍會印出警告與備份提示)：
 
 ```bash
 sudo clp site delete example.com --force
@@ -807,7 +809,7 @@ sudo clp server -nginx-hooks=off                # 移除所有網站的 hook
 - clp 建立的網站（`-new`、`-clone-from`、`-migrate`）會立即加入。在 CloudPanel 後台建立的網站不會（後台的 WordPress 精靈無法選擇範本）：請用 `clp site <網域> -nginx-hooks` 加入；`clp site -list` 會列出尚未加入的網站。
 - 之後 hook 消失時（例如在修改之前就開著的 Vhost 分頁按了儲存），clp 不會自動補回：`clp site -list`、`-nginx-hooks=status` 與 `httpauth -list=protected` 會顯示，並附上修復指令。
 - 網站還有 hook 檔（例如 httpauth 防護）時，`-off` 會拒絕，因為移除 include 會讓它們在不知情下失效。
-- 只支援範本中有唯一 HTTPS server 區塊、其中只有一行 `root` 的 PHP 網站；停用中的網站會跳過。
+- 只支援範本中有唯一 HTTPS server 區塊（只做轉址的區塊不計）、其中只有一行 `root` 的 PHP 網站；停用中的網站會跳過。
 
 ---
 
@@ -1166,20 +1168,18 @@ sudo clp restore example.com -file=example.com-full-20261005_153000.tar.gz -to=b
 - **拒絕其他網站的封裝**：`.tar.gz` 最上層沒有這個網站的 `<網域>/` 目錄時，在任何變更之前就拒絕。要把網站複製到其他網域，請使用 `clp site -clone-from` 或 `-migrate`。
   - `db`：只匯入資料庫，不涉及檔案。
 - **年份以備份當時為準**：從檔名的時間戳記判斷，不是還原當天的年份。
-- **一律保護**：目前的 `wp-config.php`（備份中的版本另存到快照目錄）、上方列出的快取與備份外掛目錄。
-- **確認提示**：先下載並解壓所有檔案，互動模式下再列出每個檔案將刪除的項目數量與前 20 筆，輸入一次 `yes` 才會繼續（輸入其他內容時什麼都不會變更，也不會留下快照）；使用 `-y` 或 `--force` 時直接執行。
+- **一律保護**：目前的 `wp-config.php`（不會寫入備份中的版本；需要時請從備份檔取出）、上方列出的快取與備份外掛目錄。
+- **確認提示**：先下載並解壓所有檔案，互動模式下再列出每個檔案將刪除的項目數量與前 20 筆，輸入一次 `yes` 才會繼續（輸入其他內容時什麼都不會變更）；使用 `-y` 或 `--force` 時直接執行。下方的提示一律會印出。
 - **保留舊行為**：加上 `-keep-extra` 只覆蓋、不刪除。
-- **可以復原**：還原前會先建立快照（`<backup-dir>/rollback/`，預設 `/root/clpBackup/rollback/`），涵蓋所有可能被刪除的檔案；還原失敗會自動回復。
+- **clp 不會幫你還原**：還原前 clp 不會備份，還原失敗也不會自動回復。請先備份（例如 `clp backup example.com -type=full`）。
 
-#### ④ 還原前快照
+#### ④ 不會自動備份或回復
 
-- **先檢查空間**：建立快照前，會估算網站目錄（不含上方的快取與備份外掛目錄）加上資料庫的大小，再加 10% 餘裕，與 `/root/clpBackup` 的剩餘空間比較。
-- **空間不足或快照失敗**：會刪除不完整的快照，此時尚未變更任何內容。互動模式下會詢問是否在沒有快照的情況下繼續（需輸入 `yes`）；使用 `-y` 或 `--force` 時一律中止。
-- **略過快照**：加上 `-no-snapshot` 就不建立快照，還原失敗時也無法自動回復，風險自負。
-
-```bash
-sudo clp restore example.com -type=compact -no-snapshot
-```
+- **請先備份**：還原前 clp 會印出提示（`-y`、`--force` 也會印）：`clp 不會自動備份，失敗也不會還原。` 如果可能還需要目前的網站，請先執行 `clp backup <網域> -type=full`。
+- **還原失敗不會回復**：匯入資料庫或同步檔案失敗時，clp 會停止並指出失敗的備份檔。網站可能只還原了一部分（檔案與資料庫可能不一致），請用你自己的備份還原。
+- **`-no-snapshot` 已無作用**：舊版會在每次還原前建立快照，這個選項用來略過快照。現在仍接受這個選項，讓既有的指令不會出錯，並印出說明。
+- **舊版留下的 `<backup-dir>/rollback/`**：clp 不再建立。備份存在本機時，`backup-expire` 會清掉舊的快照目錄；備份到遠端（`backup-to`）的主機請手動刪除 `<backup-dir>/rollback/`（預設 `/root/clpBackup/rollback/`）。
+- 同樣的提示也會出現在 `clp site delete`（`-y`、`--force` 也會印）、`-force-replace` 取代網站之前，以及 `-migrate -all` 的衝突選單。
 
 保留網站上多出來的檔案：
 
@@ -1191,7 +1191,7 @@ sudo clp restore example.com -type=compact -keep-extra
 
 `backup` 與 `restore` 只用網站自己的權限存取資料庫：先以網站使用者身分執行 WP-CLI，再用 `wp-config.php` 中的資料庫帳密。
 
-- **不會自動改用 MySQL root**：兩者都失敗時直接報錯。還原會在建立快照之前先確認資料庫可以存取：會匯入資料庫的還原（`.sql`、`full`）在這裡停止，尚未變更任何內容；只還原檔案（`compact`、`archive`）時顯示警告後繼續，快照不包含資料庫。
+- **不會自動改用 MySQL root**：兩者都失敗時直接報錯。還原會在變更任何內容之前先確認資料庫可以存取：會匯入資料庫的還原（`.sql`、`full`，或內含資料庫備份的封裝）在這裡停止，尚未變更任何內容；只還原檔案（`compact`、`archive`）時不需要資料庫。
 - **`-db-root`**：允許最後改用 MySQL root 帳號。一律連 CloudPanel 的 MySQL master（`clpctl db:show:master-credentials` 提供的主機與埠號，不使用 `wp-config.php` 的 `DB_HOST`），資料庫名稱只能包含英數字、`_` 與 `-`。
 - **以 `-` 開頭的資料庫名稱**：不會交給 `mysql`／`mysqldump`（WP-CLI 以網站使用者身分執行，不受影響）。
 - **`site -clone-from`／`-migrate`**：只用新網站的資料庫帳號匯入。匯入的 SQL 由來源網站或遠端主機決定，失敗時不會自動改用 MySQL root，而是報錯並移除新建的網站與資料庫（使用 `-force-replace` 時，被取代的舊網站已先刪除）。確定來源可信時，可加上 `-db-root` 重新執行，SQL 會以 MySQL root 權限執行。
@@ -1211,10 +1211,10 @@ sudo clp restore example.com -to=google -file=example.com-archive-20261001_03000
 ```
 
 - **先全部準備好**：所有檔案先下載、解壓並算出要刪除的項目，才開始變更。任何一個檔案失敗（下載、解壓、其他網站的封裝）就全部取消。
-- **確認一次、快照一次**：所有檔案只確認一次，只建立一份快照，再依 `archive` → `compact` → `db` 套用；任何一步失敗，都用這份快照回復網站與資料庫。
+- **確認一次**：所有檔案只確認一次，再依 `archive` → `compact` → `db` 套用；任何一步失敗，clp 會停止且不會回復，網站可能只還原了一部分。
 - **compact 的年份以 compact 為準**：archive 也含有 compact 的年份時（例如 12 月的 compact 與 1 月的 archive），該年取自 compact，archive 不處理。
 - **兩個檔案都沒有的年份**：archive 的年份比 compact 早時（例如 12 月的 archive 與 1 月的 compact），archive 那一年兩個檔案都沒有，會維持網站目前的內容，並顯示警告。
-- **磁碟空間**：所有檔案會同時解壓（在 `/var/tmp`；遠端檔案也下載到這裡），另加一份快照。空間不夠時，改為一次還原一個檔案。
+- **磁碟空間**：所有檔案會同時解壓（在 `/var/tmp`；遠端檔案也下載到這裡）。空間不夠時，改為一次還原一個檔案。
 
 ---
 
@@ -1474,7 +1474,7 @@ CLP Helper 提供專屬的全域設定管理模組 (`clp config`)，用來保存
 | `backup-remote-dir` | 未指定 `-path` 時，rclone 遠端上的目錄（實際為 `<值>/<網域>`） | 相對路徑；預設 `clpBackup` |
 | `backup-type` | 未指定 `-type` 時的備份類型 | `db`、`full`、`compact`、`archive`；預設 `full` |
 | `backup-to` | 未指定 `-to` 時的儲存目標（`clp restore` 的來源也相同） | `local` 或 rclone 遠端名稱；預設 `local` |
-| `backup-expire` | 未指定 `-expire` 時，每次 `clp backup` 後刪除超過 N 天的備份。⚠️ 設定後，**每一次**備份（包括排程）都會刪除該網站較舊的備份；本機備份還會一併刪除該網站超過 N 天的還原快照（rollback）。單次執行可用 `-expire=off` 停用 | `off`、`1d`～`3650d`；預設 `off` |
+| `backup-expire` | 未指定 `-expire` 時，每次 `clp backup` 後刪除超過 N 天的備份。⚠️ 設定後，**每一次**備份（包括排程）都會刪除該網站較舊的備份；本機備份還會一併刪除該網站超過 N 天的舊還原快照目錄（`<backup-dir>/rollback/`，舊版留下的）。單次執行可用 `-expire=off` 停用 | `off`、`1d`～`3650d`；預設 `off` |
 
 #### 指令語法與範例
 

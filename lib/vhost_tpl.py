@@ -46,13 +46,16 @@ SAFE_NAME_RE = re.compile(r'[^A-Za-z0-9._-]+')
 DOMAIN_RE = re.compile(r'^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$')
 
 # clp nginx hooks: an http-level include at the top of the file and a server-level include
-# right after the root line of the HTTPS server block
+# right after the root line of the HTTPS server block (redirect-only blocks are not counted)
 HOOK_DIR = '/etc/nginx/clp-helper'
 HOOK_HTTP_START = '# --- CLP HELPER HOOKS (http) START ---'
 HOOK_HTTP_END = '# --- CLP HELPER HOOKS (http) END ---'
 HOOK_START = '# --- CLP HELPER HOOKS START ---'
 HOOK_END = '# --- CLP HELPER HOOKS END ---'
 ROOT_LINE_RE = re.compile(r'^\s*(\{\{root\}\}|root\s+[^;{}]+;\s*(#.*)?)\s*$')
+# 與 lib/httpauth_vhost.py 的 https_server_span 相同的轉址判斷（對遮罩後的區塊頂層文字比對）
+REDIRECT_RETURN_RE = re.compile(r'(?:^|;)\s*return\s+(?:30[1278]\b|https?://)', re.MULTILINE)
+INCLUDE_RE = re.compile(r'(?:^|;)\s*include\s', re.MULTILINE)
 
 
 def fail(msg, code=1):
@@ -226,7 +229,9 @@ def hooks_state(text):
 
 def https_root_line(text):
     """Index (in text.splitlines(True)) of the root line of the one server block that listens on 443
-    and not on 8080; None when there is not exactly one such block or root line"""
+    and not on 8080; None when there is not exactly one such block or root line.
+    A redirect-only block (CloudPanel's www redirect) is not counted: a top-level 30x/http(s) return,
+    no root line, no nested block and no include. Anything less certain still counts, so the site is skipped."""
     mask = code_mask(text)
     depth_at = []
     depth = 0
@@ -236,6 +241,12 @@ def https_root_line(text):
             depth += 1
         elif c == '}':
             depth -= 1
+    root_pos = []
+    pos = 0
+    for idx, line in enumerate(text.splitlines(True)):
+        if depth_at[pos] == 1 and ROOT_LINE_RE.match(line.rstrip('\r\n')):
+            root_pos.append((pos, idx))
+        pos += len(line)
     candidates = []
     for m in re.finditer(r'(?<![\w$])server\s*\{', mask):
         if depth_at[m.start()] != 0:
@@ -251,17 +262,14 @@ def https_root_line(text):
         listens = re.findall(r'(?:^|[;\s])listen\s+([^;]*);', top)
         if any(re.search(r'(?<![\d.])443(?!\d)', l) for l in listens) and \
                 not any(re.search(r'(?<![\d.])8080(?!\d)', l) for l in listens):
-            candidates.append((open_idx, close_idx))
-    if len(candidates) != 1:
+            roots = [idx for p, idx in root_pos if open_idx < p < close_idx]
+            nested = '{' in mask[open_idx + 1:close_idx]
+            if not roots and not nested and REDIRECT_RETURN_RE.search(top) and not INCLUDE_RE.search(top):
+                continue
+            candidates.append(roots)
+    if len(candidates) != 1 or len(candidates[0]) != 1:
         return None
-    open_idx, close_idx = candidates[0]
-    found = []
-    pos = 0
-    for idx, line in enumerate(text.splitlines(True)):
-        if open_idx < pos < close_idx and depth_at[pos] == 1 and ROOT_LINE_RE.match(line.rstrip('\r\n')):
-            found.append(idx)
-        pos += len(line)
-    return found[0] if len(found) == 1 else None
+    return candidates[0][0]
 
 
 def add_hooks(text, domain):
@@ -473,7 +481,7 @@ def cmd_hooks(cmd, domain, path):
     else:
         out = add_hooks(text, domain)
         if out is None:
-            fail("no place for the clp hook lines (one HTTPS server block with one root line is required)", 3)
+            fail("no place for the clp hook lines (one HTTPS server block with one root line is required; redirect-only blocks are not counted)", 3)
     sys.stdout.buffer.write(out.encode('utf-8', 'surrogateescape'))
 
 

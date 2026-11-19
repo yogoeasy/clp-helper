@@ -413,7 +413,6 @@ _count_home_files() {
   printf '%s\n' "$out"
 }
 
-_human_kb() { awk -v k="${1:-0}" 'BEGIN { if (k >= 1048576) printf "%.1f GB", k / 1048576; else if (k >= 1024) printf "%.0f MB", k / 1024; else printf "%.0f KB", k }'; }
 _dur() {
   local s="${1:-0}"
   if (( s >= 3600 )); then printf '%dh%02dm' "$((s / 3600))" "$((s % 3600 / 60))"
@@ -707,6 +706,10 @@ _replace_notice() {
   fi
   [[ -z "$db" ]] || echo "$(_t "SITE_REPLACE_NOTICE_DB" "$db")" >&2
   echo -e "${C_YELLOW}$(_t "SITE_REPLACE_NOTICE_LOCK")${C_NC}" >&2
+  # 批次搬移（-migrate -all）已在清單確認前或衝突選單前印過備份提示，這裡不重複
+  if [[ "${CLP_MIGRATE_BATCH:-0}" -ne 1 ]]; then
+    echo -e "${C_YELLOW}$(_t "BACKUP_NO_AUTO_BACKUP_NOTICE" "$domain")${C_NC}" >&2
+  fi
 }
 
 # _confirm_replace_site <網域>：取代前說明並確認（在匯出／下載資料庫之前呼叫，實際刪除在之後）
@@ -799,15 +802,22 @@ site_delete() {
   local available_conf="/etc/nginx/sites-available/${domain}.conf"
 
   # 防呆確認
-  local is_force=0
-  if has_opt "force" || has_opt "y" || has_opt "yes" || has_opt "force-replace" || has_opt "force_replace" || [[ "${CLP_AUTO_YES:-false}" == "true" ]] || [[ "${2:-}" =~ ^--?(force|y|yes)$ ]]; then
+  #   --internal-replace：-force-replace 流程內部呼叫（視為 force）；說明與備份提示已由 _replace_notice 印過，這裡不重複
+  local is_force=0 internal_replace=0
+  [[ "${2:-}" == "--internal-replace" ]] && internal_replace=1
+  if [[ $internal_replace -eq 1 ]] || has_opt "force" || has_opt "y" || has_opt "yes" || has_opt "force-replace" || has_opt "force_replace" || [[ "${CLP_AUTO_YES:-false}" == "true" ]] || [[ "${2:-}" =~ ^--?(force|y|yes)$ ]]; then
     is_force=1
   fi
 
-  if [[ $is_force -eq 0 ]]; then
+  # 警告與備份提示：-y／--force 也要印（只是不詢問）
+  if [[ $internal_replace -eq 0 ]]; then
     echo ""
     echo -e "${C_RED}${C_BOLD}$(_t "SITE_DELETE_WARN_PROMPT_1" "$domain")${C_NC}"
     echo -e "${C_RED}$(_t "SITE_DELETE_WARN_PROMPT_2")${C_NC}"
+    echo -e "${C_YELLOW}$(_t "BACKUP_NO_AUTO_BACKUP_NOTICE" "$domain")${C_NC}"
+  fi
+
+  if [[ $is_force -eq 0 ]]; then
     # 非 TTY 且沒有 -y 時明確報錯；讀到 EOF（Ctrl-D）視為取消
     require_tty_or_yes || return 1
     local confirm_del=""
@@ -1127,8 +1137,11 @@ PYEOF
 
   local api_param
   api_param=$(opt_get "api" "")
-  # -migrate 時使用者從選單選的 token 檔（_migrate_pick_cf_secret；呼叫端以 local 設定，只影響這次搬移）
-  [[ -z "$api_param" ]] && api_param="${CLP_SSL_API_FILE:-}"
+  # 沒有 -api、檔名又對不上網域時，讓使用者從可用的 .ini 中選（-y／非 TTY 只提示 -api=）
+  if [[ -z "$api_param" ]]; then
+    _ssl_pick_cf_secret "$domain"
+    api_param="$CLP_SSL_CF_PICK"
+  fi
 
   if [[ -n "$api_param" ]]; then
     if ! cf_resolve_credentials "$ssl_domain" "" "$api_param"; then
@@ -1148,7 +1161,8 @@ PYEOF
     fi
 
     if [[ -z "$credentials_file" || ! -f "$credentials_file" ]]; then
-      log_warn "$(_t "SITE_SSL_WARN_NO_CF_CREDS")"
+      # 選單或提示已說明會改用 HTTP-01 時，不再顯示「找不到憑證」
+      [[ "$CLP_SSL_CF_PICK_SHOWN" -eq 1 ]] || log_warn "$(_t "SITE_SSL_WARN_NO_CF_CREDS")"
       if command -v clpctl >/dev/null 2>&1; then
         clpctl lets-encrypt:install:certificate --domainName="$domain" || {
           log_warn "$(_t "SITE_SSL_WARN_NATIVE_RETRY_FAILED")"
@@ -2249,7 +2263,7 @@ site_new() {
   if [[ "$replace_existing" -eq 1 ]]; then
     log_warn "$(_t "SITE_NEW_WARN_EXISTING_FORCE")"
     local del_rc=0
-    site_delete "$domain" -force || del_rc=$?
+    site_delete "$domain" --internal-replace || del_rc=$?
     if [[ "$del_rc" -ne 0 ]]; then
       _replace_delete_failed "$domain" "$del_rc" "-"
       return 1
@@ -3629,7 +3643,7 @@ site_clone() {
   if [[ -n "$replace_target" ]]; then
     log_warn "$(_t "SITE_CLONE_7" "${target_domain}")"
     local del_rc=0
-    site_delete "$target_domain" -force || del_rc=$?
+    site_delete "$target_domain" --internal-replace || del_rc=$?
     if [[ "$del_rc" -ne 0 ]]; then
       _replace_delete_failed "$target_domain" "$del_rc" "$sql_backup"
       return 1
@@ -3997,6 +4011,7 @@ _migrate_all_replace_warn() {
   for dom in "$@"; do
     if [[ -n "$(_migrate_all_mark "$dom")" ]]; then
       echo -e "${C_YELLOW}$(_t "SITE_REPLACE_NOTICE_LOCK")${C_NC}"
+      echo -e "${C_YELLOW}$(_t "BACKUP_NO_AUTO_BACKUP_NOTICE_BATCH")${C_NC}"
       echo ""
       return 0
     fi
@@ -4251,6 +4266,7 @@ site_migrate_all() {
         fi
         echo -e "$(_t "SITE_MIGRATE_ALL_22" "${C_YELLOW}" "${dom}" "${C_NC}")"
         echo -e "${C_YELLOW}$(_t "SITE_REPLACE_NOTICE_LOCK")${C_NC}"
+        echo -e "${C_YELLOW}$(_t "BACKUP_NO_AUTO_BACKUP_NOTICE" "${dom}")${C_NC}"
         echo "$(_t "SITE_MIGRATE_ALL_23")"
         echo "$(_t "SITE_MIGRATE_ALL_24")"
         echo "$(_t "SITE_MIGRATE_ALL_25")"
@@ -4318,18 +4334,22 @@ site_migrate_all() {
 }
 
 # ------------------------------------------------------------------------------
-# _migrate_pick_cf_secret <domain>：搬移時以 Cloudflare DNS 驗證簽發憑證前，決定要用哪個 token 檔
-#   搬移時網域通常仍指向來源主機，HTTP-01 必定失敗；所以無法依檔名自動對應、又有可用的 .ini 時，
-#   讓使用者從清單選擇。選擇結果寫入 CLP_MIGRATE_CF_PICK（檔案路徑；空字串為不使用 Cloudflare），
-#   並記在 CLP_MIGRATE_CF_LAST，-all 的下一個網站以它為預設值。
-#   有 -api、能自動對應、或沒有可用的 .ini 時不詢問（CLP_MIGRATE_CF_PICK 為空，沿用原本的流程）。
+# _ssl_pick_cf_secret <domain>：site_ssl 以 Cloudflare DNS 驗證簽發憑證前，決定要用哪個 token 檔
+#   （新建網站、-clone、-migrate、-ssl 都經過這裡）網域還沒指向這台主機，或經過 Cloudflare 代理時，
+#   HTTP-01 會失敗；所以無法依檔名自動對應、又有可用的 .ini 時，讓使用者從清單選擇。
+#   選擇結果寫入 CLP_SSL_CF_PICK（檔案路徑；空字串為不使用 Cloudflare），
+#   並記在 CLP_SSL_CF_LAST，-migrate -all 的下一個網站以它為預設值。
+#   有 -api、能自動對應、或沒有可用的 .ini 時不詢問（CLP_SSL_CF_PICK 為空，沿用原本的流程）。
 #   非互動（-y 或非 TTY）時不詢問，只提示可用 -api= 指定。
+#   顯示了選單或提示時 CLP_SSL_CF_PICK_SHOWN=1，site_ssl 不再重複「找不到憑證」的警告。
 # ------------------------------------------------------------------------------
-CLP_MIGRATE_CF_LAST=""
-CLP_MIGRATE_CF_PICK=""
-_migrate_pick_cf_secret() {
+CLP_SSL_CF_LAST=""
+CLP_SSL_CF_PICK=""
+CLP_SSL_CF_PICK_SHOWN=0
+_ssl_pick_cf_secret() {
   local domain="$1"
-  CLP_MIGRATE_CF_PICK=""
+  CLP_SSL_CF_PICK=""
+  CLP_SSL_CF_PICK_SHOWN=0
 
   has_opt "api" && return 0
   if cf_resolve_credentials "$(remove_www "$domain")" "" "" 2>/dev/null; then
@@ -4339,27 +4359,28 @@ _migrate_pick_cf_secret() {
   local files=(${CF_USABLE_SECRETS[@]+"${CF_USABLE_SECRETS[@]}"})
   [[ ${#files[@]} -eq 0 ]] && return 0
 
+  CLP_SSL_CF_PICK_SHOWN=1
   if clp_auto_yes || [[ ! -t 0 ]]; then
-    log_warn "$(_t "SITE_MIGRATE_CF_PICK_HINT_NONINTERACTIVE" "$domain")"
+    log_warn "$(_t "SITE_SSL_CF_PICK_HINT_NONINTERACTIVE" "$domain")"
     return 0
   fi
 
   local default_idx="" i
   echo ""
-  log_info "$(_t "SITE_MIGRATE_CF_PICK_TITLE" "$domain")"
+  log_info "$(_t "SITE_SSL_CF_PICK_TITLE" "$domain")"
   for i in "${!files[@]}"; do
     echo "  $((i + 1))) $(strip_ctrl_chars "${files[$i]}")"
-    [[ -n "$CLP_MIGRATE_CF_LAST" && "${files[$i]}" == "$CLP_MIGRATE_CF_LAST" ]] && default_idx=$((i + 1))
+    [[ -n "$CLP_SSL_CF_LAST" && "${files[$i]}" == "$CLP_SSL_CF_LAST" ]] && default_idx=$((i + 1))
   done
-  echo "  0) $(_t "SITE_MIGRATE_CF_PICK_SKIP")"
+  echo "  0) $(_t "SITE_SSL_CF_PICK_SKIP")"
   # 上一個網站選了「不使用」時，預設值也是 0
-  [[ -z "$default_idx" && "$CLP_MIGRATE_CF_LAST" == "none" ]] && default_idx=0
+  [[ -z "$default_idx" && "$CLP_SSL_CF_LAST" == "none" ]] && default_idx=0
 
   local ans prompt_msg
   if [[ -n "$default_idx" ]]; then
-    prompt_msg="$(_t "SITE_MIGRATE_CF_PICK_PROMPT" "$default_idx")"
+    prompt_msg="$(_t "SITE_SSL_CF_PICK_PROMPT" "$default_idx")"
   else
-    prompt_msg="$(_t "SITE_MIGRATE_CF_PICK_PROMPT_NO_DEFAULT")"
+    prompt_msg="$(_t "SITE_SSL_CF_PICK_PROMPT_NO_DEFAULT")"
   fi
   while true; do
     # 讀到 EOF（Ctrl-D）視為取消：不使用 Cloudflare，沿用原本的流程
@@ -4372,17 +4393,17 @@ _migrate_pick_cf_secret() {
       ans=$((10#$ans))
       break
     fi
-    echo "$(_t "SITE_MIGRATE_CF_PICK_INVALID" "${#files[@]}")"
+    echo "$(_t "SITE_SSL_CF_PICK_INVALID" "${#files[@]}")"
   done
 
   if [[ "$ans" -eq 0 ]]; then
-    CLP_MIGRATE_CF_LAST="none"
-    log_info "$(_t "SITE_MIGRATE_CF_PICK_SKIPPED")"
+    CLP_SSL_CF_LAST="none"
+    log_info "$(_t "SITE_SSL_CF_PICK_SKIPPED")"
     return 0
   fi
-  CLP_MIGRATE_CF_PICK="${files[$((ans - 1))]}"
-  CLP_MIGRATE_CF_LAST="$CLP_MIGRATE_CF_PICK"
-  log_info "$(_t "SITE_MIGRATE_CF_PICK_CHOSEN" "$(strip_ctrl_chars "$CLP_MIGRATE_CF_PICK")")"
+  CLP_SSL_CF_PICK="${files[$((ans - 1))]}"
+  CLP_SSL_CF_LAST="$CLP_SSL_CF_PICK"
+  log_info "$(_t "SITE_SSL_CF_PICK_CHOSEN" "$(strip_ctrl_chars "$CLP_SSL_CF_PICK")")"
   return 0
 }
 
@@ -4462,7 +4483,7 @@ _migrate_check_space() {
     log_warn "$(_t "SITE_MIGRATE_WARN_DB_SIZE_UNKNOWN")"
     db_kb=0
   fi
-  log_info "$(_t "SITE_MIGRATE_INFO_SPACE" "$(( files_kb / 1024 ))" "$(( db_kb / 1024 ))")"
+  log_info "$(_t "SITE_MIGRATE_INFO_SPACE" "$(_human_kb "$files_kb")" "$(_human_kb "$db_kb")")"
 
   # 要被取代的本機網站：以它的網站使用者身分量測（唯讀）
   #   這是估計值：資料庫大小取自舊站 wp-config.php 指向的資料庫，不一定是 site_delete 實際刪除的那一個
@@ -4476,7 +4497,7 @@ _migrate_check_space() {
       [[ "$v" =~ ^[0-9]+$ ]] && freed_files_kb="$v"
       v=$(sudo -H -u "$old_user" wp db size --size_format=b --quiet --path="$old_root" 2>/dev/null || true)
       [[ "$v" =~ ^[0-9]+$ ]] && freed_db_kb=$(( v / 1024 ))
-      log_info "$(_t "SITE_MIGRATE_INFO_SPACE_FREED" "$replace_target" "$(( freed_files_kb / 1024 ))" "$(( freed_db_kb / 1024 ))")"
+      log_info "$(_t "SITE_MIGRATE_INFO_SPACE_FREED" "$replace_target" "$(_human_kb "$freed_files_kb")" "$(_human_kb "$freed_db_kb")")"
     fi
   fi
 
@@ -4516,15 +4537,15 @@ _migrate_check_space() {
     need=$(( ${fs_need["$mnt"]} + margin_kb ))
     have=$(( ${fs_avail["$mnt"]} + ${fs_freed["$mnt"]} ))
     if (( ${fs_freed["$mnt"]} > 0 )); then
-      log_info "$(_t "SITE_MIGRATE_INFO_SPACE_FS_FREED" "$mnt" "$(( need / 1024 ))" "$(( ${fs_avail["$mnt"]} / 1024 ))" "$(( ${fs_freed["$mnt"]} / 1024 ))")"
+      log_info "$(_t "SITE_MIGRATE_INFO_SPACE_FS_FREED" "$mnt" "$(_human_kb "$need")" "$(_human_kb "${fs_avail["$mnt"]}")" "$(_human_kb "${fs_freed["$mnt"]}")")"
     else
-      log_info "$(_t "SITE_MIGRATE_INFO_SPACE_FS" "$mnt" "$(( need / 1024 ))" "$(( ${fs_avail["$mnt"]} / 1024 ))")"
+      log_info "$(_t "SITE_MIGRATE_INFO_SPACE_FS" "$mnt" "$(_human_kb "$need")" "$(_human_kb "${fs_avail["$mnt"]}")")"
     fi
     if (( have < need )); then
       if (( ${fs_freed["$mnt"]} > 0 )); then
-        log_error "$(_t "SITE_MIGRATE_ERR_SPACE_FREED" "$mnt" "$(( ${fs_freed["$mnt"]} / 1024 ))" "$(( need / 1024 ))" "$(( ${fs_avail["$mnt"]} / 1024 ))")"
+        log_error "$(_t "SITE_MIGRATE_ERR_SPACE_FREED" "$mnt" "$(_human_kb "${fs_freed["$mnt"]}")" "$(_human_kb "$need")" "$(_human_kb "${fs_avail["$mnt"]}")")"
       else
-        log_error "$(_t "SITE_MIGRATE_ERR_SPACE" "$mnt" "$(( need / 1024 ))" "$(( have / 1024 ))")"
+        log_error "$(_t "SITE_MIGRATE_ERR_SPACE" "$mnt" "$(_human_kb "$need")" "$(_human_kb "$have")")"
       fi
       rc=1
     fi
@@ -4533,7 +4554,7 @@ _migrate_check_space() {
   if [[ "$rc" -eq 0 && -n "$bk_mnt" && "${fs_freed["$bk_mnt"]:-0}" -gt 0 ]]; then
     need=$(( db_need_kb + margin_kb ))
     if (( ${fs_avail["$bk_mnt"]} < need )); then
-      log_error "$(_t "SITE_MIGRATE_ERR_SPACE_BACKUP" "$bk_mnt" "$(( need / 1024 ))" "$(( ${fs_avail["$bk_mnt"]} / 1024 ))")"
+      log_error "$(_t "SITE_MIGRATE_ERR_SPACE_BACKUP" "$bk_mnt" "$(_human_kb "$need")" "$(_human_kb "${fs_avail["$bk_mnt"]}")")"
       rc=1
     fi
   fi
@@ -4666,7 +4687,7 @@ _migrate_single_site() {
     log_warn "$(_t "SITE__MIGRATE_SINGLE_SITE_2" "${target_domain}")"
     # site_delete 會等到網站使用者與家目錄真正刪除；沒有刪乾淨就停止，不改用其他使用者名稱
     local del_rc=0
-    site_delete "$target_domain" -force || del_rc=$?
+    site_delete "$target_domain" --internal-replace || del_rc=$?
     if [[ "$del_rc" -ne 0 ]]; then
       rm -f "$sql_backup"
       _replace_delete_failed "$target_domain" "$del_rc"
@@ -4753,11 +4774,6 @@ _migrate_single_site() {
   if [[ "$enable_ssl" == "y" ]]; then
     log_step "$(_t "SITE_CLONE_16")"
     local CLP_INTERNAL_SSL_CALL=1
-    local CLP_SSL_API_FILE=""
-    if [[ "$migrate_ssl_mode" == "dns" ]]; then
-      _migrate_pick_cf_secret "$target_domain"
-      CLP_SSL_API_FILE="$CLP_MIGRATE_CF_PICK"
-    fi
     site_ssl "$target_domain" "$migrate_ssl_mode" || log_warn "$(_t "SITE_CLONE_17" "${target_domain}")"
   fi
 

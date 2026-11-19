@@ -44,7 +44,7 @@ backup_format_size() {
   fi
 }
 
-# 所有備份類型、還原前快照、restore／rollback 的 rsync --delete 共用的排除清單（相對於網站根目錄，可用萬用字元）。
+# 所有備份類型、restore 的 rsync --delete 共用的排除清單（相對於網站根目錄，可用萬用字元）。
 # 快取與其他備份外掛的本機備份目錄：不備份，還原時也不會被刪除。
 CLP_BACKUP_EXCLUDES=(
   "wp-content/cache"
@@ -388,22 +388,6 @@ backup_db_load() {
   return 1
 }
 
-# backup_db_drop_all_tables <db_creds>：刪除資料庫中的所有資料表（rollback 用；網站帳號，-db-root 時再試 root）
-backup_db_drop_all_tables() {
-  local db_creds="$1" who tables sql
-  for who in site root; do
-    [[ "$who" == "root" ]] && ! backup_db_root_allowed && break
-    backup_db_conn "$db_creds" "$who" || continue
-    tables=$(MYSQL_PWD="$BACKUP_DB_PASS" mysql "${BACKUP_DB_ARGS[@]}" -N -B -e "SHOW TABLES" "$BACKUP_DB_NAME" 2>/dev/null) || continue
-    [[ -z "$tables" ]] && return 0
-    sql="SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS $(awk '{ gsub(/`/, "``"); printf "%s`%s`", (NR > 1 ? ", " : ""), $0 }' <<< "$tables");"
-    # 由 stdin 傳入（資料表很多時 -e 參數可能超過長度上限）；資料表名稱由網站決定，同樣停用用戶端指令
-    mysql_no_cmds_opt
-    printf '%s\n' "$sql" | MYSQL_PWD="$BACKUP_DB_PASS" mysql "${BACKUP_DB_ARGS[@]}" "$CLP_MYSQL_NO_CMDS_OPT" "$BACKUP_DB_NAME" 2>/dev/null && return 0
-  done
-  return 1
-}
-
 # backup_wp_ready <siteroot> <siteuser>：可以用網站使用者身分執行 WP-CLI
 backup_wp_ready() {
   [[ -n "$2" ]] && command -v wp >/dev/null 2>&1 && \
@@ -449,7 +433,7 @@ backup_export_site_db() {
 # ------------------------------------------------------------------------------
 # restore_import_sql <sql_file> <db_creds_str> [siteroot] [siteuser]
 #   將 .sql 或 .sql.gz 匯入網站資料庫：WP-CLI（網站使用者）→ 網站 DB 帳號 →（-db-root）MySQL root。
-#   以 if 判斷結果，失敗時回傳 1（不會在 set -e 下中途結束，呼叫端可執行 rollback）。
+#   以 if 判斷結果，失敗時回傳 1（不會在 set -e 下中途結束，呼叫端自行處理失敗）。
 # ------------------------------------------------------------------------------
 restore_import_sql() {
   local sql_file="$1"
@@ -474,133 +458,15 @@ restore_import_sql() {
 }
 
 # ------------------------------------------------------------------------------
-# Restore Rollback Helpers
-#   restore_take_snapshot <domain> <siteroot> <db_creds_str>
-#     → 建立快照至 <backup-dir>/rollback/<domain>-<ts>/
-#     → 回傳快照目錄路徑（供後續 rollback 使用）
-#   restore_rollback <domain> <siteroot> <siteuser> <snapshot_dir>
-#     → 從快照目錄還原 DB 與檔案
+# Legacy rollback directory
+#   clp 不再於還原前建立快照，也不會在還原失敗時自動回復。
+#   backup_rollback_base 只用來清理舊版留下的 <backup-dir>/rollback/（見 backup_site 的過期清理）。
 # ------------------------------------------------------------------------------
-# backup_rollback_base：還原前快照的上層目錄（clp config 的 backup-dir 底下的 rollback/）；設定不合法時回傳 1
+# backup_rollback_base：舊版還原前快照的上層目錄（clp config 的 backup-dir 底下的 rollback/）；設定不合法時回傳 1
 backup_rollback_base() {
   local b
   b="$(config_get_valid BACKUP_DIR)" || return 1
   printf '%s\n' "${b%/}/rollback"
-}
-
-restore_take_snapshot() {
-  local domain="$1"
-  local siteroot="$2"
-  local db_creds="$3"   # backup_get_site_db_credentials 的輸出（\x1f 分隔）
-  local mode="${4:-full}" # full：建立 DB 與檔案快照；files：只建立檔案快照（資料庫無法存取、且本次還原不涉及資料庫）；none：只建立目錄（-no-snapshot，供保存 db_creds 與備份中的 wp-config）
-  local siteuser="${5:-}"
-
-  local db_name="${db_creds%%$'\x1f'*}"
-
-  local rollback_base
-  rollback_base="$(backup_rollback_base)" || return 1
-  # 自動相容：歷史版本在 /root/clpBackup 產生的隱藏目錄 .rollback，改名為 rollback
-  if [[ -d "/root/clpBackup/.rollback" && ! -d "/root/clpBackup/rollback" ]]; then
-    mv "/root/clpBackup/.rollback" "/root/clpBackup/rollback" 2>/dev/null || true
-  fi
-
-  local timestamp
-  timestamp=$(date +"%Y%m%d_%H%M%S")
-  local snap_dir="${rollback_base}/${domain}-${timestamp}"
-  [[ "$mode" == "none" ]] && snap_dir="${snap_dir}-nosnap"
-  (umask 077; mkdir -p "$snap_dir") || return 1
-  chmod 700 "$(dirname "$rollback_base")" "$rollback_base" "$snap_dir" 2>/dev/null || true
-
-  # 保存快照當下的 DB 憑證；還原失敗時 wp-config.php 可能已被覆寫，rollback 須沿用原憑證
-  ( umask 077; printf '%s\n' "$db_creds" > "${snap_dir}/db_creds" ) || { rm -rf "$snap_dir"; return 1; }
-
-  if [[ "$mode" == "none" ]]; then
-    echo "$snap_dir"
-    return 0
-  fi
-
-  log_info >&2 "$(_t "BACKUP_TAKE_SNAPSHOT_1" "${snap_dir}")"
-
-  # 1. DB 快照
-  # 依序：WP-CLI（網站使用者）→ 快照當下的網站帳密 mysqldump →（-db-root）MySQL root；邊匯出邊壓縮
-  if [[ -n "$db_name" && "$mode" == "full" ]]; then
-    local snap_sql="${snap_dir}/db.sql.gz" snap_ok=0
-    ( umask 077; : > "$snap_sql" )
-    if backup_wp_ready "$siteroot" "$siteuser" && \
-       sudo -H -u "$siteuser" wp db export - --add-drop-table --skip-plugins --skip-themes --path="$siteroot" 2>/dev/null | gzip -c > "$snap_sql"; then
-      snap_ok=1
-    elif backup_db_dump "$db_creds" "$snap_sql" 1 --add-drop-table; then
-      snap_ok=1
-    fi
-    if [[ "$snap_ok" -eq 1 ]]; then
-      log_info >&2 "$(_t "BACKUP_TAKE_SNAPSHOT_2" "${snap_sql}")"
-    else
-      backup_db_hint "$db_creds"
-      log_warn >&2 "$(_t "BACKUP_TAKE_SNAPSHOT_3")"
-      rm -rf "$snap_dir"
-      return 1
-    fi
-  fi
-
-  # 2. 網站檔案快照（排除 CLP_BACKUP_EXCLUDES；tar 結束代碼 1 只表示有檔案在打包時變動，可接受）
-  local snap_files="${snap_dir}/files.tar.gz"
-  if [[ -d "$siteroot" ]]; then
-    backup_tar_exclude_args "$(basename "$siteroot")"
-    local tar_rc=0
-    backup_tar_create --warning=no-file-changed -czf "$snap_files" \
-      "${BACKUP_TAR_EXCLUDES[@]}" \
-      -C "$(dirname "$siteroot")" "$(basename "$siteroot")" 2>/dev/null || tar_rc=$?
-    if [[ "$tar_rc" -le 1 ]]; then
-      log_info >&2 "$(_t "BACKUP_TAKE_SNAPSHOT_4" "${snap_files}")"
-    else
-      log_warn >&2 "$(_t "BACKUP_TAKE_SNAPSHOT_5")"
-      rm -rf "$snap_dir"
-      return 1
-    fi
-  fi
-
-  chmod 600 "${snap_dir}"/* 2>/dev/null || true
-  echo "$snap_dir"
-}
-
-# restore_snapshot_space_check <siteroot> <db_creds>
-#   估算快照需要的空間（網站目錄扣除 CLP_BACKUP_EXCLUDES，加上資料庫大小，再加 10% 餘裕），
-#   與 backup-dir 所在磁碟的剩餘空間比較。設定 SNAP_NEED_BYTES、SNAP_AVAIL_BYTES；空間不足時回傳 1。
-restore_snapshot_space_check() {
-  local siteroot="$1" db_creds="$2"
-  local need=0 p m sz
-  if [[ -d "$siteroot" ]]; then
-    # du 遇到消失的檔案會回傳 1，但仍輸出總計；只取第一行，避免「數字＋0」兩行造成算術錯誤
-    need=$(du -sb "$siteroot" 2>/dev/null | head -n1 | cut -f1 || true)
-    [[ "$need" =~ ^[0-9]+$ ]] || need=0
-    for p in "${CLP_BACKUP_EXCLUDES[@]}"; do
-      # shellcheck disable=SC2206
-      for m in "$siteroot"/$p; do
-        [[ -e "$m" ]] || continue
-        sz=$(du -sb "$m" 2>/dev/null | head -n1 | cut -f1 || true)
-        [[ "$sz" =~ ^[0-9]+$ ]] || sz=0
-        need=$((need - ${sz:-0}))
-      done
-    done
-  fi
-  if backup_db_conn "$db_creds" site; then
-    local db_bytes
-    db_bytes=$(MYSQL_PWD="$BACKUP_DB_PASS" mysql "${BACKUP_DB_ARGS[@]}" -N -B -e \
-      "SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema = DATABASE()" \
-      "$BACKUP_DB_NAME" 2>/dev/null || echo 0)
-    [[ "$db_bytes" =~ ^[0-9]+$ ]] || db_bytes=0
-    need=$((need + db_bytes))
-  fi
-  [[ "$need" -lt 0 ]] && need=0
-  need=$((need + need / 10))
-  local snap_base
-  snap_base="$(backup_rollback_base)" || return 1
-  snap_base="$(dirname "$snap_base")"
-  (umask 077; mkdir -p "$snap_base") 2>/dev/null || true
-  SNAP_NEED_BYTES="$need"
-  SNAP_AVAIL_BYTES=$(df -P -B1 "$snap_base" 2>/dev/null | awk 'NR==2 {print $4}')
-  [[ "$SNAP_AVAIL_BYTES" =~ ^[0-9]+$ ]] || return 0
-  [[ "$SNAP_AVAIL_BYTES" -ge "$SNAP_NEED_BYTES" ]]
 }
 
 # restore_stage_for_user <siteuser> <dir> <open_dir...>
@@ -627,7 +493,7 @@ restore_foreign_owned() {
 
 # restore_rsync_as_user <siteuser> <src_dir> <siteroot> [rsync 選項...]
 #   以網站使用者身分同步（-rlpt：不保留擁有者、群組與裝置檔）；結束代碼 24（來源檔案在同步時消失）只警告，
-#   其餘失敗（包括 23：部分檔案無法寫入，rsync 也會因此略過 --delete）回傳原結束代碼，由呼叫端 rollback
+#   其餘失敗（包括 23：部分檔案無法寫入，rsync 也會因此略過 --delete）回傳原結束代碼，由呼叫端中止
 restore_rsync_as_user() {
   local siteuser="$1" src="$2" dst="$3" rc=0
   shift 3
@@ -637,99 +503,6 @@ restore_rsync_as_user() {
     return 0
   fi
   return "$rc"
-}
-
-restore_rollback() {
-  local domain="$1"
-  local siteroot="$2"
-  local siteuser="$3"
-  local snap_dir="$4"
-
-  if [[ -z "$snap_dir" || ! -d "$snap_dir" ]]; then
-    log_error "$(_t "BACKUP_ROLLBACK_1" "${snap_dir}")"
-    return 1
-  fi
-  if [[ ! -f "${snap_dir}/db.sql.gz" && ! -f "${snap_dir}/files.tar.gz" ]]; then
-    # -no-snapshot 或快照失敗後選擇繼續：沒有可回復的內容
-    log_error "$(_t "BACKUP_ROLLBACK_NO_SNAPSHOT" "${snap_dir}")"
-    return 1
-  fi
-
-  log_step "$(_t "BACKUP_ROLLBACK_2" "${snap_dir}")"
-  local rb_failed=0
-
-  # 取得 DB 憑證（優先使用快照當下保存的憑證）
-  local db_creds
-  if [[ -s "${snap_dir}/db_creds" ]]; then
-    db_creds=$(head -n 1 "${snap_dir}/db_creds")
-  else
-    db_creds=$(backup_get_site_db_credentials "$siteroot")
-  fi
-  # 1. 回復資料庫（先用快照當下的帳密：還原失敗時 wp-config.php 可能已不同；再試 WP-CLI）
-  local snap_sql="${snap_dir}/db.sql.gz"
-  if [[ -f "$snap_sql" && -n "${db_creds%%$'\x1f'*}" ]]; then
-    log_info "$(_t "BACKUP_ROLLBACK_3")"
-    # 快照只有 DROP TABLE IF EXISTS 快照當時的表；失敗的還原新增的資料表要先清掉，才是真正回到原狀
-    # 先確認快照檔完整，才刪除資料表（否則載入失敗會留下空的資料庫）
-    if ! gunzip -t "$snap_sql" 2>/dev/null; then
-      log_error "$(_t "BACKUP_ROLLBACK_5")"
-      rb_failed=1
-    elif backup_db_drop_all_tables "$db_creds" && backup_db_load "$db_creds" "$snap_sql"; then
-      log_success "$(_t "BACKUP_ROLLBACK_4")"
-    elif backup_wp_ready "$siteroot" "$siteuser" && \
-         sudo -H -u "$siteuser" wp db reset --yes --path="$siteroot" >/dev/null 2>&1 && \
-         gunzip -c "$snap_sql" | sudo -H -u "$siteuser" wp db import - --path="$siteroot" >/dev/null 2>&1; then
-      log_success "$(_t "BACKUP_ROLLBACK_4")"
-    else
-      backup_db_hint "$db_creds"
-      log_error "$(_t "BACKUP_ROLLBACK_5")"
-      rb_failed=1
-    fi
-  fi
-
-  # 2. 回復網站檔案
-  local snap_files="${snap_dir}/files.tar.gz"
-  if [[ -f "$snap_files" ]]; then
-    log_info "$(_t "BACKUP_ROLLBACK_6")"
-    # 不可先刪除整個網站目錄：快照沒有包含 CLP_BACKUP_EXCLUDES（快取、其他備份外掛的本機備份），
-    # 改為解壓到暫存目錄後以 rsync --delete 鏡像回去，並帶相同的排除清單保護這些目錄。
-    #    寫入由網站使用者執行（見 restore_stage_for_user）。
-    local rb_tmp="" rb_ok=0 rb_src
-    rb_tmp=$(mktemp -d "/var/tmp/clpRollback.XXXXXX") || rb_tmp=""
-    rb_src="${rb_tmp}/$(basename "$siteroot")"
-    if [[ -z "$siteuser" ]]; then
-      log_error "$(_t "BACKUP_RESTORE_ERR_NO_SITE_USER" "$domain")"
-    elif [[ -n "$rb_tmp" ]] && \
-       tar --no-same-owner -xzf "$snap_files" -C "$rb_tmp" 2>/dev/null && \
-       restore_stage_for_user "$siteuser" "$rb_src" "$rb_tmp"; then
-      backup_rsync_exclude_args
-      sudo -H -u "$siteuser" mkdir -p "$siteroot" 2>/dev/null || true
-      if restore_rsync_as_user "$siteuser" "$rb_src" "$siteroot" --delete "${BACKUP_RSYNC_EXCLUDES[@]}"; then
-        rb_ok=1
-      fi
-    fi
-    [[ -n "$rb_tmp" ]] && rm -rf "$rb_tmp"
-    if [[ "$rb_ok" -eq 1 ]]; then
-      log_success "$(_t "BACKUP_ROLLBACK_7")"
-    else
-      log_error "$(_t "BACKUP_ROLLBACK_8")"
-      rb_failed=1
-    fi
-  fi
-
-  # 3. 清除快取 (wp cache flush)
-  if command -v wp >/dev/null 2>&1 && [[ -f "${siteroot}/wp-config.php" ]]; then
-    log_info "$(_t "BACKUP_ROLLBACK_9")"
-    sudo -H -u "$siteuser" wp cache flush --path="$siteroot" 2>/dev/null || sudo -H -u "$siteuser" wp cache flush --path="$siteroot" --skip-plugins 2>/dev/null || true
-    sudo -H -u "$siteuser" wp transient delete --all --path="$siteroot" 2>/dev/null || sudo -H -u "$siteuser" wp transient delete --all --path="$siteroot" --skip-plugins 2>/dev/null || true
-  fi
-
-  if [[ "$rb_failed" -eq 1 ]]; then
-    log_error "$(_t "BACKUP_ROLLBACK_INCOMPLETE" "${snap_dir}")"
-    return 1
-  fi
-  log_success "$(_t "BACKUP_ROLLBACK_10" "${snap_dir}")"
-  return 0
 }
 
 # restore_sync_wp_table_prefix <target_wpconfig> <backup_source> <siteuser>
@@ -1038,7 +811,7 @@ backup_site() {
             ;;
         esac
 
-        # 清理本機超過 N 天之 rollback 快照目錄
+        # 清理本機超過 N 天之 rollback 快照目錄（舊版還原前快照；新版不再建立，保留這段只為了清掉舊版留下的目錄）
         local rb_base
         rb_base="$(backup_rollback_base 2>/dev/null)" || rb_base=""
         if [[ -n "$rb_base" && -d "$rb_base" ]]; then
@@ -1380,7 +1153,7 @@ _restore_kind_order() {
 # restore_site <domain> [<file[,file...]>] [<type>] [<to>] [<path>] [<force>]
 #   一次可以還原多個檔案（db、compact、archive 各最多一個；full 只能單獨還原）。流程：
 #   1. 選擇檔案（-file 或選單）；2. 準備：下載、解壓、建立規則、算出要刪除的項目（任何失敗都還沒有變更）；
-#   3. 確認一次；4. 快照一次；5. 依 archive → compact → db 套用，任何一步失敗就用同一份快照回復。
+#   3. 確認一次；4. 依 archive → compact → db 套用。clp 不建立還原點，任何一步失敗都不會自動還原（可能只還原一部分），由使用者用自己的備份還原。
 restore_site() {
   local domain="$1"
   local r_file="${2:-}"     # backup filename(s), comma separated
@@ -1416,8 +1189,6 @@ restore_site() {
       cfg_remote_dir="$(config_get_valid BACKUP_REMOTE_DIR)" || return 1
     fi
   fi
-  # 還原前快照寫在 backup-dir 底下的 rollback/；先檢查設定，不合法時在確認與下載之前停止
-  backup_rollback_base >/dev/null || return 1
 
   local remote="" remote_dir="" search_dir=""
   if [[ "$source_is_remote" -eq 1 ]]; then
@@ -1712,19 +1483,17 @@ restore_site() {
   # ----------------------------------------------------------------------------
   # Step 2: Prepare every file (nothing on the site or in the database changes yet)
   # ----------------------------------------------------------------------------
-  # 先確認資料庫可以存取（不再自動改用 MySQL root）：
-  #   會匯入資料庫時，失敗就在下載與任何變更之前停止；只還原檔案（compact、archive）時只警告，快照不含資料庫。
-  local db_creds
+  # 會匯入資料庫時，先確認資料庫可以存取（不再自動改用 MySQL root），失敗就在下載與任何變更之前停止；
+  #   只還原檔案（compact、archive）時不檢查；解壓後才發現封裝內含資料庫備份時，在確認之前補檢查一次。
+  local db_creds db_checked=0
   db_creds=$(backup_get_site_db_credentials "$siteroot")
-  local snap_db_mode="full"
-  if [[ -n "${db_creds%%$'\x1f'*}" ]] && ! backup_db_check "$db_creds" "$siteroot" "$siteuser"; then
-    backup_db_hint "$db_creds"
-    if [[ "$needs_db" -eq 1 ]]; then
+  if [[ "$needs_db" -eq 1 && -n "${db_creds%%$'\x1f'*}" ]]; then
+    db_checked=1
+    if ! backup_db_check "$db_creds" "$siteroot" "$siteuser"; then
+      backup_db_hint "$db_creds"
       log_error "$(_t "BACKUP_RESTORE_ERR_DB_ACCESS" "$domain")"
       return 1
     fi
-    log_warn "$(_t "BACKUP_RESTORE_WARN_DB_SNAPSHOT_SKIP")"
-    snap_db_mode="files"
   fi
 
   if [[ "$any_tar" -eq 1 ]]; then
@@ -1733,7 +1502,7 @@ restore_site() {
       log_error "$(_t "BACKUP_RESTORE_ERR_NO_SITE_USER" "$domain")"
       return 1
     fi
-    # 網站中有不屬於網站使用者的檔案時，網站使用者無法覆寫或刪除，還原會失敗後 rollback；先列出並停止
+    # 網站中有不屬於網站使用者的檔案時，網站使用者無法覆寫或刪除，還原會失敗而留下只還原一部分的網站；先列出並停止
     local foreign_owned
     foreign_owned=$(restore_foreign_owned "$siteuser" "$siteroot")
     if [[ -n "$foreign_owned" ]]; then
@@ -1835,7 +1604,7 @@ restore_site() {
 
     # 交給網站使用者之前，先把要由 root 讀取的檔案移到 root_dir（之後網站使用者可以替換暫存目錄中的檔案）：
     # 新版封裝最上層的 backup.sql、舊版的 <domain>/.clp_db_export.sql，以及備份中的 wp-config.php
-    # （之後另存於 root 專屬的快照目錄，不可放在網站根目錄，否則會被當成純文字公開）
+    # （不可放在網站根目錄，否則會被當成純文字公開）
     if [[ -f "${unpack_dir}/backup.sql" && ! -L "${unpack_dir}/backup.sql" ]]; then
       item_sql[$i]="${root_dir}/sql_${i}.sql"
       mv "${unpack_dir}/backup.sql" "${item_sql[$i]}" || { log_error "$(_t "BACKUP_RESTORE_ERR_PREPARE" "${item_name[$i]}")"; return 1; }
@@ -1861,6 +1630,19 @@ restore_site() {
         | sed -n 's/^\*deleting  *//p' || true)
     fi
   done
+
+  # 封裝內含資料庫備份、但前面沒有檢查過資料庫（只還原 compact／archive 時）：在確認與任何變更之前補檢查
+  if [[ "$db_checked" -eq 0 && -n "${db_creds%%$'\x1f'*}" ]]; then
+    for i in "${!item_sql[@]}"; do
+      [[ -n "${item_sql[$i]}" ]] || continue
+      if ! backup_db_check "$db_creds" "$siteroot" "$siteuser"; then
+        backup_db_hint "$db_creds"
+        log_error "$(_t "BACKUP_RESTORE_ERR_DB_ACCESS" "$domain")"
+        return 1
+      fi
+      break
+    done
+  fi
 
   # ----------------------------------------------------------------------------
   # Step 3: Confirm once (files, years, items to be deleted)
@@ -1906,6 +1688,14 @@ restore_site() {
   done
   [[ "$any_keep_extra" -eq 1 ]] && log_info "$(_t "BACKUP_RESTORE_INFO_KEEP_EXTRA")"
 
+  # -no-snapshot 已無作用（保留選項以免舊的指令失敗）
+  if has_opt "no-snapshot" || has_opt "no_snapshot"; then
+    log_warn "$(_t "BACKUP_SNAPSHOT_SKIPPED_BY_OPTION")"
+  fi
+
+  # clp 不會自動備份，失敗也不會還原；-y／--force 也要印
+  log_warn "$(_t "BACKUP_NO_AUTO_BACKUP_NOTICE" "$domain")"
+
   if [[ "$force_mode" -eq 0 ]]; then
     local confirm="" prompt_key="BACKUP_SITE_34"
     [[ "$total_del" -gt 0 ]] && prompt_key="BACKUP_RESTORE_DELETE_PROMPT"
@@ -1916,59 +1706,16 @@ restore_site() {
     fi
   fi
 
-  # ----------------------------------------------------------------------------
-  # Step 4: Snapshot (Rollback Safety), once for the whole set
-  # ----------------------------------------------------------------------------
-  log_step "$(_t "BACKUP_SITE_39")"
-  # 快照：預設建立；空間不足或快照失敗時，互動模式讓使用者決定是否在沒有快照的情況下繼續，
-  # -y／--force 時一律中止（保守預設，需要明確加上 -no-snapshot 才會略過）。
-  local snap_dir="" snap_mode="full" snap_problem=""
-  if has_opt "no-snapshot" || has_opt "no_snapshot"; then
-    snap_mode="none"
-    log_warn "$(_t "BACKUP_SNAPSHOT_SKIPPED_BY_OPTION")"
-  elif ! restore_snapshot_space_check "$siteroot" "$db_creds"; then
-    snap_problem="$(_t "BACKUP_SNAPSHOT_ERR_SPACE" "$(backup_format_size "$SNAP_NEED_BYTES")" "$(backup_format_size "$SNAP_AVAIL_BYTES")")"
-  elif ! snap_dir=$(restore_take_snapshot "$domain" "$siteroot" "$db_creds" "$snap_db_mode" "$siteuser"); then
-    snap_dir=""
-    snap_problem="$(_t "BACKUP_SNAPSHOT_ERR_FAILED")"
-  fi
-
-  if [[ -n "$snap_problem" ]]; then
-    log_error "$snap_problem"
-    log_info "$(_t "BACKUP_SNAPSHOT_HINT_CLEANUP" "$(backup_rollback_base 2>/dev/null)")"
-    if [[ "$force_mode" -eq 1 ]]; then
-      log_error "$(_t "BACKUP_SNAPSHOT_ERR_AUTO_ABORT")"
-      return 1
-    fi
-    local snap_confirm=""
-    read -r -p "$(_t "BACKUP_SNAPSHOT_PROMPT_CONTINUE")" snap_confirm || snap_confirm=""
-    if [[ "$snap_confirm" != "yes" ]]; then
-      log_info "$(_t "BACKUP_SITE_29")"
-      return 0
-    fi
-    snap_mode="none"
-  fi
-
-  if [[ "$snap_mode" == "none" ]]; then
-    if ! snap_dir=$(restore_take_snapshot "$domain" "$siteroot" "$db_creds" "none"); then
-      log_error "$(_t "BACKUP_SNAPSHOT_ERR_FAILED")"
-      return 1
-    fi
-    log_warn "$(_t "BACKUP_SNAPSHOT_NONE_WARN")"
-  else
-    log_info "$(_t "BACKUP_SITE_40" "${snap_dir}")"
-  fi
-
-  # 備份中的 wp-config.php 另存於快照目錄（root 專屬）
-  for i in "${!item_wpcfg[@]}"; do
-    [[ -n "${item_wpcfg[$i]}" ]] || continue
-    if install -m 600 "${item_wpcfg[$i]}" "${snap_dir}/wp-config.from-backup.php"; then
-      log_info "$(_t "BACKUP_SITE_49" "${snap_dir}")"
-    fi
+  # 備份中的 wp-config.php 不會覆蓋目前的版本（只依它同步 $table_prefix）
+  local cfg_i
+  for cfg_i in "${!item_wpcfg[@]}"; do
+    [[ -n "${item_wpcfg[$cfg_i]}" ]] || continue
+    log_info "$(_t "BACKUP_SITE_49")"
+    break
   done
 
   # ----------------------------------------------------------------------------
-  # Step 5: Apply in order (archive → compact → full → db); any failure rolls back the whole set
+  # Step 4: Apply in order (archive → compact → full → db); a failure stops here and is NOT rolled back
   # ----------------------------------------------------------------------------
   log_step "$(_t "BACKUP_SITE_41" "${domain}")"
   local any_files=0
@@ -1977,8 +1724,7 @@ restore_site() {
       # Pure DB Restore
       log_info "$(_t "BACKUP_SITE_42")"
       if ! restore_import_sql "${item_sql[$i]}" "$db_creds" "$siteroot" "$siteuser"; then
-        log_error "$(_t "BACKUP_SITE_43")"
-        restore_rollback "$domain" "$siteroot" "$siteuser" "$snap_dir" || true
+        log_error "$(_t "BACKUP_SITE_43" "${item_name[$i]}")"
         return 1
       fi
       log_success "$(_t "BACKUP_SITE_44")"
@@ -1993,8 +1739,7 @@ restore_site() {
     if [[ -n "${item_sql[$i]}" ]]; then
       log_step "$(_t "BACKUP_SITE_47")"
       if ! restore_import_sql "${item_sql[$i]}" "$db_creds" "$siteroot" "$siteuser"; then
-        log_error "$(_t "BACKUP_SITE_43")"
-        restore_rollback "$domain" "$siteroot" "$siteuser" "$snap_dir" || true
+        log_error "$(_t "BACKUP_SITE_43" "${item_name[$i]}")"
         return 1
       fi
       log_success "$(_t "BACKUP_SITE_48")"
@@ -2004,7 +1749,7 @@ restore_site() {
       rm -f "${item_sql[$i]}"
     fi
 
-    # Sync web files（備份中的 wp-config.php 已另存，依它同步 table prefix）
+    # Sync web files（不覆蓋目前的 wp-config.php，只依備份中的版本同步 table prefix）
     if [[ -n "${item_wpcfg[$i]}" ]]; then
       restore_sync_wp_table_prefix "${siteroot}/wp-config.php" "${item_wpcfg[$i]}" "$siteuser"
     fi
@@ -2014,8 +1759,7 @@ restore_site() {
     log_info "$(_t "BACKUP_SITE_50" "${siteroot}")"
     # 以網站使用者身分寫入，檔案直接屬於網站使用者，不需要再以 root chown -R
     if ! restore_rsync_as_user "$siteuser" "${item_src[$i]}" "$siteroot" ${rsync_mode_args[@]+"${rsync_mode_args[@]}"} "${rsync_rules[@]}"; then
-      log_error "$(_t "BACKUP_SITE_51")"
-      restore_rollback "$domain" "$siteroot" "$siteuser" "$snap_dir" || true
+      log_error "$(_t "BACKUP_SITE_51" "${item_name[$i]}")"
       return 1
     fi
     rm -rf "${item_unpack[$i]}"
@@ -2036,8 +1780,6 @@ restore_site() {
     fi
     sudo -H -u "$siteuser" wp transient delete --all --path="$siteroot" 2>/dev/null || sudo -H -u "$siteuser" wp transient delete --all --path="$siteroot" --skip-plugins 2>/dev/null || true
   fi
-
-  log_info "$(_t "BACKUP_SITE_57" "${snap_dir}" "${snap_dir}")"
 
   echo ""
   echo -e "${C_GREEN}${C_BOLD}======================================================================${C_NC}"
@@ -2077,7 +1819,6 @@ restore_handler() {
     echo -e "$(_t "BACKUP_HANDLER_19")"
     echo -e "$(_t "BACKUP_HANDLER_20")"
     echo -e "$(_t "BACKUP_HANDLER_KEEP_EXTRA")"
-    echo -e "$(_t "BACKUP_HANDLER_NO_SNAPSHOT")"
     echo -e "$(_t "BACKUP_HANDLER_MIRROR_NOTE")"
     echo -e "$(_t "BACKUP_HANDLER_8")"
     echo -e "  sudo clp restore example.com"

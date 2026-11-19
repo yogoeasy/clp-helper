@@ -5,7 +5,8 @@
 #
 # 在 CloudPanel 網站的 vhost 範本（site.vhost_template）與渲染後的 vhost 中加入 clp 的 include：
 #   檔案最上面（http 層）：include /etc/nginx/clp-helper/sites/<domain>/http/*.conf;
-#   HTTPS server 的 root 之後：include /etc/nginx/clp-helper/*.conf;
+#   HTTPS server 的 root 之後（只做轉址的 HTTPS 區塊不計，例如 CloudPanel 的 www 轉址區塊）：
+#                              include /etc/nginx/clp-helper/*.conf;
 #                              include /etc/nginx/clp-helper/sites/<domain>/*.conf;
 # 範本中有 include，CloudPanel 重新產生 vhost（例如後台 Vhost 分頁儲存）時就會保留，
 # 功能的設定（例如 httpauth）放在 include 的檔案中，不會被移除。

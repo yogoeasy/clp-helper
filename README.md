@@ -146,7 +146,7 @@ Check version information:
 clp -v
 ```
 
-Output example:`CLP Helper v1.3.9 (build 2026-11-13 01:06:07)`
+Output example:`CLP Helper v1.4.0 (build 2026-11-19 15:50:02)`
 
 Display global help menu:
 
@@ -437,6 +437,8 @@ Use specific Cloudflare API credentials file:
 sudo clp site example.com -ssl=on -dns -api=my-cloudflare.ini
 ```
 
+Without `-api`, the token file is picked by name (`example.com.ini`, or a file named after a parent domain). When no file name matches and several are available, an interactive run lists them so you can pick one; this also applies to `-new`, `-clone` and `-migrate`. With `-y` or without a terminal, add `-api=<name>` instead, otherwise it falls back to HTTP-01 (which fails while the domain is proxied through Cloudflare with SSL mode Full (strict), or does not point to this server yet).
+
 Issue CloudPanel native HTTP-01 SSL (domain pointing to server IP):
 
 ```bash
@@ -467,7 +469,7 @@ Overwrite existing target site:
 sudo clp site -clone-from=example.com new-example.com -force-replace
 ```
 
-With `-force-replace`, clp first shows what will be deleted (site user, number of files and size, database) and asks for confirmation before exporting the source database; `-y` confirms in advance, and without a terminal `-y` is required. The existing site is deleted only after every check passes and the source database has been exported (user name, PHP version, export), and the new site is created only after the old site user and its home directory are really gone (see deleting a site above); the new site keeps the old site user name. If a later step fails, the old site is not restored, so back it up first if you need it. Only `-force-replace` replaces a site; `-force` does not. The same applies to `-migrate` (the confirmation comes before the database download) and to `-new -force-replace` (shown in the build plan).
+With `-force-replace`, clp first shows what will be deleted (site user, number of files and size, database) and asks for confirmation before exporting the source database; `-y` confirms in advance, and without a terminal `-y` is required. The existing site is deleted only after every check passes and the source database has been exported (user name, PHP version, export), and the new site is created only after the old site user and its home directory are really gone (see deleting a site above); the new site keeps the old site user name. clp does not back up the site first and does not restore it if a later step fails, so run `clp backup <domain> -type=full` beforehand if you need it. Only `-force-replace` replaces a site; `-force` does not. The same applies to `-migrate` (the confirmation comes before the database download) and to `-new -force-replace` (shown in the build plan).
 
 Customize user and PHP version for target site:
 
@@ -536,13 +538,13 @@ Resume site:
 sudo clp site example.com -on
 ```
 
-Interactive site and database deletion:
+Interactive site and database deletion (clp does not back up first; run `clp backup example.com -type=full` beforehand if you need the site):
 
 ```bash
 sudo clp site delete example.com
 ```
 
-Force delete without interactive prompt:
+Force delete without interactive prompt (the warning and the backup notice are still printed):
 
 ```bash
 sudo clp site delete example.com --force
@@ -799,7 +801,7 @@ sudo clp server -nginx-hooks=off                # remove them from every site
 - Sites created by clp (`-new`, `-clone-from`, `-migrate`) get the lines right away. Sites created in CloudPanel do not (its WordPress wizard cannot choose a template): add them with `clp site <domain> -nginx-hooks`. `clp site -list` lists the sites without them.
 - If the lines disappear later (for example when a Vhost tab opened before the change is saved), clp does not add them back by itself: `clp site -list`, `-nginx-hooks=status` and `httpauth -list=protected` show it, with the command to fix it.
 - `-off` refuses while a site still has hook files (e.g. httpauth protection), because removing the lines would silently turn them off.
-- Only PHP sites whose template has one HTTPS server block with one `root` line; disabled sites are skipped.
+- Only PHP sites whose template has one HTTPS server block (redirect-only blocks are not counted) with one `root` line; disabled sites are skipped.
 
 ---
 
@@ -1158,20 +1160,18 @@ By default, a file restore deletes files on the site that are not in the backup 
 - **Archives from another site are refused**: a `.tar.gz` without the site's top-level `<domain>/` folder is rejected before anything is changed. To copy a site to another domain, use `clp site -clone-from` or `-migrate`.
   - `db`: imports the database only; no files are touched.
 - **The year comes from the backup**: it is read from the timestamp in the file name, not the date of the restore.
-- **Always protected**: the current `wp-config.php` (the backup's copy is saved in the snapshot folder) and the cache and backup-plugin folders listed above.
-- **Confirmation**: all files are downloaded and unpacked first; then, in interactive mode, the number of items each file will delete and the first 20 are shown, and you type `yes` once to continue (answering anything else changes nothing and leaves no snapshot). With `-y` or `--force` it proceeds directly.
+- **Always protected**: the current `wp-config.php` (the backup's version is not written; extract it from the backup file if you need it) and the cache and backup-plugin folders listed above.
+- **Confirmation**: all files are downloaded and unpacked first; then, in interactive mode, the number of items each file will delete and the first 20 are shown, and you type `yes` once to continue (answering anything else changes nothing). With `-y` or `--force` it proceeds directly. The notice below is printed in every case.
 - **Previous behavior**: add `-keep-extra` to overwrite without deleting.
-- **Recoverable**: a snapshot is taken before every restore (`<backup-dir>/rollback/`, default `/root/clpBackup/rollback/`) and covers every file that can be deleted; a failed restore is rolled back automatically.
+- **Not recoverable by clp**: clp does not back up before a restore and does not roll back a failed restore. Back up first (for example `clp backup example.com -type=full`).
 
-#### ④ Pre-Restore Snapshot
+#### ④ No Automatic Backup or Rollback
 
-- **Disk space check first**: before the snapshot, the size of the site directory (without the cache and backup-plugin folders above) plus the database, with a 10% margin, is compared with the free space of `/root/clpBackup`.
-- **Not enough space or snapshot failure**: the incomplete snapshot is removed and nothing has been changed yet. In interactive mode you are asked whether to continue without a snapshot (type `yes`); with `-y` or `--force` the restore is aborted.
-- **Skipping the snapshot**: add `-no-snapshot` to restore without a snapshot. A failed restore then cannot be rolled back automatically; use it at your own risk.
-
-```bash
-sudo clp restore example.com -type=compact -no-snapshot
-```
+- **Back up first**: before a restore, clp prints a notice (also with `-y` or `--force`): `clp does not back up automatically and does not roll back on failure.` Run `clp backup <domain> -type=full` first if you may need the current site.
+- **A failed restore is not rolled back**: if importing the database or syncing files fails, clp stops and names the backup file that failed. The site may be only partly restored (files and database may not match); restore it from your own backup.
+- **`-no-snapshot` has no effect**: older versions took a snapshot before every restore, and this option skipped it. It is still accepted so existing commands keep working, and prints a note.
+- **Leftover `<backup-dir>/rollback/` from older versions**: clp no longer creates it. When the backup is on this server, `backup-expire` removes the old snapshot folders; when backups go to a remote (`backup-to`), delete `<backup-dir>/rollback/` by hand (default `/root/clpBackup/rollback/`).
+- The same notice is printed before `clp site delete` (also with `-y`, `--force`), before `-force-replace` replaces a site, and in the `-migrate -all` conflict menu.
 
 Keep extra files on the site:
 
@@ -1183,7 +1183,7 @@ sudo clp restore example.com -type=compact -keep-extra
 
 `backup` and `restore` access the database with the site's own permissions only: first WP-CLI as the site user, then the database credentials in `wp-config.php`.
 
-- **No automatic MySQL root**: if both fail, the command stops with an error. A restore checks database access before the snapshot: if the restore imports a database (`.sql`, `full`), it stops there and nothing has been changed; a files-only restore (`compact`, `archive`) continues with a warning and the snapshot does not include the database.
+- **No automatic MySQL root**: if both fail, the command stops with an error. A restore checks database access before changing anything: if the restore imports a database (`.sql`, `full`, or an archive that contains a database dump), it stops there and nothing has been changed; a files-only restore (`compact`, `archive`) does not need the database.
 - **`-db-root`**: allows the MySQL root account as a last resort. It always connects to the CloudPanel MySQL master server from `clpctl db:show:master-credentials` (the `DB_HOST` in `wp-config.php` is ignored), and the database name may contain only letters, digits, `_` and `-`.
 - **Database names starting with `-`** are never passed to `mysql`／`mysqldump` (WP-CLI runs as the site user and is not affected).
 - **`site -clone-from` / `-migrate`** import the database with the new site's database user only. The SQL comes from the source site or the remote host, so a failed import does not fall back to MySQL root: the command stops with an error and removes the new site and database (with `-force-replace`, the replaced site has already been deleted). If you trust the source, run again with `-db-root`; the SQL then runs with MySQL root privileges.
@@ -1203,10 +1203,10 @@ sudo clp restore example.com -to=google -file=example.com-archive-20261001_03000
 ```
 
 - **Prepared first**: every file is downloaded and unpacked, and the items to be deleted are worked out, before anything changes. If any file fails (download, unpacking, an archive from another site), the whole restore is cancelled.
-- **One confirmation, one snapshot**: you confirm once for all files, and a single snapshot is taken. The files are then applied as `archive` → `compact` → `db`; if any step fails, the site and database are rolled back from that one snapshot.
+- **One confirmation**: you confirm once for all files. The files are then applied as `archive` → `compact` → `db`; if any step fails, clp stops and does not roll back, so the site may be only partly restored.
 - **compact wins its own year**: if the archive also contains the compact's year (for example a December compact with a January archive), that year is taken from the compact and the archive leaves it alone.
 - **Years in neither file**: if the archive is from an earlier year than the compact (for example a December archive with a January compact), the archive's year is in neither file; it is left as it is on the site now, and a warning is shown.
-- **Disk space**: all files are unpacked at the same time (in `/var/tmp`; remote files are downloaded there as well), plus one snapshot. If space is short, restore the files one at a time instead.
+- **Disk space**: all files are unpacked at the same time (in `/var/tmp`; remote files are downloaded there as well). If space is short, restore the files one at a time instead.
 
 ---
 
@@ -1466,7 +1466,7 @@ The first choice shown is the recommended one; `sudo bash install.sh -y` uses it
 | `backup-remote-dir` | Directory on the rclone remote when `-path` is not given (`<value>/<domain>`) | Relative path; default `clpBackup` |
 | `backup-type` | Backup type when `-type` is not given | `db`, `full`, `compact`, `archive`; default `full` |
 | `backup-to` | Destination (and `clp restore` source) when `-to` is not given | `local` or an rclone remote name; default `local` |
-| `backup-expire` | Delete backups older than N days after each `clp backup` when `-expire` is not given. ⚠️ When set, **every** backup run (including cron) deletes that site's older backups, and for local backups also its restore rollback snapshots older than N days. `-expire=off` disables it for one run | `off`, `1d`–`3650d`; default `off` |
+| `backup-expire` | Delete backups older than N days after each `clp backup` when `-expire` is not given. ⚠️ When set, **every** backup run (including cron) deletes that site's older backups, and for local backups also the old restore snapshot folders (`<backup-dir>/rollback/`, left by older versions) older than N days. `-expire=off` disables it for one run | `off`, `1d`–`3650d`; default `off` |
 
 #### Available Commands & Examples
 

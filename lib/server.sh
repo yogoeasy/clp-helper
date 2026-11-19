@@ -1834,19 +1834,15 @@ ensure_system_bootstrap() {
   avail_kb=$(df -Pk / 2>/dev/null | tail -n 1 | awk '{print $4}' || echo "")
   if [[ -n "$avail_kb" && "$avail_kb" =~ ^[0-9]+$ ]]; then
     if (( avail_kb < 6000000 )); then
-      local avail_gb
-      avail_gb=$(awk "BEGIN {printf \"%.2f\", $avail_kb / 1048576}" 2>/dev/null || echo "0")
       if command -v clpctl >/dev/null 2>&1; then
-        log_warn "$(_t "SERVER_BOOTSTRAP_WARN_DISK_LOW" "${avail_gb}" "${avail_kb}")"
+        log_warn "$(_t "SERVER_BOOTSTRAP_WARN_DISK_LOW" "$(_human_kb "$avail_kb")")"
       else
-        log_error "$(_t "SERVER_BOOTSTRAP_ERR_DISK_INSUFFICIENT" "${avail_gb}" "${avail_kb}")"
+        log_error "$(_t "SERVER_BOOTSTRAP_ERR_DISK_INSUFFICIENT" "$(_human_kb "$avail_kb")")"
         log_error "$(_t "SERVER_BOOTSTRAP_ERR_DISK_EXPAND_HINT")"
         return 1
       fi
     else
-      local avail_gb
-      avail_gb=$(awk "BEGIN {printf \"%.2f\", $avail_kb / 1048576}" 2>/dev/null || echo "0")
-      log_info "$(_t "SERVER_BOOTSTRAP_INFO_DISK_OK" "${avail_gb}" "${avail_kb}")"
+      log_info "$(_t "SERVER_BOOTSTRAP_INFO_DISK_OK" "$(_human_kb "$avail_kb")")"
     fi
   else
     log_warn "$(_t "SERVER_BOOTSTRAP_WARN_DISK_UNKNOWN")"
@@ -3920,7 +3916,7 @@ server_clean() {
     avail_after=$(df -m / | tail -n1 | awk '{print $4}')
     local freed=$((avail_after - avail_before))
     if [[ $freed -gt 0 ]]; then
-      log_success "$(_t "SERVER_CLEAN_SUCCESS_FREED" "${freed}")"
+      log_success "$(_t "SERVER_CLEAN_SUCCESS_FREED" "$(_human_kb "$((freed * 1024))")")"
     else
       log_success "$(_t "SERVER_CLEAN_SUCCESS_HEALTHY")"
     fi
