@@ -135,6 +135,70 @@ _nh_rmdirs() {
   rmdir "$dir" 2>/dev/null || true
 }
 
+# _nh_hooks_add <domain> <來源：tpl|vhost> <輸出檔> [<hooks-add 的 --file 參數>]
+#   執行 vhost_tpl.py hooks-add（tpl：從 ${VHOST_STAGE}/export.json 讀範本；vhost：讀指定的檔案）。
+#   stderr 收到 mktemp 暫存檔（所有返回路徑都清除）：
+#   結束碼 3（找不到位置）→ 不顯示英文 stderr，改印一行語系訊息（來源、原因、行號），回傳 3；
+#   其他非 0 → NH_ERR_BUILD，並顯示收到的 stderr，回傳 1
+_nh_hooks_add() {
+  local domain="$1" kind="$2" out="$3" file="${4:-}"
+  local errf rc=0
+  # VHOST_STAGE 存在時建在裡面（中斷時的 vhost_stage_cleanup 會一併清除）
+  if [[ -n "${VHOST_STAGE:-}" && -d "$VHOST_STAGE" ]]; then
+    errf="$(mktemp "${VHOST_STAGE}/hooks.err.XXXXXX")" || errf=""
+  else
+    errf="$(mktemp)" || errf=""
+  fi
+  [[ -n "$errf" ]] || { log_error "$(_t "NH_ERR_BUILD" "$domain")"; return 1; }
+  if [[ "$kind" == "tpl" ]]; then
+    ( umask 077; vhost_tpl_py hooks-add --domain "$domain" < "${VHOST_STAGE}/export.json" > "$out" 2> "$errf" ) || rc=$?
+  else
+    ( umask 077; vhost_tpl_py hooks-add --domain "$domain" --file "$file" > "$out" 2> "$errf" ) || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    rm -f "$errf"; return 0
+  elif [[ "$rc" -eq 3 ]]; then
+    _nh_warn_no_place "$domain" "$kind" "$errf"
+    rm -f "$errf"; return 3
+  fi
+  log_error "$(_t "NH_ERR_BUILD" "$domain")"
+  if [[ -s "$errf" ]]; then
+    # 逐行清除控制字元（保留換行），最多 2000 位元組
+    local l
+    while IFS= read -r l || [[ -n "$l" ]]; do
+      strip_ctrl_chars "$l" >&2 || true
+      echo >&2
+    done < <(head -c 2000 "$errf")
+  fi
+  rm -f "$errf"
+  return 1
+}
+
+# _nh_warn_no_place <domain> <tpl|vhost> <stderr 檔>：解析 vhost_tpl.py 的「clp-no-place <代碼> <a> <b> -- …」，印一行警告
+_nh_warn_no_place() {
+  local domain="$1" kind="$2" errf="$3" src line tag code a b
+  if [[ "$kind" == "tpl" ]]; then
+    src="$(_t "NH_SRC_TPL")"
+  else
+    src="$(_t "NH_SRC_VHOST" "/etc/nginx/sites-enabled/${domain}.conf")"
+  fi
+  line="$(grep -m1 '^clp-no-place ' "$errf" 2>/dev/null || true)"
+  tag="" code="" a="" b=""
+  IFS=' ' read -r tag code a b _ <<< "$line" || true
+  # 只接受數字與逗號（來自 vhost_tpl.py，仍然不直接信任）
+  [[ "$a" =~ ^[0-9]+$ ]] || a="-"
+  [[ "$b" =~ ^[0-9]+(,[0-9]+)*$ ]] || b="-"
+  case "$code" in
+    markers)     log_warn "$(_t "NH_WARN_NP_MARKERS" "$domain" "$src")" ;;
+    braces)      log_warn "$(_t "NH_WARN_NP_BRACES" "$domain" "$src" "$a")" ;;
+    no_https)    log_warn "$(_t "NH_WARN_NP_NO_HTTPS" "$domain" "$src" "$a")" ;;
+    multi_https) log_warn "$(_t "NH_WARN_NP_MULTI_HTTPS" "$domain" "$src" "$a" "$b")" ;;
+    no_root)     log_warn "$(_t "NH_WARN_NP_NO_ROOT" "$domain" "$src" "$a")" ;;
+    multi_root)  log_warn "$(_t "NH_WARN_NP_MULTI_ROOT" "$domain" "$src" "$a" "$b")" ;;
+    *)           log_warn "$(_t "NH_WARN_NP_OTHER" "$domain" "$src")" ;;
+  esac
+}
+
 # nh_add_site <domain>：在網站的範本與 vhost 加入 hook（呼叫端已執行 vhost_stage_init 與 vhost_export）
 #   回傳 0 已加入或原本就有、1 失敗（已還原）、3 跳過
 #   成功時設定 NH_NEED_RELOAD=1，由呼叫端統一 reload
@@ -164,12 +228,7 @@ nh_add_site() {
   # 新的範本與 vhost
   local new_tpl="${VHOST_STAGE}/hooks.tpl" new_vhost="${VHOST_STAGE}/hooks.vhost" src="$vhost" rc=0
   if [[ "$t" != "on" ]]; then
-    ( umask 077; vhost_tpl_py hooks-add --domain "$domain" < "${VHOST_STAGE}/export.json" > "$new_tpl" ) || rc=$?
-    if [[ "$rc" -eq 3 ]]; then
-      log_warn "$(_t "NH_WARN_NO_PLACE" "$domain")"; return 3
-    elif [[ "$rc" -ne 0 ]]; then
-      log_error "$(_t "NH_ERR_BUILD" "$domain")"; return 1
-    fi
+    _nh_hooks_add "$domain" tpl "$new_tpl" || return $?
   fi
   if [[ -s "$legacy" ]]; then
     _nh_require_httpauth_lib || return 1
@@ -178,13 +237,7 @@ nh_add_site() {
       log_error "$(_t "NH_ERR_LEGACY_STATE" "$domain")"; return 1
     fi
   fi
-  rc=0
-  ( umask 077; vhost_tpl_py hooks-add --domain "$domain" --file "$src" > "$new_vhost" ) || rc=$?
-  if [[ "$rc" -eq 3 ]]; then
-    log_warn "$(_t "NH_WARN_NO_PLACE" "$domain")"; return 3
-  elif [[ "$rc" -ne 0 ]]; then
-    log_error "$(_t "NH_ERR_BUILD" "$domain")"; return 1
-  fi
+  _nh_hooks_add "$domain" vhost "$new_vhost" "$src" || return $?
 
   # 舊格式的防護先寫成 hook 檔（vhost 還沒有 include，不會生效）
   local ha_dir="${VHOST_STAGE}/ha"

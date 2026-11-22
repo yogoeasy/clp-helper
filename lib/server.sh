@@ -1344,7 +1344,7 @@ setup_smtp() {
       # 以 umask 077 建立，避免密碼在 chmod 前短暫可被其他使用者讀取
       ( umask 077; echo "[${relay_host}]:${relay_port} ${smtp_user}:${smtp_pass}" > "$sasl_passwd_file" )
       chmod 600 "$sasl_passwd_file"
-      postmap "$sasl_passwd_file" 2>/dev/null || true
+      ( umask 077; postmap "$sasl_passwd_file" 2>/dev/null || true )
       [[ -f "${sasl_passwd_file}.db" ]] && chmod 600 "${sasl_passwd_file}.db"
 
       postconf -e "relayhost = [${relay_host}]:${relay_port}"

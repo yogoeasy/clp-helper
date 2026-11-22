@@ -1146,13 +1146,13 @@ PYEOF
   if [[ -n "$api_param" ]]; then
     if ! cf_resolve_credentials "$ssl_domain" "" "$api_param"; then
       if ! _resolve_cf_token_file "$api_param" >/dev/null 2>&1; then
-        log_error "$(_t "SITE_SSL_ERR_API_FILE_NOT_FOUND" "$api_param")"
+        log_error "$(_t "SITE_SSL_ERR_API_FILE_NOT_FOUND")"
       fi
       return 1
     fi
 
     credentials_file="$(_certbot_credentials_file "$ssl_domain")" || {
-      log_error "$(_t "SITE_SSL_ERR_API_FILE_NOT_FOUND" "$api_param")"
+      log_error "$(_t "SITE_SSL_ERR_API_FILE_NOT_FOUND")"
       return 1
     }
   else
@@ -2342,7 +2342,7 @@ site_new() {
   # 建立 wp-config.php (注意 CloudPanel 必須使用 127.0.0.1)
   log_step "$(_t "SITE_NEW_STEP_CREATE_CONFIG")"
   # 密碼由 stdin 傳入（--prompt），不出現在命令列（ps 看得到）
-  printf '%s\n' "$dbpass" | sudo -H -u "$siteuser" wp config create \
+  printf '%s\n' "$dbpass" | sudo -H -u "$siteuser" env TERM=dumb wp config create \
     --dbname="$dbname" \
     --dbuser="$dbname" \
     --dbhost="127.0.0.1" \
@@ -2367,24 +2367,25 @@ site_new() {
   fi
 
   log_step "$(_t "SITE_NEW_STEP_INSTALLING_CORE")"
-  # 管理員密碼由 stdin 傳入（--prompt），不出現在命令列
-  printf '%s\n' "$wp_admin_pass" | sudo -H -u "$siteuser" wp core install \
+  # 管理員密碼由 stdin 傳入（--prompt），不出現在命令列；--prompt 會把完整指令（含密碼）印到 stdout，
+  # 所以 stdout 丟棄（Error: 在 stderr，仍會顯示）；TERM=dumb 消除非 TTY 的 terminal type 雜訊
+  printf '%s\n' "$wp_admin_pass" | sudo -H -u "$siteuser" env TERM=dumb wp core install \
     --url="${site_scheme}://${domain}" \
     --title="New WordPress" \
     --admin_user="$wp_admin_user" \
     --admin_email="$wp_admin_email" \
     --skip-email \
     --prompt=admin_password \
-    --path="$wpdir" || {
+    --path="$wpdir" >/dev/null || {
       # 嘗試以 http 協議安裝 (若尚未配置 SSL)
-      printf '%s\n' "$wp_admin_pass" | sudo -H -u "$siteuser" wp core install \
+      printf '%s\n' "$wp_admin_pass" | sudo -H -u "$siteuser" env TERM=dumb wp core install \
         --url="http://${domain}" \
         --title="New WordPress" \
         --admin_user="$wp_admin_user" \
         --admin_email="$wp_admin_email" \
         --skip-email \
         --prompt=admin_password \
-        --path="$wpdir" || {
+        --path="$wpdir" >/dev/null || {
           log_error "$(_t "SITE_NEW_ERR_INSTALL_CORE")"
           return 1
         }

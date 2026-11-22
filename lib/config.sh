@@ -543,7 +543,7 @@ config_handler() {
             return 1
           fi
         elif [[ "$is_path_like" == "true" ]]; then
-          log_error "$(_t "CONFIG_ERR_FILE_NOT_FOUND" "$target_val")"
+          log_error "$(_t "CONFIG_ERR_FILE_NOT_FOUND")"
           return 1
         fi
       else

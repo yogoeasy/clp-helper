@@ -113,9 +113,11 @@ check_root() {
     fi
   fi
   if [[ $EUID -ne 0 ]]; then
+    # 只顯示模組名稱：其餘參數可能含密碼或 token（空白分隔的 -pass 值等），不回顯
     local example="sudo clp"
     if [[ $# -gt 0 ]]; then
-      example="sudo clp $*"
+      example="sudo clp $1"
+      [[ $# -gt 1 ]] && example="${example} ..."
     fi
     log_error "$(_t "CORE_ERR_ROOT_REQUIRED" "$example")"
     exit 1
@@ -1034,13 +1036,36 @@ reject_extra_positionals() {
 
   [[ ${#extra_args[@]} -eq 0 ]] && return 0
 
-  log_error "$(_t "CORE_ERR_EXTRA_ARGS" "${extra_args[*]}")"
+  # 顯示用的值：敏感選項後面的值（含同值出現在別處）、漏打 '-' 的 鍵=值／鍵:值 一律顯示 <redacted>，
+  # 不寫進畫面或 log。先掃一遍原始參數，收集所有出現在敏感選項後面的值（集合）：
+  # 任何多餘參數只要等於集合中的值就遮蔽（例如 -user X -pass X、-add foo.com -pass foo.com）
+  local _sens_re='(pass|pwd|token|secret|key)|^api$'
+  local -a _sec_vals=() _sec_names=()
+  local k _a _n _nl _v
+  for ((k = 0; k < ${#_raw_args[@]}; k++)); do
+    _a="${_raw_args[$k]}"
+    if [[ "$_a" =~ ^--?([a-zA-Z0-9_-]+)[=:](.*)$ ]]; then
+      _n="${BASH_REMATCH[1]}"
+      _v="${BASH_REMATCH[2]}"  # 先存起來：下一個 =~ 會覆寫 BASH_REMATCH
+      _nl=$(printf '%s' "$_n" | tr '[:upper:]' '[:lower:]')
+      if [[ "$_nl" =~ $_sens_re && -n "$_v" ]]; then
+        _sec_vals+=("$_v")
+        _sec_names+=("$_n")
+      fi
+    elif [[ "$_a" =~ ^--?([a-zA-Z0-9_-]+)$ && $((k + 1)) -lt ${#_raw_args[@]} ]]; then
+      _n="${BASH_REMATCH[1]}"
+      _nl=$(printf '%s' "$_n" | tr '[:upper:]' '[:lower:]')
+      if [[ "$_nl" =~ $_sens_re ]]; then
+        _sec_vals+=("${_raw_args[$((k + 1))]}")
+        _sec_names+=("$_n")
+      fi
+    fi
+  done
+
+  local -a _prev_opts=() _shown=() _secret_name=()
   local extra
   for extra in "${extra_args[@]}"; do
-    local extra_lower
-    extra_lower=$(echo "$extra" | tr '[:upper:]' '[:lower:]')
     local prev_opt=""
-    local k
     for ((k = 1; k < ${#_raw_args[@]}; k++)); do
       if [[ "${_raw_args[$k]}" == "$extra" ]]; then
         local prev="${_raw_args[$((k - 1))]}"
@@ -1050,10 +1075,46 @@ reject_extra_positionals() {
         fi
       fi
     done
+    _prev_opts+=("$prev_opt")
+    local sname="" m
+    for ((m = 0; m < ${#_sec_vals[@]}; m++)); do
+      if [[ "${_sec_vals[$m]}" == "$extra" ]]; then
+        sname="${_sec_names[$m]}"
+        break
+      fi
+    done
+    _secret_name+=("$sname")
+    if [[ -n "$sname" ]]; then
+      _shown+=("<redacted>")
+    elif [[ "$extra" =~ ^-*([^=:]+)([=:]) ]]; then
+      local ekey="${BASH_REMATCH[1]}" esep="${BASH_REMATCH[2]}" ekey_lc
+      ekey_lc=$(printf '%s' "$ekey" | tr '[:upper:]' '[:lower:]')
+      if [[ "$ekey_lc" =~ $_sens_re ]]; then
+        _shown+=("${ekey}${esep}<redacted>")
+      else
+        _shown+=("$extra")
+      fi
+    else
+      _shown+=("$extra")
+    fi
+  done
 
-    # 若緊接在需要帶值的選項後面（例如 -cf-waf off、-delete user、-file backup.sql.gz、-expire 30d、-ufw off）
-    if [[ -n "$prev_opt" && "$prev_opt" =~ ^(delete|del|add|path|whitelist|list|user|username|pass|password|cf-waf|cf_waf|file|expire|to|type|ufw|allow|deny|icmp|unban|install|ssl|clone-from|clone_from|migrate|from|timezone|dns|smtp|exclude|port|max-children|idle-timeout|max-requests)$ ]]; then
-      log_info "$(_t "CORE_HINT_OPT_VALUE_FORMAT" "$prev_opt" "$extra")"
+  log_error "$(_t "CORE_ERR_EXTRA_ARGS" "${_shown[*]}")"
+  local idx=0
+  for extra in "${extra_args[@]}"; do
+    local extra_lower
+    extra_lower=$(printf '%s' "$extra" | tr '[:upper:]' '[:lower:]')
+    local prev_opt="${_prev_opts[$idx]}"
+    local sname="${_secret_name[$idx]}"
+    local shown="${_shown[$idx]}"
+    idx=$((idx + 1))
+
+    if [[ -n "$sname" ]]; then
+      # 密碼／token 不可由命令列傳入（會出現在 ps 與 log），也不建議改用 -選項=值
+      log_info "$(_t "CORE_HINT_SECRET_NOT_ON_CMDLINE" "$sname")"
+    elif [[ -n "$prev_opt" && "$prev_opt" =~ ^(delete|del|add|path|whitelist|list|user|username|cf-waf|cf_waf|file|expire|to|type|ufw|allow|deny|icmp|unban|install|ssl|clone-from|clone_from|migrate|from|timezone|dns|smtp|exclude|port|max-children|idle-timeout|max-requests)$ ]]; then
+      # 若緊接在需要帶值的選項後面（例如 -cf-waf off、-delete user、-file backup.sql.gz、-expire 30d、-ufw off）
+      log_info "$(_t "CORE_HINT_OPT_VALUE_FORMAT" "$prev_opt" "$shown")"
     elif [[ -n "$_known_flags" && "$extra_lower" =~ ^(${_known_flags})$ ]]; then
       log_info "$(_t "CORE_HINT_DID_YOU_MEAN_OPT" "$extra_lower")"
     else

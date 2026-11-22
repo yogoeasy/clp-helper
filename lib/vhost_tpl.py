@@ -24,6 +24,12 @@ Usage (root; the database is opened read-only, nothing is written to it):
   vhost_tpl.py hooks-report --vhost-dir DIR [--domain D]  (stdin: export JSON) one line per site, tab separated:
                                                       <domain> <php|other> <template state> <vhost state|disabled>
 
+hooks-add exit 3 (no place for the hook lines): the one stderr line is
+  clp-no-place <code> <a> <b> -- no place for the clp hook lines: <English reason>
+code/a/b (see diagnose_no_place; '-' = none; line numbers are 1-based lines of the checked text):
+  markers - - | braces L - | no_https N - | multi_https N L1,L2,.. | no_root L - | multi_root L R1,R2,..
+(unknown - - when the cause cannot be told). lib/nginx_hooks.sh parses it; the English text is for people.
+
 Comparison ignores CR/LF differences, trailing whitespace, trailing blank lines and the clp hook lines,
 and treats every "server_name ...;" line as {{server_name}}. The template that is written is the official
 text itself (plus the hook lines when the site had them).
@@ -172,7 +178,8 @@ def code_mask(text):
                     out[k] = ' '
             i = j + 1
             continue
-        if c == '#':
+        if c == '#' and (i == 0 or text[i - 1] in ' \t\r\n;{}'):
+            # nginx 只在 token 開頭把 # 當成註解（location ~ ^/a#b 的 # 是 regex 的一部分；同 httpauth_vhost.py）
             j = text.find('\n', i)
             j = n if j == -1 else j
             for k in range(i, j):
@@ -207,14 +214,7 @@ def hook_blocks(lines):
 
 
 def strip_hooks(text):
-    lines = text.splitlines(True)
-    try:
-        blocks = hook_blocks(lines)
-    except ValueError:
-        return text
-    for s, e, _ in reversed(blocks):
-        del lines[s:e + 1]
-    return ''.join(lines)
+    return _strip_hooks_map(text)[0]
 
 
 def hooks_state(text):
@@ -227,11 +227,12 @@ def hooks_state(text):
     return 'partial' if kinds else 'none'
 
 
-def https_root_line(text):
-    """Index (in text.splitlines(True)) of the root line of the one server block that listens on 443
-    and not on 8080; None when there is not exactly one such block or root line.
-    A redirect-only block (CloudPanel's www redirect) is not counted: a top-level 30x/http(s) return,
-    no root line, no nested block and no include. Anything less certain still counts, so the site is skipped."""
+def _scan_https(text):
+    """Scan the top-level server blocks of text (the rules of https_root_line).
+    ('braces', line) when a top-level server block is not closed (line of its "server {");
+    otherwise ('ok', candidates, skipped): candidates = [(line, [root line index, ...]), ...] for the
+    blocks that listen on 443 and not on 8080 and are not redirect-only (line = 1-based line of the
+    block's "server {", root line index as in text.splitlines(True)), skipped = number of redirect-only blocks."""
     mask = code_mask(text)
     depth_at = []
     depth = 0
@@ -248,6 +249,7 @@ def https_root_line(text):
             root_pos.append((pos, idx))
         pos += len(line)
     candidates = []
+    skipped = 0
     for m in re.finditer(r'(?<![\w$])server\s*\{', mask):
         if depth_at[m.start()] != 0:
             continue
@@ -256,7 +258,7 @@ def https_root_line(text):
         while close_idx < len(mask) and not (mask[close_idx] == '}' and depth_at[close_idx] == 1):
             close_idx += 1
         if close_idx >= len(mask):
-            return None
+            return ('braces', text.count('\n', 0, m.start()) + 1)
         top = ''.join(ch for k, ch in enumerate(mask[open_idx + 1:close_idx], open_idx + 1)
                       if depth_at[k] == 1 and ch not in '{}')
         listens = re.findall(r'(?:^|[;\s])listen\s+([^;]*);', top)
@@ -265,11 +267,83 @@ def https_root_line(text):
             roots = [idx for p, idx in root_pos if open_idx < p < close_idx]
             nested = '{' in mask[open_idx + 1:close_idx]
             if not roots and not nested and REDIRECT_RETURN_RE.search(top) and not INCLUDE_RE.search(top):
+                skipped += 1
                 continue
-            candidates.append(roots)
-    if len(candidates) != 1 or len(candidates[0]) != 1:
+            candidates.append((text.count('\n', 0, m.start()) + 1, roots))
+    return ('ok', candidates, skipped)
+
+
+def https_root_line(text):
+    """Index (in text.splitlines(True)) of the root line of the one server block that listens on 443
+    and not on 8080; None when there is not exactly one such block or root line.
+    A redirect-only block (CloudPanel's www redirect) is not counted: a top-level 30x/http(s) return,
+    no root line, no nested block and no include. Anything less certain still counts, so the site is skipped."""
+    res = _scan_https(text)
+    if res[0] != 'ok':
         return None
-    return candidates[0][0]
+    candidates = res[1]
+    if len(candidates) != 1 or len(candidates[0][1]) != 1:
+        return None
+    return candidates[0][1][0]
+
+
+def _strip_hooks_map(text):
+    """(strip_hooks(text), the 1-based line number in text of each line of the result)"""
+    lines = text.splitlines(True)
+    try:
+        blocks = hook_blocks(lines)
+    except ValueError:
+        return text, list(range(1, len(lines) + 1))
+    drop = set()
+    for s, e, _ in blocks:
+        drop.update(range(s, e + 1))
+    keep = [i for i in range(len(lines)) if i not in drop]
+    return ''.join(lines[i] for i in keep), [i + 1 for i in keep]
+
+
+def diagnose_no_place(text):
+    """Why add_hooks(text, ...) finds no place for the hook lines: (code, a, b), or None when there is one.
+    Existing (balanced) hook blocks are stripped before scanning, but every line number reported is the
+    1-based line number in the original text, so it matches the file or template the user looks at.
+      markers      -   -                  clp hook markers are unbalanced
+      braces       L   -                  the server block starting at line L is not closed
+      no_https     N   -                  no HTTPS server block to use (N redirect-only blocks were not counted)
+      multi_https  N   L1,L2,..           N HTTPS server blocks (their starting lines; redirect-only blocks not counted)
+      no_root      L   -                  the one HTTPS block starting at line L has no top-level root line
+      multi_root   L   R1,R2,..           the one HTTPS block starting at line L has several top-level root lines"""
+    base, nums = _strip_hooks_map(text)
+    if hooks_state(base) != 'none':
+        return ('markers', '-', '-')
+    res = _scan_https(base)
+    if res[0] == 'braces':
+        return ('braces', str(nums[res[1] - 1]), '-')
+    cands, skipped = res[1], res[2]
+    if not cands:
+        return ('no_https', str(skipped), '-')
+    if len(cands) > 1:
+        return ('multi_https', str(len(cands)), ','.join(str(nums[c[0] - 1]) for c in cands))
+    line, roots = cands[0]
+    if not roots:
+        return ('no_root', str(nums[line - 1]), '-')
+    if len(roots) > 1:
+        return ('multi_root', str(nums[line - 1]), ','.join(str(nums[r]) for r in roots))
+    return None
+
+
+NO_PLACE_TEXT = {
+    'markers': "the clp hook markers are unbalanced",
+    'braces': "the server block starting at line %(a)s is not closed",
+    'no_https': "no HTTPS server block to use (redirect-only blocks found and not counted: %(a)s)",
+    'multi_https': "%(a)s HTTPS server blocks (lines %(b)s; redirect-only blocks not counted), exactly one is required",
+    'no_root': "the HTTPS server block starting at line %(a)s has no top-level root line",
+    'multi_root': "the HTTPS server block starting at line %(a)s has several top-level root lines (lines %(b)s)",
+}
+
+
+def no_place_reason(diag):
+    """English text of a diagnose_no_place result"""
+    code, a, b = diag
+    return NO_PLACE_TEXT[code] % {'a': a, 'b': b}
 
 
 def add_hooks(text, domain):
@@ -308,7 +382,8 @@ def build(site, official):
     if hooks_state(site.get('template', '')) != 'none':
         hooked = add_hooks(text, site['domain'])
         if hooked is None:
-            fail("no place for the clp hook lines in the template", 3)
+            diag = diagnose_no_place(text)
+            fail("no place for the clp hook lines in the template" + (": " + no_place_reason(diag) if diag else ""), 3)
         return hooked
     return text
 
@@ -481,7 +556,13 @@ def cmd_hooks(cmd, domain, path):
     else:
         out = add_hooks(text, domain)
         if out is None:
-            fail("no place for the clp hook lines (one HTTPS server block with one root line is required; redirect-only blocks are not counted)", 3)
+            diag = diagnose_no_place(text)
+            if diag is None:
+                diag = ('unknown', '-', '-')
+                reason = "one HTTPS server block with one root line is required"
+            else:
+                reason = no_place_reason(diag)
+            fail("clp-no-place %s %s %s -- no place for the clp hook lines: %s" % (diag + (reason,)), 3)
     sys.stdout.buffer.write(out.encode('utf-8', 'surrogateescape'))
 
 
